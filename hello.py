@@ -134,11 +134,11 @@ class Experiment:
         self._input_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         
         # Bind sockets
-        # print("Waiting for connection")
-        # self._input_socket.bind((self._server_address, self._backend_port))
-        # self._input_socket.listen()
-        # self._input_socket.accept()
-        # print("Connection accepted")
+        print("Waiting for connection")
+        self._input_socket.bind((self._server_address, self._backend_port))
+        self._input_socket.listen()
+        self._input_socket.accept()
+        print("Connection accepted")
 
         # Create virtual object at center of screen
         self._virtual_object = VirtualObject(
@@ -154,8 +154,6 @@ class Experiment:
             "ring": mp.solutions.hands.HandLandmark.RING_FINGER_TIP
         }[finger_pair]
 
-        import ipdb; ipdb.set_trace()
-        
         # Camera indices
         self.TOP_CAMERA = 0
         self.SIDE_CAMERA = 1
@@ -186,10 +184,7 @@ class Experiment:
         self._top_thread = threading.Thread(target=self.start_top_camera, daemon=True)
         self._top_thread.start()
 
-        if SIDE_CAMERA_DEBUG:
-            # Register the space key interrupt to target function
-            keyboard.on_press_key("space", self._detect_pinch_space)
-        else:
+        if not SIDE_CAMERA_DEBUG:
             self._side_thread = threading.Thread(target=self.start_side_camera, daemon=True)
             self._side_thread.start()
 
@@ -262,7 +257,10 @@ class Experiment:
 
                 print("Pausing")
                 self.state = ExperimentState.PAUSE
-                sleep(PAUSE_SLEEP_SECONDS)
+                for _ in range(PAUSE_SLEEP_SECONDS):
+                    sleep(1)
+                    if not self._running:
+                        break;
 
             else:
                 print("Comparing")
@@ -277,12 +275,16 @@ class Experiment:
                 while self._running and not self._check_comparison_end():
                     self._update_virtual_object(pair.second.value, 1)
 
+                if not self._running:
+                    print("Exit via Ctrl-C")
+                    break
+
                 print("Question")
                 self._state = ExperimentState.QUESTION
                 # .recv is a blocking call, waiting for input from the frontend
-                # answer_data = self._input_socket.recv(1024)
-                # answer = ExperimentControl.model_validate_json(answer_data)
-                # answers.append(QuestionInput(answer.questionInput))
+                answer_data = self._input_socket.recv(1024)
+                answer = ExperimentControl.model_validate_json(answer_data)
+                answers.append(QuestionInput(answer.questionInput))
 
 
     def _arduino_control_loop(self):
@@ -414,7 +416,6 @@ class Experiment:
 
     def start_top_camera(self):
         """Process top camera feed to track finger positions"""
-        # TODO - Consider spliting top camera thread to two threads - camera read and virtual object management
         backend = cv2.CAP_DSHOW
         cap = cv2.VideoCapture(self.TOP_CAMERA, backend) if backend else cv2.VideoCapture()
         if not cap.isOpened():
@@ -435,8 +436,11 @@ class Experiment:
 
                 detected = self._process_top_view(frame, hands)
                 cv2.imshow("Top Camera", cv2.flip(frame, 1))
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                key = cv2.waitKey(1) & 0xFF
+                if key== ord('q'):
                     break
+                elif key == ord(' '):
+                    self._toggle_pinch()
                 
                 with self._hand_position_lock:
                     self._current_position = detected
@@ -551,11 +555,6 @@ class Experiment:
         else:
             self._is_pinching = False
 
-    def _detect_pinch_space(self, event):
-        if event.event_type == keyboard.KEY_DOWN:
-            import ipdb; ipdb.set_trace()
-            self._toggle_pinch()
-
         
     def cleanup(self):
         """Clean up resources"""
@@ -563,6 +562,7 @@ class Experiment:
         keyboard.unhook_all()
         cv2.destroyAllWindows()
         self._data_socket.close()
+        self._input_socket.close()
         if not ARDUINO_DEBUG and self._arduino:
             self._arduino.close()
 

@@ -17,7 +17,9 @@ class PygameFrontEnd:
 
         self._running = False
         self._left_button_timer = 0
+        self._left_button_sent: bool = False
         self._right_button_timer = 0
+        self._right_button_sent: bool = False
         self._button_hold_time = 2 * VIRTUAL_WORLD_FPS  # 2 seconds worth of frames
 
         # Initialize socket to receive backend information
@@ -25,8 +27,8 @@ class PygameFrontEnd:
         self._data_socket.bind((server_address, frontend_port))
 
         # Initialize socket to send user input to backend
-        # self._input_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # self._input_socket.connect((server_address, backend_port))
+        self._input_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._input_socket.connect((server_address, backend_port))
         
         # Initialize pygame for visualization and keyboard input
         pygame.init()
@@ -98,23 +100,25 @@ class PygameFrontEnd:
             
             if left_button.collidepoint(finger_pos):
                 self._left_button_timer += 1
-                # if self._left_button_timer >= self._button_hold_time:
-                #     # ! BUG: will send data to backend over and over even if the button is not released
-                #     self._input_socket.sendall(
-                #         ExperimentControl(questionInput=QuestionInput.LEFT.value).model_dump_json().encode()
-                #     )
+                if self._left_button_timer >= self._button_hold_time and not self._left_button_sent:
+                    self._input_socket.sendall(
+                        ExperimentControl(questionInput=QuestionInput.LEFT.value).model_dump_json().encode()
+                    )
+                    self._left_button_sent = True
             else:
                 self._left_button_timer = 0
+                self._left_button_sent = False
 
             if right_button.collidepoint(finger_pos):
                 self._right_button_timer += 1
-                # if self._right_button_timer >= self._button_hold_time:
-                #     # ! BUG: will send data to backend over and over even if the button is not released
-                #     self._input_socket.sendall(
-                #         ExperimentControl(questionInput=QuestionInput.RIGHT.value).model_dump_json().encode()
-                #     )
+                if self._right_button_timer >= self._button_hold_time and not self._right_button_sent:
+                    self._input_socket.sendall(
+                        ExperimentControl(questionInput=QuestionInput.RIGHT.value).model_dump_json().encode()
+                    )
+                    self._right_button_sent = True
             else:
-                self._right_button_timer = 0
+                self._right_button_timer = 0 
+                self._right_button_sent = False
 
         # Draw progress bars for button holds
         if self._left_button_timer > 0:
