@@ -95,30 +95,39 @@ class PygameFrontEnd:
         pygame.draw.rect(self.screen, SECOND_COLOR, right_button)
 
         # Check if any fingers are touching buttons
+        left_touched = False
+        right_touched = False
+        
         for finger_position in landmarks:
             finger_pos = (int(finger_position.x * self._width), int(finger_position.z * self._height))
             
             if left_button.collidepoint(finger_pos):
-                self._left_button_timer += 1
-                if self._left_button_timer >= self._button_hold_time and not self._left_button_sent:
-                    self._input_socket.sendall(
-                        ExperimentControl(questionInput=QuestionInput.LEFT.value).model_dump_json().encode()
-                    )
-                    self._left_button_sent = True
-            else:
-                self._left_button_timer = 0
-                self._left_button_sent = False
-
+                left_touched = True
             if right_button.collidepoint(finger_pos):
-                self._right_button_timer += 1
-                if self._right_button_timer >= self._button_hold_time and not self._right_button_sent:
-                    self._input_socket.sendall(
-                        ExperimentControl(questionInput=QuestionInput.RIGHT.value).model_dump_json().encode()
-                    )
-                    self._right_button_sent = True
-            else:
-                self._right_button_timer = 0
-                self._right_button_sent = False
+                right_touched = True
+
+        # Update button states based on touches
+        if left_touched:
+            self._left_button_timer += 1
+            if self._left_button_timer >= self._button_hold_time and not self._left_button_sent:
+                self._input_socket.sendall(
+                    ExperimentControl(questionInput=QuestionInput.LEFT.value).model_dump_json().encode()
+                )
+                self._left_button_sent = True
+        else:
+            self._left_button_timer = 0
+            self._left_button_sent = False
+
+        if right_touched:
+            self._right_button_timer += 1
+            if self._right_button_timer >= self._button_hold_time and not self._right_button_sent:
+                self._input_socket.sendall(
+                    ExperimentControl(questionInput=QuestionInput.RIGHT.value).model_dump_json().encode()
+                )
+                self._right_button_sent = True
+        else:
+            self._right_button_timer = 0
+            self._right_button_sent = False
 
         # Draw progress bars for button holds
         if self._left_button_timer > 0:

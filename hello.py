@@ -90,6 +90,7 @@ class VirtualObject(BaseModel):
         self.y = self.original_y
         self.prev_x = self.original_x
         self.prev_y = self.original_y
+        self.is_pinched = False
 
         # reset progress/Cycle Counter
         self.progress = 0.0
@@ -98,8 +99,6 @@ class VirtualObject(BaseModel):
         # Reset the stiffness value/pair index since the previous value is no longer 
         self.stiffness_value = 0
         self.pair_index = 0
-
-        # TODO - Is pinch reset necessary?
 
 class Experiment:
     def __init__(self, config: Configuration, finger_pair: FingerPair = "index", width: int = WIDTH, height: int = HEIGHT, camera_fps: int = 30,
@@ -131,13 +130,13 @@ class Experiment:
         self._frontend_port = frontend_port
         self._backend_port = backend_port
         self._data_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._input_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         
         # Bind sockets
         print("Waiting for connection")
-        self._input_socket.bind((self._server_address, self._backend_port))
-        self._input_socket.listen()
-        self._input_socket.accept()
+        self._listening_socket.bind((self._server_address, self._backend_port))
+        self._listening_socket.listen()
+        self._control_socket, _ = self._listening_socket.accept()
         print("Connection accepted")
 
         # Create virtual object at center of screen
@@ -233,6 +232,9 @@ class Experiment:
     def _check_comparison_end(self) -> bool:
         return self._virtual_object.cycle_counter == TARGET_CYCLE_COUNT
 
+    def _reset_comparison(self):
+        self._is_pinching = False
+        self._virtual_object.reset()
 
     def _experiment_loop(self):
         answers: list[QuestionInput] = []
@@ -268,11 +270,11 @@ class Experiment:
                 self._state = ExperimentState.COMPARISON
 
                 # For each object in pair pass the stiffness value and pair index to the virtual
-                self._virtual_object.reset()
+                self._reset_comparison()
                 while self._running and not self._check_comparison_end():
                     self._update_virtual_object(pair.first.value, 0)
 
-                self._virtual_object.reset()
+                self._reset_comparison()
                 while self._running and not self._check_comparison_end():
                     self._update_virtual_object(pair.second.value, 1)
 
@@ -284,7 +286,7 @@ class Experiment:
                 self._state = ExperimentState.QUESTION
                 # .recv is a blocking call, waiting for input from the frontend
                 # TODO - add support for exit via Ctrl-C
-                answer_data = self._input_socket.recv(1024)
+                answer_data = self._control_socket.recv(1024)
                 answer = ExperimentControl.model_validate_json(answer_data)
                 answers.append(QuestionInput(answer.questionInput))
 
@@ -564,7 +566,8 @@ class Experiment:
         keyboard.unhook_all()
         cv2.destroyAllWindows()
         self._data_socket.close()
-        self._input_socket.close()
+        self._listening_socket.close()
+        self._control_socket.close()
         if not ARDUINO_DEBUG and self._arduino:
             self._arduino.close()
 
