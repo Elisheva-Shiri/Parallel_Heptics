@@ -1,5 +1,4 @@
 import csv
-from enum import Enum
 from pathlib import Path
 import keyboard
 import math
@@ -13,13 +12,13 @@ import mediapipe as mp
 import socket
 from pydantic import BaseModel
 import serial
-from structures import FingerPosition, TrackingObject, GamePacket
-from consts import HEIGHT, PYGAME_PORT, TARGET_CYCLE_COUNT, VIRTUAL_WORLD_FPS, WIDTH, FingerPair
+from structures import ExperimentControl, ExperimentState, FingerPosition, QuestionInput, TrackingObject, ExperimentPacket
+from consts import BACKEND_PORT, HEIGHT, PAUSE_SLEEP_SECONDS, PYGAME_PORT, TARGET_CYCLE_COUNT, VIRTUAL_WORLD_FPS, WIDTH, FingerPair
+
+# TODO - Add saving recordings and tracking CSV according to the data architecture
 
 ARDUINO_DEBUG = True
 SIDE_CAMERA_DEBUG = True
-
-ExperimentState = Enum("ExperimentState", ["START", "READ_CONFIG", "COMPARISON", "QUESTION", "PAUSE`", "END"])
 
 class StiffnessValue(BaseModel):
     value: int
@@ -43,12 +42,10 @@ class Configuration(BaseModel):
         
         with open(path, 'r') as file:
             csv_reader = csv.reader(file)
-            return Configuration(
-                [
-                    StiffnessPair(first=StiffnessValue(int(row[0])),
-                                  second=StiffnessValue(int(row[1]))) for row in csv_reader
-                ]
-            )
+            return Configuration(pairs = [
+                StiffnessPair(first=StiffnessValue(value=int(row[0])),
+                                second=StiffnessValue(value=int(row[1]))) for row in csv_reader
+            ])
         
         
 
@@ -106,7 +103,7 @@ class VirtualObject(BaseModel):
 
 class Experiment:
     def __init__(self, config: Configuration, finger_pair: FingerPair = "index", width: int = WIDTH, height: int = HEIGHT, camera_fps: int = 30,
-                 server_address: str = "localhost", server_port: int = PYGAME_PORT):
+                 server_address: str = "localhost", frontend_port: int = PYGAME_PORT, backend_port: int = BACKEND_PORT):
         
         # SETUP
         self._hand_position_lock = Lock()
@@ -119,7 +116,7 @@ class Experiment:
         self._virtual_world_fps = VIRTUAL_WORLD_FPS
         self._camera_fps = camera_fps
         # TODO - add Start screen if needed, and adjust to ExperimentState.START
-        self._state: ExperimentState = ExperimentState.READ_CONFIG
+        self._state = ExperimentState.COMPARISON
         
         # Movement tracking thresholds
         self.CENTER_THRESHOLD = 20  # Pixels from center to start movement
@@ -131,9 +128,18 @@ class Experiment:
         
         # UDP server config
         self._server_address = server_address
-        self._server_port = server_port
-        self._udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._frontend_port = frontend_port
+        self._backend_port = backend_port
+        self._data_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._input_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         
+        # Bind sockets
+        print("Waiting for connection")
+        self._input_socket.bind((self._server_address, self._backend_port))
+        self._input_socket.listen()
+        self._input_socket.accept()
+        print("Connection accepted")
+
         # Create virtual object at center of screen
         self._virtual_object = VirtualObject(
             original_x=self._width/2,
@@ -188,11 +194,11 @@ class Experiment:
     def _sleep(self):
         sleep(1.0 / self._virtual_world_fps)
 
-    def _update_virtual_object(self):
+    def _update_virtual_object(self, stiffness_value: int, pair_index: int) -> None:
         """Update virtual object position based on hand position and pinch state"""
         if self._current_position is None:
             return
-            
+
         # Check if fingers are near object for pinching
         finger_midpoint_x = (self._current_position.thumb_x + self._current_position.active_finger_x) / 2
         finger_midpoint_y = (self._current_position.thumb_y + self._current_position.active_finger_y) / 2
@@ -223,48 +229,58 @@ class Experiment:
             self._virtual_object.y = self._virtual_object.original_y
             self._virtual_object.progress = 0.0
 
+        # Update stiffness and index
+        self._virtual_object.stiffness_value = stiffness_value
+        self._virtual_object.pair_index = pair_index
+
     def _check_comparison_end(self) -> bool:
         return self._virtual_object.cycle_counter == TARGET_CYCLE_COUNT
 
 
     def _experiment_loop(self):
+        answers: list[QuestionInput] = []
+        
         for pair in self._config.pairs:
-            while self._running and self._state != ExperimentState.READ_CONFIG:
-                self._sleep()
-            
             if not self._running:
-                # Exit via Ctrl-C
+                print("Exit via Ctrl-C")
                 break
 
             # Read the next pair and decide action
             if pair.first.value == -1:
                 if pair.second.value != -1:
                     raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
-                self._state = ExperimentState.END
+                
+                print("Exit via end of experiment")
+                self.state = ExperimentState.END
                 break
 
             elif pair.first.value == 0:
                 if pair.second.value != 0:
                     raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
 
-                self._state = ExperimentState.PAUSE
+                print("Pausing")
+                self.state = ExperimentState.PAUSE
+                sleep(PAUSE_SLEEP_SECONDS)
 
             else:
-                self._virtual_object.reset()
+                print("Comparing")
                 self._state = ExperimentState.COMPARISON
-            
+
                 # For each object in pair pass the stiffness value and pair index to the virtual
-                while self._state == ExperimentState.COMPARISON:
+                self._virtual_object.reset()
+                while self._running and not self._check_comparison_end():
                     self._update_virtual_object(pair.first.value, 0)
-                    if self._check_comparison_end():
-                        break
 
-                while self._state == ExperimentState.COMPARISON:
+                self._virtual_object.reset()
+                while self._running and not self._check_comparison_end():
                     self._update_virtual_object(pair.second.value, 1)
-                    if self._check_comparison_end():
-                        break
 
+                print("Question")
                 self._state = ExperimentState.QUESTION
+                # .recv is a blocking call, waiting for input from the frontend
+                answer_data = self._input_socket.recv(1024)
+                answer = ExperimentControl.model_validate_json(answer_data)
+                answers.append(QuestionInput(answer.questionInput))
 
 
     def _arduino_control_loop(self):
@@ -278,17 +294,19 @@ class Experiment:
                 x_movement = self._virtual_object.x - self._virtual_object.prev_x
                 y_movement = self._virtual_object.y - self._virtual_object.prev_y
                 
+                stiffness_value = self._virtual_object.stiffness_value
                 if abs(x_movement) > MOVEMENT_THRESHOLD or abs(y_movement) > MOVEMENT_THRESHOLD:
                     if abs(x_movement) > abs(y_movement):
+                        # TODO - Add support on arduino/motor side for this communication protocol (with stiffness values)
                         if x_movement < 0:  # Moving left
-                            self._arduino.write(b'L')  # Left signal
+                            self._arduino.write(f'L{stiffness_value}'.encode())  # Left signal
                         else:  # Moving right
-                            self._arduino.write(b'R')  # Right signal
+                            self._arduino.write(f'R{stiffness_value}'.encode())  # Right signal
                     else:
                         if y_movement < 0:  # Moving up
-                            self._arduino.write(b'U')  # Up signal
+                            self._arduino.write(f'U{stiffness_value}'.encode())  # Up signal
                         else:  # Moving down
-                            self._arduino.write(b'D')  # Down signal
+                            self._arduino.write(f'D{stiffness_value}'.encode())  # Down signal
             elif not steady_flag:
                 self._arduino.write(b'S')
                 steady_flag = True
@@ -309,7 +327,8 @@ class Experiment:
                     FingerPosition(x=current_pos.pinky_x / self._width, z=current_pos.pinky_y / self._height)
                 ]
 
-                packet = GamePacket(
+                packet = ExperimentPacket(
+                    state=self._state.value,
                     landmarks=finger_positions,
                     trackingObject=TrackingObject(
                         x=self._virtual_object.x / self._width,
@@ -317,13 +336,14 @@ class Experiment:
                         size=self._virtual_object.size,
                         isPinched=self._virtual_object.is_pinched,
                         progress=self._virtual_object.progress,
-                        cycleCount=self._virtual_object.cycle_counter
+                        cycleCount=self._virtual_object.cycle_counter,
+                        pairIndex=self._virtual_object.pair_index
                     )
                 )
 
                 try:
                     # * Send information to unity via udp socket
-                    self._udp_socket.sendto(packet.model_dump_json().encode("utf-8"), (self._server_address, self._server_port))
+                    self._data_socket.sendto(packet.model_dump_json().encode("utf-8"), (self._server_address, self._frontend_port))
                 except Exception as e:
                     print(f"Failed to send UDP data: {e}")
                     
@@ -539,7 +559,7 @@ class Experiment:
         self._running = False
         keyboard.unhook_all()
         cv2.destroyAllWindows()
-        self._udp_socket.close()
+        self._data_socket.close()
         if not ARDUINO_DEBUG and self._arduino:
             self._arduino.close()
 
