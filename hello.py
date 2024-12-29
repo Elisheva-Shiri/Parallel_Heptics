@@ -1,23 +1,57 @@
+import csv
+from enum import Enum
+from pathlib import Path
 import keyboard
-import signal
 import math
 from time import sleep
 import cv2
 import threading
-from dataclasses import dataclass
-from typing import Any, Optional, Literal
+from typing import Any, Optional
 from threading import Lock
 import numpy as np
 import mediapipe as mp
 import socket
 from pydantic import BaseModel
 import serial
-import csv
 from structures import FingerPosition, TrackingObject, GamePacket
-from consts import HEIGHT, PYGAME_PORT, VIRTUAL_WORLD_FPS, WIDTH
+from consts import HEIGHT, PYGAME_PORT, VIRTUAL_WORLD_FPS, WIDTH, FingerPair
 
 ARDUINO_DEBUG = True
 SIDE_CAMERA_DEBUG = True
+
+ExperimentState = Enum("ExperimentState", ["START", "READ_CONFIG", "COMPARISON", "QUESTION", "PAUSE`", "END"])
+
+class StiffnessValue(BaseModel):
+    value: int
+    # ! Add support for different fingers
+    # finger: FingerPair
+
+
+class StiffnessPair(BaseModel):
+    first: StiffnessValue
+    second: StiffnessValue
+
+    
+class Configuration(BaseModel):
+    pairs: list[StiffnessPair]
+
+    # * Special constructor that accepts path and returns Configuration (instead of acception "pairs")
+    @staticmethod
+    def read_configuration(path: str):
+        if not Path(path).exists():
+            raise Exception("Missing configuration file")
+        
+        with open(path, 'r') as file:
+            csv_reader = csv.reader(file)
+            return Configuration(
+                [
+                    StiffnessPair(first=StiffnessValue(int(row[0])),
+                                  second=StiffnessValue(int(row[1]))) for row in csv_reader
+                ]
+            )
+        
+        
+
 
 class HandPosition(BaseModel):
     thumb_x: float
@@ -34,8 +68,8 @@ class HandPosition(BaseModel):
     active_finger_y: float
 
 class VirtualObject(BaseModel):
-    x: float
-    y: float
+    x: float = 0.0
+    y: float = 0.0
     size: float = 40.0  # Size of cube sides
     original_x: float = 0.0  # Center of plane
     original_y: float = 0.0  # Center of plane
@@ -43,23 +77,41 @@ class VirtualObject(BaseModel):
     prev_x: float = 0.0  # Track previous x position for movement detection
     prev_y: float = 0.0  # Track previous y position for movement detection
 
-    movement_phase: int = 1  # Tracks the movement phase (1, 2, 3)
     progress: float = 0.0   # Tracks the movement progress (0.0 to 1.0)
     cycle_counter: int = 0  # Counts full movement cycles
 
-FingerPair = Literal["index", "middle", "ring"]
+    def model_post_init(self, __context) -> None:
+        self.reset()
 
-class HandTracker:
-    def __init__(self, finger_pair: FingerPair = "index", width: int = WIDTH, height: int = HEIGHT, camera_fps: int = 30,
+    def reset(self):
+        # Reset object location
+        self.x = self.original_x
+        self.y = self.original_y
+        self.prev_x = self.original_x
+        self.prev_y = self.original_y
+
+        # reset progress/Cycle Counter
+        self.progress = 0.0
+        self.cycle_counter = 0
+
+        # TODO - Is pinch reset necessary?
+
+class Experiment:
+    def __init__(self, config: Configuration, finger_pair: FingerPair = "index", width: int = WIDTH, height: int = HEIGHT, camera_fps: int = 30,
                  server_address: str = "localhost", server_port: int = PYGAME_PORT):
+        
+        # SETUP
         self._hand_position_lock = Lock()
         self._visualization_lock = Lock()
         self._current_position: Optional[HandPosition] = None
         self._is_pinching = False
+        self._config = config
         self._width = width
         self._height = height
         self._virtual_world_fps = VIRTUAL_WORLD_FPS
         self._camera_fps = camera_fps
+        # TODO - add Start screen if needed, and adjust to ExperimentState.START
+        self._state: ExperimentState = ExperimentState.READ_CONFIG
         
         # Movement tracking thresholds
         self.CENTER_THRESHOLD = 20  # Pixels from center to start movement
@@ -76,12 +128,8 @@ class HandTracker:
         
         # Create virtual object at center of screen
         self._virtual_object = VirtualObject(
-            x=self._width/2,
-            y=self._height/2,
             original_x=self._width/2,
             original_y=self._height/2,
-            prev_x=self._width/2,
-            prev_y=self._height/2
         )
         self._running = True
         
@@ -98,6 +146,10 @@ class HandTracker:
         
         # Threshold for pinch detection (adjust as needed)
         self.BASE_PINCH_THRESHOLD = 1.5  # pixels
+
+        # Start Experiment Management thread
+        self._management_thread = threading.Thread(target=self._management_loop, daemon=True)
+        self._management_thread.start()
 
         # Start UDP sender thread
         self._network_thread = threading.Thread(target=self._network_loop, daemon=True)
@@ -125,6 +177,36 @@ class HandTracker:
             self._side_thread = threading.Thread(target=self.start_side_camera, daemon=True)
             self._side_thread.start()
 
+    def _sleep(self):
+        sleep(1.0 / self._virtual_world_fps)
+
+    def _management_loop(self):
+        for pair in self._config.pairs:
+            while self._running and self._state != ExperimentState.READ_CONFIG:
+                self._sleep()
+            
+            if not self._running:
+                # Exit via Ctrl-C
+                break
+
+            # Read the next pair and decide action
+            if pair.first.value == -1:
+                if pair.second.value != -1:
+                    raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
+                self._state = ExperimentState.END
+                break
+
+            elif pair.first.value == 0:
+                if pair.second.value != 0:
+                    raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
+
+                self._state = ExperimentState.PAUSE
+
+            else:
+                self._virtual_object.reset()
+                self._state = ExperimentState.COMPARISON
+
+
     def _arduino_control_loop(self):
         """Thread that controls Arduino based on hand movement"""
         MOVEMENT_THRESHOLD = 5.0  # Minimum movement to trigger signal
@@ -151,7 +233,7 @@ class HandTracker:
                 self._arduino.write(b'S')
                 steady_flag = True
                             
-            sleep(1.0 / self._virtual_world_fps)
+            self._sleep()
 
     def _network_loop(self):
         """Thread that sends hand position data over UDP"""
@@ -185,7 +267,7 @@ class HandTracker:
                 except Exception as e:
                     print(f"Failed to send UDP data: {e}")
                     
-            sleep(1.0 / self._virtual_world_fps)
+            self._sleep()
 
     def _calculate_pinch_threshold(self, depth: float) -> float:
         """Adjust threshold based on depth (distance from side camera)"""
@@ -283,10 +365,10 @@ class HandTracker:
             self._virtual_object.y = self._virtual_object.original_y
             self._virtual_object.progress = 0.0
 
-    
 
     def start_top_camera(self):
         """Process top camera feed to track finger positions"""
+        # TODO - Consider spliting top camera thread to two threads - camera read and virtual object management
         backend = cv2.CAP_DSHOW
         cap = cv2.VideoCapture(self.TOP_CAMERA, backend) if backend else cv2.VideoCapture()
         if not cap.isOpened():
@@ -438,21 +520,21 @@ class HandTracker:
         if not ARDUINO_DEBUG and self._arduino:
             self._arduino.close()
 
-def start_hand_tracking(finger_pair: FingerPair = "index"):
+def start_experiment(config: Configuration, finger_pair: FingerPair = "index"):
     """Initialize and start the hand tracking system"""
-    tracker = HandTracker(finger_pair)
+    experiment = Experiment(config, finger_pair)
     
-    return tracker
+    return experiment
 
-if __name__ == "__main__":
-    config = []
-    with open('configuration.csv', 'r') as file:
-        csv_reader = csv.reader(file)
-        config = [[int(val) for val in row] for row in csv_reader]
-
-    tracker = start_hand_tracking()
+def main():
+    config = Configuration.read_configuration('configuration.csv')
+    experiment = start_experiment(config)
     try:
         while True:
             sleep(0.1)
     except KeyboardInterrupt:
-        tracker.cleanup()
+        experiment.cleanup()
+
+
+if __name__ == "__main__":
+    main()    

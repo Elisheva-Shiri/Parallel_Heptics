@@ -2,6 +2,9 @@ import csv
 import os
 import random
 from typing import List, Union
+from consts import FingerPair
+
+# TODO - add FingerPair value (Literal["index", "middle", "ring"]) after each stiffness value
 
 def mix_values(comparisons: List[int]) -> List[int]:
     """Randomly shuffle the comparison values."""
