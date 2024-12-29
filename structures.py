@@ -27,9 +27,12 @@ class TrackingObject(Position):
     cycleCount: int
     pairIndex: int
 
+class StateData(BaseModel):
+    state: int
+    pauseTime: int
 
 class ExperimentPacket(BaseModel):
-    state: int
+    stateData: StateData
     landmarks: list[FingerPosition]
     trackingObject: TrackingObject
 

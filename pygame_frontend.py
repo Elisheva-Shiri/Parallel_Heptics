@@ -142,14 +142,14 @@ class PygameFrontEnd:
             pygame.draw.rect(self.screen, (64, 64, 64), (self._width - 150, self._height/2 + 60, button_width, 10))
             pygame.draw.rect(self.screen, (0, 255, 0), (self._width - 150, self._height/2 + 60, button_width * progress, 10))
 
-    def _draw_pause(self):
+    def _draw_pause(self, pause_time: int):
         # Draw pause screen title
         title = self._title_font.render("Take a break!", True, (255, 255, 255))
         title_rect = title.get_rect(center=(self._width/2, self._height/2 - 30))
         self.screen.blit(title, title_rect)
 
         # Draw pause screen subtitle
-        subtitle = self._font.render("60 seconds break before moving to the next test...", True, (255, 255, 255))
+        subtitle = self._font.render(f"{pause_time} seconds left before moving to the next test...", True, (255, 255, 255))
         subtitle_rect = subtitle.get_rect(center=(self._width/2, self._height/2 + 30))
         self.screen.blit(subtitle, subtitle_rect)
 
@@ -177,7 +177,7 @@ class PygameFrontEnd:
             pygame.draw.circle(self.screen, (255, 0, 0),
                             (int(finger_position.x * self._width), int(finger_position.z * self._height)), 5)
         
-        match packet.state:
+        match packet.stateData.state:
             case ExperimentState.COMPARISON.value:
                 self._draw_comparison(packet.trackingObject)
 
@@ -185,7 +185,7 @@ class PygameFrontEnd:
                 self._draw_question(packet.landmarks)
 
             case ExperimentState.PAUSE.value:
-                self._draw_pause()
+                self._draw_pause(packet.stateData.pauseTime)
 
             case ExperimentState.END.value:
                 self._draw_end()

@@ -12,7 +12,7 @@ import mediapipe as mp
 import socket
 from pydantic import BaseModel
 import serial
-from structures import ExperimentControl, ExperimentState, FingerPosition, QuestionInput, TrackingObject, ExperimentPacket
+from structures import ExperimentControl, ExperimentState, FingerPosition, QuestionInput, StateData, TrackingObject, ExperimentPacket
 from consts import BACKEND_PORT, HEIGHT, PAUSE_SLEEP_SECONDS, PYGAME_PORT, TARGET_CYCLE_COUNT, VIRTUAL_WORLD_FPS, WIDTH, FingerPair
 
 # TODO - Add saving recordings and tracking CSV according to the data architecture
@@ -116,6 +116,7 @@ class Experiment:
         self._camera_fps = camera_fps
         # TODO - add Start screen if needed, and adjust to ExperimentState.START
         self._state = ExperimentState.COMPARISON
+        self._pause_time = 0
         
         # Movement tracking thresholds
         self.CENTER_THRESHOLD = 20  # Pixels from center to start movement
@@ -258,12 +259,16 @@ class Experiment:
                     raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
 
                 print("Pausing")
+                self._pause_time = PAUSE_SLEEP_SECONDS
                 self._state = ExperimentState.PAUSE
-                for _ in range(PAUSE_SLEEP_SECONDS):
-                    # sleeping one second at a time so we can exit via Ctrl-C during pause
+                for i in range(PAUSE_SLEEP_SECONDS, 0, -1):
+                    # sleeping one second at a time to update frontend + exit via Ctrl-C during pause
                     sleep(1)
+                    self._pause_time = i
                     if not self._running:
                         break;
+            
+                self._pause_time = 0
 
             else:
                 print("Comparing")
@@ -336,7 +341,7 @@ class Experiment:
                 ]
 
                 packet = ExperimentPacket(
-                    state=self._state.value,
+                    stateData=StateData(state=self._state.value, pauseTime=self._pause_time),
                     landmarks=finger_positions,
                     trackingObject=TrackingObject(
                         x=self._virtual_object.x / self._width,
