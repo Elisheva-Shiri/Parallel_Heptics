@@ -1,4 +1,5 @@
-import json
+import keyboard
+import signal
 import math
 from time import sleep
 import cv2
@@ -8,16 +9,17 @@ from typing import Any, Optional, Literal
 from threading import Lock
 import numpy as np
 import mediapipe as mp
-import pygame
 import socket
+from pydantic import BaseModel
 import serial
 import csv
-import time
+from structures import FingerPosition, TrackingObject, GamePacket
+from consts import HEIGHT, PYGAME_PORT, VIRTUAL_WORLD_FPS, WIDTH
 
 ARDUINO_DEBUG = True
 SIDE_CAMERA_DEBUG = True
-@dataclass 
-class HandPosition:
+
+class HandPosition(BaseModel):
     thumb_x: float
     thumb_y: float
     index_x: float 
@@ -31,8 +33,7 @@ class HandPosition:
     active_finger_x: float  # The chosen finger for object control
     active_finger_y: float
 
-@dataclass
-class VirtualObject:
+class VirtualObject(BaseModel):
     x: float
     y: float
     size: float = 40.0  # Size of cube sides
@@ -49,15 +50,15 @@ class VirtualObject:
 FingerPair = Literal["index", "middle", "ring"]
 
 class HandTracker:
-    def __init__(self, finger_pair: FingerPair = "index", width: int = 640, height: int = 480, camera_fps: int = 30,
-                 server_address: str = "localhost", server_port: int = 12345):
+    def __init__(self, finger_pair: FingerPair = "index", width: int = WIDTH, height: int = HEIGHT, camera_fps: int = 30,
+                 server_address: str = "localhost", server_port: int = PYGAME_PORT):
         self._hand_position_lock = Lock()
         self._visualization_lock = Lock()
         self._current_position: Optional[HandPosition] = None
         self._is_pinching = False
         self._width = width
         self._height = height
-        self._virtual_world_fps = 30
+        self._virtual_world_fps = VIRTUAL_WORLD_FPS
         self._camera_fps = camera_fps
         
         # Movement tracking thresholds
@@ -97,15 +98,6 @@ class HandTracker:
         
         # Threshold for pinch detection (adjust as needed)
         self.BASE_PINCH_THRESHOLD = 1.5  # pixels
-        
-        # Initialize pygame for visualization and keyboard input
-        pygame.init()
-        pygame.font.init()
-        self._font = pygame.font.SysFont('Arial', 30)
-        
-        # Start visualization thread
-        self._viz_thread = threading.Thread(target=self._visualization_loop, daemon=True)
-        self._viz_thread.start()
 
         # Start UDP sender thread
         self._network_thread = threading.Thread(target=self._network_loop, daemon=True)
@@ -126,7 +118,10 @@ class HandTracker:
         self._top_thread = threading.Thread(target=self.start_top_camera, daemon=True)
         self._top_thread.start()
 
-        if not SIDE_CAMERA_DEBUG:        
+        if SIDE_CAMERA_DEBUG:
+            # Register the space key interrupt to target function
+            keyboard.on_press_key("space", self._detect_pinch_space)
+        else:
             self._side_thread = threading.Thread(target=self.start_side_camera, daemon=True)
             self._side_thread.start()
 
@@ -165,26 +160,28 @@ class HandTracker:
             if current_pos:
                 # Convert to list of finger positions
                 finger_positions = [
-                    {"x": current_pos.thumb_x / self._width, "z": current_pos.thumb_y / self._height},
-                    {"x": current_pos.index_x / self._width, "z": current_pos.index_y / self._height}, 
-                    {"x": current_pos.middle_x / self._width, "z": current_pos.middle_y / self._height},
-                    {"x": current_pos.ring_x / self._width, "z": current_pos.ring_y / self._height},
-                    {"x": current_pos.pinky_x / self._width, "z": current_pos.pinky_y / self._height}
+                    FingerPosition(x=current_pos.thumb_x / self._width, z=current_pos.thumb_y / self._height),
+                    FingerPosition(x=current_pos.index_x / self._width, z=current_pos.index_y / self._height), 
+                    FingerPosition(x=current_pos.middle_x / self._width, z=current_pos.middle_y / self._height),
+                    FingerPosition(x=current_pos.ring_x / self._width, z=current_pos.ring_y / self._height),
+                    FingerPosition(x=current_pos.pinky_x / self._width, z=current_pos.pinky_y / self._height)
                 ]
 
-                json_data = json.dumps({
-                    "landmarks": finger_positions,
-                    "trackingObject": {
-                        "x": self._virtual_object.x / self._width,
-                        "z": self._virtual_object.y / self._height,
-                        "progress": self._virtual_object.progress,
-                        "cycleCount": self._virtual_object.cycle_counter
-                    }
-                })
-                
+                packet = GamePacket(
+                    landmarks=finger_positions,
+                    trackingObject=TrackingObject(
+                        x=self._virtual_object.x / self._width,
+                        z=self._virtual_object.y / self._height,
+                        size=self._virtual_object.size,
+                        isPinched=self._virtual_object.is_pinched,
+                        progress=self._virtual_object.progress,
+                        cycleCount=self._virtual_object.cycle_counter
+                    )
+                )
+
                 try:
                     # * Send information to unity via udp socket
-                    self._udp_socket.sendto(json_data.encode("utf-8"), (self._server_address, self._server_port))
+                    self._udp_socket.sendto(packet.model_dump_json().encode("utf-8"), (self._server_address, self._server_port))
                 except Exception as e:
                     print(f"Failed to send UDP data: {e}")
                     
@@ -286,88 +283,7 @@ class HandTracker:
             self._virtual_object.y = self._virtual_object.original_y
             self._virtual_object.progress = 0.0
 
-    def _draw_visualization(self):
-        """Draw fingers and virtual object visualization"""
-        # TODO - Add red rectangle signaling the middle
-        with self._visualization_lock:
-            for event in pygame.event.get():
-                if not self._handle_pygame_events(event):
-                    return
-
-            self.screen.fill((0, 0, 0))
-            
-            current_position = self.get_hand_position()
-            if current_position:
-                # Draw all fingers as circles
-                pygame.draw.circle(self.screen, (255, 0, 0),
-                                 (int(current_position.thumb_x), int(current_position.thumb_y)), 5)
-                pygame.draw.circle(self.screen, (0, 0, 255),
-                                 (int(current_position.index_x), int(current_position.index_y)), 5)
-                pygame.draw.circle(self.screen, (0, 255, 0),
-                                 (int(current_position.middle_x), int(current_position.middle_y)), 5)
-                pygame.draw.circle(self.screen, (255, 255, 0),
-                                 (int(current_position.ring_x), int(current_position.ring_y)), 5)
-                pygame.draw.circle(self.screen, (255, 0, 255),
-                                 (int(current_position.pinky_x), int(current_position.pinky_y)), 5)
-                
-                pygame.draw.line(self.screen, (0, 255, 0),
-                               (int(current_position.thumb_x), int(current_position.thumb_y)),
-                               (int(current_position.active_finger_x), int(current_position.active_finger_y)), 2)
-            
-            # Draw virtual object
-            color = (255, 165, 0) if self._virtual_object.is_pinched else (128, 128, 128)
-            half_size = self._virtual_object.size / 2
-            rect = pygame.Rect(
-                int(self._virtual_object.x - half_size),
-                int(self._virtual_object.y - half_size),
-                int(self._virtual_object.size),
-                int(self._virtual_object.size)
-            )
-            pygame.draw.rect(self.screen, color, rect)
-            
-            # Draw progress bar
-            bar_width = 200
-            bar_height = 20
-            bar_x = (self._width - bar_width) // 2
-            bar_y = self._height - 40
-            
-            # Background bar
-            pygame.draw.rect(self.screen, (64, 64, 64),
-                           (bar_x, bar_y, bar_width, bar_height))
-            
-            # Progress fill
-            fill_width = int(bar_width * self._virtual_object.progress)
-            if fill_width > 0:
-                pygame.draw.rect(self.screen, (0, 255, 0),
-                               (bar_x, bar_y, fill_width, bar_height))
-                
-            # Draw movement counter
-            counter_text = self._font.render(str(self._virtual_object.cycle_counter), True, (255, 255, 255))
-            self.screen.blit(counter_text, (self._width - 50, self._height - 40))
-
-            pygame.display.flip()
-
-    def _visualization_loop(self):
-        """Separate thread for visualization updates"""
-        self.screen = pygame.display.set_mode((self._width, self._height))
-        pygame.display.set_caption("Hand Tracking Visualization")
-        clock = pygame.time.Clock()
-
-        while self._running:
-            self._draw_visualization()
-            clock.tick(self._virtual_world_fps)
-
-    def _handle_pygame_events(self, event: pygame.event.Event) -> bool:
-        """ Handle pygame events and returns if the program should continue running"""
-        match event.type:
-            case pygame.KEYDOWN:
-                if event.key == pygame.K_SPACE:
-                    self.toggle_pinch()
-            case pygame.QUIT:
-                self._running = False
-                pygame.quit()
-                return False
-        return True
+    
 
     def start_top_camera(self):
         """Process top camera feed to track finger positions"""
@@ -432,7 +348,7 @@ class HandTracker:
         """Get current pinch state"""
         return self._is_pinching
 
-    def toggle_pinch(self):
+    def _toggle_pinch(self):
         """Toggle pinch state when not using camera"""
         print(f"toggle pinch from {self._is_pinching} to {not self._is_pinching}")
         self._is_pinching = not self._is_pinching
@@ -470,7 +386,20 @@ class HandTracker:
                 active_finger_y=active_tip.y * self._height
             )
             
-        return HandPosition(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        return HandPosition(
+            thumb_x=0.0,
+            thumb_y=0.0,
+            index_x=0.0,
+            index_y=0.0,
+            middle_x=0.0,
+            middle_y=0.0,
+            ring_x=0.0,
+            ring_y=0.0,
+            pinky_x=0.0,
+            pinky_y=0.0,
+            active_finger_x=0.0,
+            active_finger_y=0.0
+        )
 
     def _detect_pinch(self, frame: np.ndarray, hands: Any):
         """Process side camera frame to detect pinch gesture"""
@@ -494,12 +423,17 @@ class HandTracker:
             self._is_pinching = distance < threshold
         else:
             self._is_pinching = False
+
+    def _detect_pinch_space(self, event):
+        if event.event_type == keyboard.KEY_DOWN:
+            self._toggle_pinch()
+
         
     def cleanup(self):
         """Clean up resources"""
         self._running = False
+        keyboard.unhook_all()
         cv2.destroyAllWindows()
-        pygame.quit()
         self._udp_socket.close()
         if not ARDUINO_DEBUG and self._arduino:
             self._arduino.close()
