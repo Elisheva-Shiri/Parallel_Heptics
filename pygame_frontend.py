@@ -25,8 +25,8 @@ class PygameFrontEnd:
         self._data_socket.bind((server_address, frontend_port))
 
         # Initialize socket to send user input to backend
-        self._input_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._input_socket.connect((server_address, backend_port))
+        # self._input_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # self._input_socket.connect((server_address, backend_port))
         
         # Initialize pygame for visualization and keyboard input
         pygame.init()
@@ -98,19 +98,21 @@ class PygameFrontEnd:
             
             if left_button.collidepoint(finger_pos):
                 self._left_button_timer += 1
-                if self._left_button_timer >= self._button_hold_time:
-                    self._input_socket.sendall(
-                        ExperimentControl(questionInput=QuestionInput.LEFT.value).model_dump_json().encode()
-                    )
+                # if self._left_button_timer >= self._button_hold_time:
+                #     # ! BUG: will send data to backend over and over even if the button is not released
+                #     self._input_socket.sendall(
+                #         ExperimentControl(questionInput=QuestionInput.LEFT.value).model_dump_json().encode()
+                #     )
             else:
                 self._left_button_timer = 0
 
             if right_button.collidepoint(finger_pos):
                 self._right_button_timer += 1
-                if self._right_button_timer >= self._button_hold_time:
-                    self._input_socket.sendall(
-                        ExperimentControl(questionInput=QuestionInput.RIGHT.value).model_dump_json().encode()
-                    )
+                # if self._right_button_timer >= self._button_hold_time:
+                #     # ! BUG: will send data to backend over and over even if the button is not released
+                #     self._input_socket.sendall(
+                #         ExperimentControl(questionInput=QuestionInput.RIGHT.value).model_dump_json().encode()
+                #     )
             else:
                 self._right_button_timer = 0
 

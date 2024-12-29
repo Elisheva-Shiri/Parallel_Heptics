@@ -134,11 +134,11 @@ class Experiment:
         self._input_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         
         # Bind sockets
-        print("Waiting for connection")
-        self._input_socket.bind((self._server_address, self._backend_port))
-        self._input_socket.listen()
-        self._input_socket.accept()
-        print("Connection accepted")
+        # print("Waiting for connection")
+        # self._input_socket.bind((self._server_address, self._backend_port))
+        # self._input_socket.listen()
+        # self._input_socket.accept()
+        # print("Connection accepted")
 
         # Create virtual object at center of screen
         self._virtual_object = VirtualObject(
@@ -153,6 +153,8 @@ class Experiment:
             "middle": mp.solutions.hands.HandLandmark.MIDDLE_FINGER_TIP,
             "ring": mp.solutions.hands.HandLandmark.RING_FINGER_TIP
         }[finger_pair]
+
+        import ipdb; ipdb.set_trace()
         
         # Camera indices
         self.TOP_CAMERA = 0
@@ -278,9 +280,9 @@ class Experiment:
                 print("Question")
                 self._state = ExperimentState.QUESTION
                 # .recv is a blocking call, waiting for input from the frontend
-                answer_data = self._input_socket.recv(1024)
-                answer = ExperimentControl.model_validate_json(answer_data)
-                answers.append(QuestionInput(answer.questionInput))
+                # answer_data = self._input_socket.recv(1024)
+                # answer = ExperimentControl.model_validate_json(answer_data)
+                # answers.append(QuestionInput(answer.questionInput))
 
 
     def _arduino_control_loop(self):
@@ -551,6 +553,7 @@ class Experiment:
 
     def _detect_pinch_space(self, event):
         if event.event_type == keyboard.KEY_DOWN:
+            import ipdb; ipdb.set_trace()
             self._toggle_pinch()
 
         
