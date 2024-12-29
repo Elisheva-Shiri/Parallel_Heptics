@@ -117,7 +117,7 @@ class PygameFrontEnd:
                     )
                     self._right_button_sent = True
             else:
-                self._right_button_timer = 0 
+                self._right_button_timer = 0
                 self._right_button_sent = False
 
         # Draw progress bars for button holds

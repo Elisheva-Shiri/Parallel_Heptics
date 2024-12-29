@@ -258,6 +258,7 @@ class Experiment:
                 print("Pausing")
                 self.state = ExperimentState.PAUSE
                 for _ in range(PAUSE_SLEEP_SECONDS):
+                    # sleeping one second at a time so we can exit via Ctrl-C during pause
                     sleep(1)
                     if not self._running:
                         break;
@@ -282,6 +283,7 @@ class Experiment:
                 print("Question")
                 self._state = ExperimentState.QUESTION
                 # .recv is a blocking call, waiting for input from the frontend
+                # TODO - add support for exit via Ctrl-C
                 answer_data = self._input_socket.recv(1024)
                 answer = ExperimentControl.model_validate_json(answer_data)
                 answers.append(QuestionInput(answer.questionInput))
