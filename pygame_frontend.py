@@ -110,6 +110,7 @@ class PygameFrontEnd:
         if left_touched:
             self._left_button_timer += 1
             if self._left_button_timer >= self._button_hold_time and not self._left_button_sent:
+                self._left_button_timer = self._button_hold_time  # limit the timer to the hold time
                 self._input_socket.sendall(
                     ExperimentControl(questionInput=QuestionInput.LEFT.value).model_dump_json().encode()
                 )
@@ -121,6 +122,7 @@ class PygameFrontEnd:
         if right_touched:
             self._right_button_timer += 1
             if self._right_button_timer >= self._button_hold_time and not self._right_button_sent:
+                self._right_button_timer = self._button_hold_time  # limit the timer to the hold time
                 self._input_socket.sendall(
                     ExperimentControl(questionInput=QuestionInput.RIGHT.value).model_dump_json().encode()
                 )
@@ -139,6 +141,23 @@ class PygameFrontEnd:
             progress = self._right_button_timer / self._button_hold_time
             pygame.draw.rect(self.screen, (64, 64, 64), (self._width - 150, self._height/2 + 60, button_width, 10))
             pygame.draw.rect(self.screen, (0, 255, 0), (self._width - 150, self._height/2 + 60, button_width * progress, 10))
+
+    def _draw_pause(self):
+        # Draw pause screen title
+        title = self._title_font.render("Take a break!", True, (255, 255, 255))
+        title_rect = title.get_rect(center=(self._width/2, self._height/2 - 30))
+        self.screen.blit(title, title_rect)
+
+        # Draw pause screen subtitle
+        subtitle = self._font.render("60 seconds break before moving to the next test...", True, (255, 255, 255))
+        subtitle_rect = subtitle.get_rect(center=(self._width/2, self._height/2 + 30))
+        self.screen.blit(subtitle, subtitle_rect)
+
+    def _draw_end(self):
+        # Draw end screen title
+        title = self._title_font.render("Thank you for participating!", True, (255, 255, 255))
+        title_rect = title.get_rect(center=(self._width/2, self._height/2 - 30))
+        self.screen.blit(title, title_rect)
 
     def _draw_visualization(self):
         """Draw fingers and virtual object visualization"""
@@ -165,7 +184,11 @@ class PygameFrontEnd:
             case ExperimentState.QUESTION.value:
                 self._draw_question(packet.landmarks)
 
-            # TODO - Add Pause>End>Start screens
+            case ExperimentState.PAUSE.value:
+                self._draw_pause()
+
+            case ExperimentState.END.value:
+                self._draw_end()
 
             case _:
                 pass

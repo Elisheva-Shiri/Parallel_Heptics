@@ -250,7 +250,7 @@ class Experiment:
                     raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
                 
                 print("Exit via end of experiment")
-                self.state = ExperimentState.END
+                self._state = ExperimentState.END
                 break
 
             elif pair.first.value == 0:
@@ -258,7 +258,7 @@ class Experiment:
                     raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
 
                 print("Pausing")
-                self.state = ExperimentState.PAUSE
+                self._state = ExperimentState.PAUSE
                 for _ in range(PAUSE_SLEEP_SECONDS):
                     # sleeping one second at a time so we can exit via Ctrl-C during pause
                     sleep(1)

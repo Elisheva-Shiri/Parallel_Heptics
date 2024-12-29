@@ -203,4 +203,5 @@ cython_debug/
 ### Other
 VR_Experiment_1/
 configuration.csv
+configuration_backup.csv
 basic_logic.txt
