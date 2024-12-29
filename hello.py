@@ -14,7 +14,7 @@ import socket
 from pydantic import BaseModel
 import serial
 from structures import FingerPosition, TrackingObject, GamePacket
-from consts import HEIGHT, PYGAME_PORT, VIRTUAL_WORLD_FPS, WIDTH, FingerPair
+from consts import HEIGHT, PYGAME_PORT, TARGET_CYCLE_COUNT, VIRTUAL_WORLD_FPS, WIDTH, FingerPair
 
 ARDUINO_DEBUG = True
 SIDE_CAMERA_DEBUG = True
@@ -80,6 +80,10 @@ class VirtualObject(BaseModel):
     progress: float = 0.0   # Tracks the movement progress (0.0 to 1.0)
     cycle_counter: int = 0  # Counts full movement cycles
 
+    stiffness_value: int = 0 # Object stiffness value as read from the configuration
+    pair_index: int = 0 # 0 or 1
+
+
     def model_post_init(self, __context) -> None:
         self.reset()
 
@@ -93,6 +97,10 @@ class VirtualObject(BaseModel):
         # reset progress/Cycle Counter
         self.progress = 0.0
         self.cycle_counter = 0
+
+        # Reset the stiffness value/pair index since the previous value is no longer 
+        self.stiffness_value = 0
+        self.pair_index = 0
 
         # TODO - Is pinch reset necessary?
 
@@ -148,8 +156,8 @@ class Experiment:
         self.BASE_PINCH_THRESHOLD = 1.5  # pixels
 
         # Start Experiment Management thread
-        self._management_thread = threading.Thread(target=self._management_loop, daemon=True)
-        self._management_thread.start()
+        self._experiment_thread = threading.Thread(target=self._experiment_loop, daemon=True)
+        self._experiment_thread.start()
 
         # Start UDP sender thread
         self._network_thread = threading.Thread(target=self._network_loop, daemon=True)
@@ -180,7 +188,46 @@ class Experiment:
     def _sleep(self):
         sleep(1.0 / self._virtual_world_fps)
 
-    def _management_loop(self):
+    def _update_virtual_object(self):
+        """Update virtual object position based on hand position and pinch state"""
+        if self._current_position is None:
+            return
+            
+        # Check if fingers are near object for pinching
+        finger_midpoint_x = (self._current_position.thumb_x + self._current_position.active_finger_x) / 2
+        finger_midpoint_y = (self._current_position.thumb_y + self._current_position.active_finger_y) / 2
+        
+        distance_to_object = math.sqrt(
+            (finger_midpoint_x - self._virtual_object.x)**2 + 
+            (finger_midpoint_y - self._virtual_object.y)**2
+        )
+        
+        # Update object pinch state
+        if self._is_pinching and distance_to_object < self._virtual_object.size * 0.5:
+            self._virtual_object.is_pinched = True
+        elif not self._is_pinching:
+            self._virtual_object.is_pinched = False
+            
+        # Store previous positions
+        self._virtual_object.prev_x = self._virtual_object.x
+        self._virtual_object.prev_y = self._virtual_object.y
+            
+        # Move object with fingers if pinched
+        if self._virtual_object.is_pinched:
+            self._virtual_object.x = finger_midpoint_x
+            self._virtual_object.y = finger_midpoint_y
+            self._update_movement_progress()
+        else:
+            # Return to original position when released
+            self._virtual_object.x = self._virtual_object.original_x
+            self._virtual_object.y = self._virtual_object.original_y
+            self._virtual_object.progress = 0.0
+
+    def _check_comparison_end(self) -> bool:
+        return self._virtual_object.cycle_counter == TARGET_CYCLE_COUNT
+
+
+    def _experiment_loop(self):
         for pair in self._config.pairs:
             while self._running and self._state != ExperimentState.READ_CONFIG:
                 self._sleep()
@@ -205,6 +252,19 @@ class Experiment:
             else:
                 self._virtual_object.reset()
                 self._state = ExperimentState.COMPARISON
+            
+                # For each object in pair pass the stiffness value and pair index to the virtual
+                while self._state == ExperimentState.COMPARISON:
+                    self._update_virtual_object(pair.first.value, 0)
+                    if self._check_comparison_end():
+                        break
+
+                while self._state == ExperimentState.COMPARISON:
+                    self._update_virtual_object(pair.second.value, 1)
+                    if self._check_comparison_end():
+                        break
+
+                self._state = ExperimentState.QUESTION
 
 
     def _arduino_control_loop(self):
@@ -330,42 +390,6 @@ class Experiment:
         self.last_x = self._virtual_object.x
         self.last_y = self._virtual_object.y
 
-    def _update_virtual_object(self):
-        """Update virtual object position based on hand position and pinch state"""
-        if self._current_position is None:
-            return
-            
-        # Check if fingers are near object for pinching
-        finger_midpoint_x = (self._current_position.thumb_x + self._current_position.active_finger_x) / 2
-        finger_midpoint_y = (self._current_position.thumb_y + self._current_position.active_finger_y) / 2
-        
-        distance_to_object = math.sqrt(
-            (finger_midpoint_x - self._virtual_object.x)**2 + 
-            (finger_midpoint_y - self._virtual_object.y)**2
-        )
-        
-        # Update object pinch state
-        if self._is_pinching and distance_to_object < self._virtual_object.size * 0.5:
-            self._virtual_object.is_pinched = True
-        elif not self._is_pinching:
-            self._virtual_object.is_pinched = False
-            
-        # Store previous positions
-        self._virtual_object.prev_x = self._virtual_object.x
-        self._virtual_object.prev_y = self._virtual_object.y
-            
-        # Move object with fingers if pinched
-        if self._virtual_object.is_pinched:
-            self._virtual_object.x = finger_midpoint_x
-            self._virtual_object.y = finger_midpoint_y
-            self._update_movement_progress()
-        else:
-            # Return to original position when released
-            self._virtual_object.x = self._virtual_object.original_x
-            self._virtual_object.y = self._virtual_object.original_y
-            self._virtual_object.progress = 0.0
-
-
     def start_top_camera(self):
         """Process top camera feed to track finger positions"""
         # TODO - Consider spliting top camera thread to two threads - camera read and virtual object management
@@ -394,7 +418,6 @@ class Experiment:
                 
                 with self._hand_position_lock:
                     self._current_position = detected
-                    self._update_virtual_object()
 
     def start_side_camera(self):
         """Process side camera feed to detect pinch gestures"""

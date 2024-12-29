@@ -1,6 +1,6 @@
 import pygame
 import socket
-from consts import HEIGHT, PYGAME_PORT, VIRTUAL_WORLD_FPS, WIDTH
+from consts import HEIGHT, PYGAME_PORT, TARGET_CYCLE_COUNT, VIRTUAL_WORLD_FPS, WIDTH
 from structures import GamePacket
 
 class PygameFrontEnd:
@@ -82,7 +82,7 @@ class PygameFrontEnd:
                             (bar_x, bar_y, fill_width, bar_height))
             
         # Draw movement counter
-        counter_text = self._font.render(str(tracking_obj.cycleCount), True, (255, 255, 255))
+        counter_text = self._font.render(f"{tracking_obj.cycleCount}/{TARGET_CYCLE_COUNT}", True, (255, 255, 255))
         self.screen.blit(counter_text, (self._width - 50, self._height - 40))
 
         pygame.display.flip()
