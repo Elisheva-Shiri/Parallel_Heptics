@@ -299,8 +299,6 @@ class Experiment:
         self._virtual_object.reset()
 
     def _experiment_loop(self):
-        answers: list[QuestionInput] = []
-        
         for pair in self._config.pairs:
             if not self._running:
                 print("Exit via Ctrl-C")
@@ -354,12 +352,31 @@ class Experiment:
                     break
 
                 print("Question")
+                question_timestamp = datetime.now()
                 self._state = ExperimentState.QUESTION
                 # .recv is a blocking call, waiting for input from the frontend
                 # TODO - add support for exit via Ctrl-C
                 answer_data = self._control_socket.recv(1024)
                 answer = ExperimentControl.model_validate_json(answer_data)
-                answers.append(QuestionInput(answer.questionInput))
+
+                # Write to answers CSV in experiment folder
+                answers_file = self._path / 'answers.csv'
+
+                # Add headers if file does not exist
+                if not answers_file.exists():
+                    with open(answers_file, 'w', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(['timestamp', 'pair_number', 'time_to_answer', 'object_1_stiffness', 'object_2_stiffness', 'answer'])
+
+                with open(answers_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        question_timestamp.isoformat(),
+                        self._pair_counter,
+                        (datetime.now() - question_timestamp).total_seconds(),
+                        pair.first.value,
+                        pair.second.value,
+                        answer.questionInput])
 
 
     def _arduino_control_loop(self):
