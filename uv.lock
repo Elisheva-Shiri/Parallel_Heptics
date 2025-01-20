@@ -542,6 +542,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "ipdb" },
+    { name = "ipython" },
     { name = "ruff" },
 ]
 
@@ -559,6 +560,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "ipdb", specifier = ">=0.13.13" },
+    { name = "ipython", specifier = ">=8.29.0" },
     { name = "ruff", specifier = ">=0.7.4" },
 ]
 
