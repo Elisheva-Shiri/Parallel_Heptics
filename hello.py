@@ -6,7 +6,7 @@ import math
 from time import sleep
 import cv2
 import threading
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from threading import Lock
 import numpy as np
 import mediapipe as mp
@@ -14,7 +14,7 @@ import socket
 from pydantic import BaseModel
 import serial
 from structures import ExperimentControl, ExperimentState, FingerPosition, QuestionInput, StateData, TrackingObject, ExperimentPacket
-from consts import BACKEND_PORT, HEIGHT, PAUSE_SLEEP_SECONDS, PYGAME_PORT, TARGET_CYCLE_COUNT, VIRTUAL_WORLD_FPS, WIDTH, FingerPair
+from consts import BACKEND_PORT, HEIGHT, PAUSE_SLEEP_SECONDS, PYGAME_PORT, TARGET_CYCLE_COUNT, VIRTUAL_WORLD_FPS, WIDTH, PairFinger
 from queue import Queue
 
 # Create experiment folder if it doesn't exist
@@ -33,7 +33,9 @@ class StiffnessValue(BaseModel):
 
 class StiffnessPair(BaseModel):
     first: StiffnessValue
+    first_is_index: bool
     second: StiffnessValue
+    second_is_index: bool
 
     
 class Configuration(BaseModel):
@@ -49,7 +51,9 @@ class Configuration(BaseModel):
             csv_reader = csv.reader(file)
             return Configuration(pairs = [
                 StiffnessPair(first=StiffnessValue(value=int(row[0])),
-                                second=StiffnessValue(value=int(row[1]))) for row in csv_reader
+                                first_is_index=(int(row[1]) == 1),
+                                second=StiffnessValue(value=int(row[2])),
+                                second_is_index=(int(row[3]) == 1)) for row in csv_reader
             ])
     
     def write_configuration(self, path: str):
@@ -57,7 +61,7 @@ class Configuration(BaseModel):
         with open(path, 'w', newline='') as file:
             csv_writer = csv.writer(file)
             for pair in self.pairs:
-                csv_writer.writerow([pair.first.value, pair.second.value])
+                csv_writer.writerow([pair.first.value, 1 if pair.first_is_index else 0, pair.second.value, 1 if pair.second_is_index else 0])
         
         
 
@@ -65,14 +69,6 @@ class Configuration(BaseModel):
 class HandPosition(BaseModel):
     thumb_x: float
     thumb_y: float
-    index_x: float 
-    index_y: float
-    middle_x: float
-    middle_y: float
-    ring_x: float
-    ring_y: float
-    pinky_x: float
-    pinky_y: float
     active_finger_x: float  # The chosen finger for object control
     active_finger_y: float
 
@@ -113,7 +109,7 @@ class VirtualObject(BaseModel):
         self.pair_index = 0
 
 class Experiment:
-    def __init__(self, config: Configuration, path: Path, finger_pair: FingerPair = "index", width: int = WIDTH, height: int = HEIGHT, camera_fps: int = 30,
+    def __init__(self, config: Configuration, path: Path, pair_finger: PairFinger, width: int = WIDTH, height: int = HEIGHT, camera_fps: int = 30,
                  server_address: str = "localhost", frontend_port: int = PYGAME_PORT, backend_port: int = BACKEND_PORT):
         
         # SETUP
@@ -131,6 +127,9 @@ class Experiment:
         self._state = ExperimentState.COMPARISON
         self._pause_time = 0
         self._pair_counter = 0  # Counter for pair folders
+        self._pair_finger: PairFinger = pair_finger
+        # * Initialization only until experiment loop begins
+        self._update_active_finger(False)
 
         # Frame queues for recording
         self._top_frame_queue = Queue(maxsize=30)
@@ -164,13 +163,6 @@ class Experiment:
             original_y=self._height/2,
         )
         self._running = True
-        
-        # Set finger landmark based on selected pair
-        self._finger_landmark = {
-            "index": mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP,
-            "middle": mp.solutions.hands.HandLandmark.MIDDLE_FINGER_TIP,
-            "ring": mp.solutions.hands.HandLandmark.RING_FINGER_TIP
-        }[finger_pair]
 
         # Camera indices
         self.TOP_CAMERA = 0
@@ -298,7 +290,17 @@ class Experiment:
         self._is_pinching = False
         self._virtual_object.reset()
 
+    def _update_active_finger(self, is_index: bool):
+        # Set finger landmark based on selected pair
+        self._active_finger = "index" if is_index else self._pair_finger
+        self._active_landmark = {
+            "index": mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP,
+            "middle": mp.solutions.hands.HandLandmark.MIDDLE_FINGER_TIP,
+            "ring": mp.solutions.hands.HandLandmark.RING_FINGER_TIP
+        }[self._active_finger]
+
     def _experiment_loop(self):
+
         for pair in self._config.pairs:
             if not self._running:
                 print("Exit via Ctrl-C")
@@ -337,10 +339,12 @@ class Experiment:
 
                 # For each object in pair pass the stiffness value and pair index to the virtual
                 self._reset_comparison()
+                self._update_active_finger(pair.first_is_index)
                 while self._running and not self._check_comparison_end():
                     self._update_virtual_object(pair.first.value, 0)
 
                 self._reset_comparison()
+                self._update_active_finger(pair.second_is_index)
                 while self._running and not self._check_comparison_end():
                     self._update_virtual_object(pair.second.value, 1)
 
@@ -417,10 +421,7 @@ class Experiment:
                 # Convert to list of finger positions
                 finger_positions = [
                     FingerPosition(x=current_pos.thumb_x / self._width, z=current_pos.thumb_y / self._height),
-                    FingerPosition(x=current_pos.index_x / self._width, z=current_pos.index_y / self._height), 
-                    FingerPosition(x=current_pos.middle_x / self._width, z=current_pos.middle_y / self._height),
-                    FingerPosition(x=current_pos.ring_x / self._width, z=current_pos.ring_y / self._height),
-                    FingerPosition(x=current_pos.pinky_x / self._width, z=current_pos.pinky_y / self._height)
+                    FingerPosition(x=current_pos.active_finger_x / self._width, z=current_pos.active_finger_y / self._height)
                 ]
 
                 packet = ExperimentPacket(
@@ -523,7 +524,7 @@ class Experiment:
                     
                     # Create CSV with headers if it doesn't exist
                     if not tracking_file.exists():
-                        headers = ['timestamp', 'pinching', 'stiffness', 'object_x', 'object_y', *list(position_dict.keys())]
+                        headers = ['timestamp', 'pinching', 'stiffness', 'object_x', 'object_y', 'finger', *list(position_dict.keys())]
                         with open(tracking_file, 'w', newline='') as f:
                             writer = csv.writer(f)
                             writer.writerow(headers)
@@ -537,6 +538,7 @@ class Experiment:
                             self._virtual_object.stiffness_value,
                             self._virtual_object.x,
                             self._virtual_object.y,
+                            self._active_finger,
                             *list(position_dict.values())
                         ]
                         writer.writerow(row_data)
@@ -650,25 +652,13 @@ class Experiment:
             
             # Get positions for all fingers
             thumb_tip = hand_landmarks.landmark[mp.solutions.hands.HandLandmark.THUMB_TIP]
-            index_tip = hand_landmarks.landmark[mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP]
-            middle_tip = hand_landmarks.landmark[mp.solutions.hands.HandLandmark.MIDDLE_FINGER_TIP]
-            ring_tip = hand_landmarks.landmark[mp.solutions.hands.HandLandmark.RING_FINGER_TIP]
-            pinky_tip = hand_landmarks.landmark[mp.solutions.hands.HandLandmark.PINKY_TIP]
             
             # Get active finger for object control
-            active_tip = hand_landmarks.landmark[self._finger_landmark]
+            active_tip = hand_landmarks.landmark[self._active_landmark]
             
             return HandPosition(
                 thumb_x=self._width - thumb_tip.x * self._width,
                 thumb_y=thumb_tip.y * self._height,
-                index_x=self._width - index_tip.x * self._width,
-                index_y=index_tip.y * self._height,
-                middle_x=self._width - middle_tip.x * self._width,
-                middle_y=middle_tip.y * self._height,
-                ring_x=self._width - ring_tip.x * self._width,
-                ring_y=ring_tip.y * self._height,
-                pinky_x=self._width - pinky_tip.x * self._width,
-                pinky_y=pinky_tip.y * self._height,
                 active_finger_x=self._width - active_tip.x * self._width,
                 active_finger_y=active_tip.y * self._height
             )
@@ -676,14 +666,6 @@ class Experiment:
         return HandPosition(
             thumb_x=0.0,
             thumb_y=0.0,
-            index_x=0.0,
-            index_y=0.0,
-            middle_x=0.0,
-            middle_y=0.0,
-            ring_x=0.0,
-            ring_y=0.0,
-            pinky_x=0.0,
-            pinky_y=0.0,
             active_finger_x=0.0,
             active_finger_y=0.0
         )
@@ -698,7 +680,7 @@ class Experiment:
             hand_landmarks = results.multi_hand_landmarks[0]
             
             thumb_tip = hand_landmarks.landmark[mp.solutions.hands.HandLandmark.THUMB_TIP]
-            finger_tip = hand_landmarks.landmark[self._finger_landmark]
+            finger_tip = hand_landmarks.landmark[self._active_landmark]
             
             distance = math.sqrt(
                 (thumb_tip.x - finger_tip.x)**2 + 
@@ -724,13 +706,22 @@ class Experiment:
         if not ARDUINO_DEBUG and self._arduino:
             self._arduino.close()
 
-def start_experiment(config: Configuration, path: Path, finger_pair: FingerPair = "index"):
+def start_experiment(config: Configuration, path: Path, pair_finger: PairFinger):
     """Initialize and start the hand tracking system"""
-    experiment = Experiment(config, path, finger_pair)
+    experiment = Experiment(config, path, pair_finger)
     
     return experiment
 
-def create_experiment_folder(config: Configuration):
+def get_pair_finger() -> PairFinger:
+    # Get user input for M or R
+    while True:
+        user_input = input("Please enter M or R: ").upper()
+        if user_input in ['M', 'R']:
+            break
+        print("Invalid input. Please enter either M or R.")
+    return "middle" if user_input == "M" else "ring"
+
+def create_experiment_folder(config: Configuration, pair_finger: PairFinger):
     # Check if experiment folder exists, create if not
     experiment_path = Path("experiment")
     if not experiment_path.exists():
@@ -745,16 +736,9 @@ def create_experiment_folder(config: Configuration):
         # Get highest numbered folder and increment
         folder_id = max(int(folder.name.split('_')[-1]) for folder in existing_folders) + 1
 
-    # Get user input for A or B
-    while True:
-        user_input = input("Please enter A or B: ").upper()
-        if user_input in ['A', 'B']:
-            break
-        print("Invalid input. Please enter either A or B.")
-
     # Create folder name with timestamp, ID and user input
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
-    folder_path = experiment_path / f"{timestamp}_{user_input}_{folder_id:03d}"
+    folder_path = experiment_path / f"{timestamp}_{pair_finger}_{folder_id:03d}"
     
     # Create the new folder
     folder_path.mkdir()
@@ -766,9 +750,10 @@ def create_experiment_folder(config: Configuration):
 
 def main():
     config = Configuration.read_configuration('configuration.csv')
-    path = create_experiment_folder(config)
+    pair_finger = get_pair_finger()
+    path = create_experiment_folder(config, pair_finger)
     
-    experiment = start_experiment(config, path)
+    experiment = start_experiment(config, path, pair_finger)
     try:
         while True:
             sleep(0.1)

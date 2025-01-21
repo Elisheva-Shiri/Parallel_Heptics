@@ -2,7 +2,7 @@ import csv
 import os
 import random
 from typing import List, Union
-from consts import FingerPair
+from consts import PairFinger
 
 # TODO - add FingerPair value (Literal["index", "middle", "ring"]) after each stiffness value
 
