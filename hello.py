@@ -6,7 +6,7 @@ import math
 from time import sleep
 import cv2
 import threading
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 from threading import Lock
 import numpy as np
 import mediapipe as mp
@@ -17,25 +17,24 @@ from structures import ExperimentControl, ExperimentState, FingerPosition, Quest
 from consts import BACKEND_PORT, HEIGHT, PAUSE_SLEEP_SECONDS, PYGAME_PORT, TARGET_CYCLE_COUNT, VIRTUAL_WORLD_FPS, WIDTH, PairFinger
 from queue import Queue
 
+ARDUINO_DEBUG = True
+SIDE_CAMERA_DEBUG = True
+RECORDING_DATA = True
+
 # Create experiment folder if it doesn't exist
-experiment_folder = Path("experiment")
+REAL_EXPERIMENTS_FOLDER = Path("live_experiments")
+DEBUG_EXPERIMENTS_FOLDER = Path("debug_experiments")
+experiment_folder = DEBUG_EXPERIMENTS_FOLDER
 if not experiment_folder.exists():
     experiment_folder.mkdir()
 
-ARDUINO_DEBUG = True
-SIDE_CAMERA_DEBUG = True
-
 class StiffnessValue(BaseModel):
     value: int
-    # ! Add support for different fingers
-    # finger: FingerPair
-
+    is_index: bool
 
 class StiffnessPair(BaseModel):
     first: StiffnessValue
-    first_is_index: bool
     second: StiffnessValue
-    second_is_index: bool
 
     
 class Configuration(BaseModel):
@@ -50,10 +49,15 @@ class Configuration(BaseModel):
         with open(path, 'r') as file:
             csv_reader = csv.reader(file)
             return Configuration(pairs = [
-                StiffnessPair(first=StiffnessValue(value=int(row[0])),
-                                first_is_index=(int(row[1]) == 1),
-                                second=StiffnessValue(value=int(row[2])),
-                                second_is_index=(int(row[3]) == 1)) for row in csv_reader
+                StiffnessPair(first=StiffnessValue(
+                    value=int(row[0]),
+                    is_index=(int(row[1]) == 1)
+                ),
+                second=StiffnessValue(
+                    value=int(row[2]),
+                    is_index=(int(row[3]) == 1)
+                )
+                ) for row in csv_reader
             ])
     
     def write_configuration(self, path: str):
@@ -61,7 +65,7 @@ class Configuration(BaseModel):
         with open(path, 'w', newline='') as file:
             csv_writer = csv.writer(file)
             for pair in self.pairs:
-                csv_writer.writerow([pair.first.value, 1 if pair.first_is_index else 0, pair.second.value, 1 if pair.second_is_index else 0])
+                csv_writer.writerow([pair.first.value, 1 if pair.first.is_index else 0, pair.second.value, 1 if pair.second.is_index else 0])
         
         
 
@@ -221,11 +225,12 @@ class Experiment:
         
     def _initialize_writers(self) -> None:
         # Initialize video writers for this pair
-        pair_path = self._get_pair_path()
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        self._top_writer = cv2.VideoWriter(str(pair_path / 'top_camera.mp4'), fourcc, self._camera_fps, (self._width, self._height))
-        if not SIDE_CAMERA_DEBUG:
-            self._side_writer = cv2.VideoWriter(str(pair_path / 'side_camera.mp4'), fourcc, self._camera_fps, (self._width, self._height))
+        if RECORDING_DATA:
+            pair_path = self._get_pair_path()
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')    
+            self._top_writer = cv2.VideoWriter(str(pair_path / 'top_camera.mp4'), fourcc, self._camera_fps, (self._width, self._height))
+            if not SIDE_CAMERA_DEBUG:
+                self._side_writer = cv2.VideoWriter(str(pair_path / 'side_camera.mp4'), fourcc, self._camera_fps, (self._width, self._height))
 
     def _setup_pair(self) -> None:
         """ Setup everything needed for a new pair """
@@ -290,9 +295,12 @@ class Experiment:
         self._is_pinching = False
         self._virtual_object.reset()
 
+    def _get_finger_name(self, is_index: bool) -> str:
+        return "index" if is_index else self._pair_finger
+
     def _update_active_finger(self, is_index: bool):
         # Set finger landmark based on selected pair
-        self._active_finger = "index" if is_index else self._pair_finger
+        self._active_finger = self._get_finger_name(is_index)
         self._active_landmark = {
             "index": mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP,
             "middle": mp.solutions.hands.HandLandmark.MIDDLE_FINGER_TIP,
@@ -339,12 +347,12 @@ class Experiment:
 
                 # For each object in pair pass the stiffness value and pair index to the virtual
                 self._reset_comparison()
-                self._update_active_finger(pair.first_is_index)
+                self._update_active_finger(pair.first.is_index)
                 while self._running and not self._check_comparison_end():
                     self._update_virtual_object(pair.first.value, 0)
 
                 self._reset_comparison()
-                self._update_active_finger(pair.second_is_index)
+                self._update_active_finger(pair.second.is_index)
                 while self._running and not self._check_comparison_end():
                     self._update_virtual_object(pair.second.value, 1)
 
@@ -370,16 +378,18 @@ class Experiment:
                 if not answers_file.exists():
                     with open(answers_file, 'w', newline='') as f:
                         writer = csv.writer(f)
-                        writer.writerow(['timestamp', 'pair_number', 'time_to_answer', 'object_1_stiffness', 'object_2_stiffness', 'answer'])
+                        writer.writerow(['timestamp', 'pair_number', 'object_1_finger', 'object_1_stiffness', 'object_2_finger', 'object_2_stiffness', 'time_to_answer', 'answer'])
 
                 with open(answers_file, 'a', newline='') as f:
                     writer = csv.writer(f)
                     writer.writerow([
                         question_timestamp.isoformat(),
                         self._pair_counter,
-                        (datetime.now() - question_timestamp).total_seconds(),
+                        self._get_finger_name(pair.first.is_index),
                         pair.first.value,
+                        self._get_finger_name(pair.second.is_index),
                         pair.second.value,
+                        (datetime.now() - question_timestamp).total_seconds(),
                         answer.questionInput])
 
 
@@ -723,7 +733,7 @@ def get_pair_finger() -> PairFinger:
 
 def create_experiment_folder(config: Configuration, pair_finger: PairFinger):
     # Check if experiment folder exists, create if not
-    experiment_path = Path("experiment")
+    experiment_path = Path(experiment_folder)
     if not experiment_path.exists():
         experiment_path.mkdir()
     
