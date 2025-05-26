@@ -15,22 +15,32 @@ void setup() {
   myservo.attach(9);         // attaches the servo on pin 9 to the servo object
   myservo.write(STOP_SPEED); // Initially stop the servo
   Serial.println("360 Servo Control Ready");
-}
+} 
 
 void loop() {
   while (Serial.available() > 0) {  // check if data is available to read
     char command = Serial.read(); // read the incoming byte
     
-    // Clear any remaining characters in the buffer
-    while(Serial.available() > 0) {
-      Serial.read();
-    }
-    
     // Print received command for debugging
     Serial.print("Received command: ");
     Serial.println(command);
-    
+
+    switch (command) {
+      case 'S':
+        // whatever
+        break;
+
+      case 'I':
+      case 'M':
+      case 'R':
+        char direction = Serial.read(); // read the incoming byte
+        
+    }
+
     switch(command) {
+      // ! Missing support for Left and Right ('L', 'R')
+      // ! Missing support for stiffness value (integer)
+
       case 'U':  // short turn right
         myservo.write(RIGHT_SPEED);
         delay(MOVE_TIME);
@@ -69,4 +79,10 @@ void loop() {
         break;
     }
   }
+
+  // ? Do we clear the buffer?
+  // // Clear any remaining characters in the buffer
+  // while(Serial.available() > 0) {
+  //   Serial.read();
+  // }
 }

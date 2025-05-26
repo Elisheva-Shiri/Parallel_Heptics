@@ -6,7 +6,7 @@ import math
 from time import sleep
 import cv2
 import threading
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from threading import Lock
 import numpy as np
 import mediapipe as mp
@@ -295,7 +295,7 @@ class Experiment:
         self._is_pinching = False
         self._virtual_object.reset()
 
-    def _get_finger_name(self, is_index: bool) -> str:
+    def _get_finger_name(self, is_index: bool) -> Literal["index"] | PairFinger:
         return "index" if is_index else self._pair_finger
 
     def _update_active_finger(self, is_index: bool):
@@ -405,18 +405,20 @@ class Experiment:
                 y_movement = self._virtual_object.y - self._virtual_object.prev_y
                 
                 stiffness_value = self._virtual_object.stiffness_value
+                finger_code = self._active_finger[0].upper()
+                message = 'Z'
                 if abs(x_movement) > MOVEMENT_THRESHOLD or abs(y_movement) > MOVEMENT_THRESHOLD:
                     if abs(x_movement) > abs(y_movement):
                         # TODO - Add support on arduino/motor side for this communication protocol (with stiffness values)
                         if x_movement < 0:  # Moving left
-                            self._arduino.write(f'L{stiffness_value}'.encode())  # Left signal
+                            self._arduino.write(f'{finger_code}L{stiffness_value}'.encode())  # Left signal
                         else:  # Moving right
-                            self._arduino.write(f'R{stiffness_value}'.encode())  # Right signal
+                            self._arduino.write(f'{finger_code}R{stiffness_value}'.encode())  # Right signal
                     else:
                         if y_movement < 0:  # Moving up
-                            self._arduino.write(f'U{stiffness_value}'.encode())  # Up signal
+                            self._arduino.write(f'{finger_code}U{stiffness_value}'.encode())  # Up signal
                         else:  # Moving down
-                            self._arduino.write(f'D{stiffness_value}'.encode())  # Down signal
+                            self._arduino.write(f'{finger_code}D{stiffness_value}'.encode())  # Down signal
             elif not steady_flag:
                 self._arduino.write(b'S')
                 steady_flag = True
