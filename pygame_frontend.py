@@ -1,6 +1,6 @@
 import pygame
 import socket
-from consts import BACKEND_PORT, HEIGHT, PYGAME_PORT, TARGET_CYCLE_COUNT, VIRTUAL_WORLD_FPS, WIDTH
+from consts import BACKEND_PORT, HEIGHT, PYGAME_PORT, TARGET_CYCLE_COUNT, FRONTEND_FPS, WIDTH
 from structures import ExperimentControl, ExperimentPacket, ExperimentState, FingerPosition, QuestionInput, TrackingObject
 
 FIRST_COLOR = (255, 165, 0)  # Orange
@@ -13,14 +13,14 @@ class PygameFrontEnd:
         self._server_address=server_address
         self._frontend_port=frontend_port
         self._backend_port=backend_port
-        self._virtual_world_fps = VIRTUAL_WORLD_FPS
+        self._virtual_world_fps = FRONTEND_FPS
 
         self._running = False
         self._left_button_timer = 0
         self._left_button_sent: bool = False
         self._right_button_timer = 0
         self._right_button_sent: bool = False
-        self._button_hold_time = 2 * VIRTUAL_WORLD_FPS  # 2 seconds worth of frames
+        self._button_hold_time = 2 * FRONTEND_FPS  # 2 seconds worth of frames
 
         # Initialize socket to receive backend information
         self._data_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

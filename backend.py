@@ -14,10 +14,23 @@ import socket
 from pydantic import BaseModel
 import serial
 from structures import ExperimentControl, ExperimentState, FingerPosition, QuestionInput, StateData, TrackingObject, ExperimentPacket
-from consts import BACKEND_PORT, HEIGHT, PAUSE_SLEEP_SECONDS, PYGAME_PORT, TARGET_CYCLE_COUNT, VIRTUAL_WORLD_FPS, WIDTH, PairFinger
+from consts import BACKEND_PORT, HEIGHT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, TECHNOSOFT_PORT, FRONTEND_FPS, WIDTH, PairFinger
 from queue import Queue
+from enum import StrEnum
 
-ARDUINO_DEBUG = True
+
+class MotorType(StrEnum):
+    ARDUINO = "arduino"
+    TECHNOSOFT = "technosoft"
+    NONE = "none"
+
+class MotorMovement(BaseModel):
+    pos: int
+    index: int
+
+DEBUG_POSITION = 1000
+
+MOTOR_TYPE = MotorType.TECHNOSOFT
 SIDE_CAMERA_DEBUG = True
 RECORDING_DATA = True
 
@@ -114,7 +127,7 @@ class VirtualObject(BaseModel):
 
 class Experiment:
     def __init__(self, config: Configuration, path: Path, pair_finger: PairFinger, width: int = WIDTH, height: int = HEIGHT, camera_fps: int = 30,
-                 server_address: str = "localhost", frontend_port: int = PYGAME_PORT, backend_port: int = BACKEND_PORT):
+                 server_address: str = "localhost", frontend_port: int = PYGAME_PORT, backend_port: int = BACKEND_PORT, technosoft_port: int = TECHNOSOFT_PORT):
         
         # SETUP
         self._hand_position_lock = Lock()
@@ -125,7 +138,8 @@ class Experiment:
         self._path = path
         self._width = width
         self._height = height
-        self._virtual_world_fps = VIRTUAL_WORLD_FPS
+        self._frontend_fps = FRONTEND_FPS
+        self._motors_communication_rate = MOTORS_COMMUNICATION_RATE
         self._camera_fps = camera_fps
         # TODO - add Start screen if needed, and adjust to ExperimentState.START
         self._state = ExperimentState.COMPARISON
@@ -151,7 +165,9 @@ class Experiment:
         self._server_address = server_address
         self._frontend_port = frontend_port
         self._backend_port = backend_port
-        self._data_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._technosoft_port = technosoft_port
+        self._frontend_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._technosoft_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         
         # Bind sockets
@@ -192,10 +208,10 @@ class Experiment:
         self._experiment_thread.start()
 
         # Start UDP sender thread
-        self._network_thread = threading.Thread(target=self._network_loop, daemon=True)
-        self._network_thread.start()
+        self._frontend_network_thread = threading.Thread(target=self._frontend_network_loop, daemon=True)
+        self._frontend_network_thread.start()
 
-        if not ARDUINO_DEBUG:
+        if MOTOR_TYPE == MotorType.ARDUINO:
             # Arduino serial connection
             try:
                 self._arduino = serial.Serial('COM3', 115200)  # Windows serial port
@@ -206,6 +222,10 @@ class Experiment:
             # Start Arduino control thread
             self._arduino_thread = threading.Thread(target=self._arduino_control_loop, daemon=True)
             self._arduino_thread.start()
+
+        if MOTOR_TYPE == MotorType.TECHNOSOFT:
+            self._technosoft_thread = threading.Thread(target=self._technosoft_control_loop, daemon=True)
+            self._technosoft_thread.start()
 
         self._top_thread = threading.Thread(target=self.start_top_camera, daemon=True)
         self._top_thread.start()
@@ -246,8 +266,11 @@ class Experiment:
             self._side_writer.release() 
             self._side_writer = None
 
-    def _sleep(self):
-        sleep(1.0 / self._virtual_world_fps)
+    def _sleep_frontend(self):
+        sleep(1.0 / self._frontend_fps)
+
+    def _sleep_motors(self):
+        sleep(1.0 / self._motors_communication_rate)
 
     def _update_virtual_object(self, stiffness_value: int, pair_index: int) -> None:
         """Update virtual object position based on hand position and pinch state"""
@@ -423,9 +446,55 @@ class Experiment:
                 self._arduino.write(b'S')
                 steady_flag = True
                             
-            self._sleep()
+            self._sleep_frontend()
 
-    def _network_loop(self):
+    def _build_message(self, motors: list[MotorMovement]) -> str:
+        message = "Z"
+        for motor in motors:
+            message += f"M{motor.index}P{motor.pos}"
+        message += "F"
+        return message
+
+    def _technosoft_control_loop(self):
+        """Thread that controls Technosoft controller based on hand movement"""
+        MOVEMENT_THRESHOLD = 5.0  # Minimum movement to trigger signal
+        
+        while self._running and self._arduino:
+            if self._virtual_object.is_pinched:
+                x_movement = self._virtual_object.x - self._virtual_object.prev_x
+                y_movement = self._virtual_object.y - self._virtual_object.prev_y
+                
+                # TODO - Use stiffness value
+                stiffness_value = self._virtual_object.stiffness_value
+                finger_motor_id = 1 if self._active_finger == "index" else 2
+
+                motors = []
+                
+                
+                # Movement Check
+                if abs(x_movement) > MOVEMENT_THRESHOLD:
+                    if x_movement < 0:  # Moving left
+                        motors.append(MotorMovement(pos=-DEBUG_POSITION, index=0))
+                    else:  # Moving right
+                        motors.append(MotorMovement(pos=DEBUG_POSITION, index=0))
+                else:
+                    motors.append(MotorMovement(pos=0, index=0))
+                
+                if abs(y_movement) > MOVEMENT_THRESHOLD:
+                    if y_movement < 0:  # Moving down
+                        motors.append(MotorMovement(pos=-DEBUG_POSITION, index=finger_motor_id))
+                    else:  # Moving up
+                        motors.append(MotorMovement(pos=DEBUG_POSITION, index=finger_motor_id))
+                else:
+                    motors.append(MotorMovement(pos=0, index=finger_motor_id))
+
+                # Build message
+                message = self._build_message(motors)
+
+                self._technosoft_socket.sendto(message.encode("utf-8"), (self._server_address, self._technosoft_port))
+            self._sleep_motors()
+
+    def _frontend_network_loop(self):
         """Thread that sends hand position data over UDP"""
         while self._running:
             current_pos = self.get_hand_position()
@@ -452,11 +521,11 @@ class Experiment:
 
                 try:
                     # * Send information to unity via udp socket
-                    self._data_socket.sendto(packet.model_dump_json().encode("utf-8"), (self._server_address, self._frontend_port))
+                    self._frontend_socket.sendto(packet.model_dump_json().encode("utf-8"), (self._server_address, self._frontend_port))
                 except Exception as e:
                     print(f"Failed to send UDP data: {e}")
                     
-            self._sleep()
+            self._sleep_frontend()
 
     def _calculate_pinch_threshold(self, depth: float) -> float:
         """Adjust threshold based on depth (distance from side camera)"""
@@ -711,12 +780,14 @@ class Experiment:
         self._running = False
         keyboard.unhook_all()
         cv2.destroyAllWindows()
-        self._data_socket.close()
+        self._frontend_socket.close()
         self._listening_socket.close()
         self._control_socket.close()
         self._cleanup_writers()
-        if not ARDUINO_DEBUG and self._arduino:
+        if MOTOR_TYPE == MotorType.ARDUINO:
             self._arduino.close()
+        if MOTOR_TYPE == MotorType.TECHNOSOFT:
+            self._technosoft_socket.close()
 
 def start_experiment(config: Configuration, path: Path, pair_finger: PairFinger):
     """Initialize and start the hand tracking system"""
