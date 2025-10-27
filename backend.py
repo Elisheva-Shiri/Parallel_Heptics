@@ -14,10 +14,13 @@ import socket
 from pydantic import BaseModel
 import serial
 from structures import ExperimentControl, ExperimentState, FingerPosition, QuestionInput, StateData, TrackingObject, ExperimentPacket
-from consts import BACKEND_PORT, HEIGHT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, TECHNOSOFT_PORT, FRONTEND_FPS, WIDTH, PairFinger
+from consts import BACKEND_PORT, HEIGHT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, TECHNOSOFT_PORT, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, WIDTH, PairFinger
 from queue import Queue
-from enum import StrEnum
+from enum import Enum, StrEnum
 
+class FingerId(Enum):
+    INDEX = 0
+    OTHER = 1
 
 class MotorType(StrEnum):
     ARDUINO = "arduino"
@@ -39,7 +42,7 @@ REAL_EXPERIMENTS_FOLDER = Path("live_experiments")
 DEBUG_EXPERIMENTS_FOLDER = Path("debug_experiments")
 experiment_folder = DEBUG_EXPERIMENTS_FOLDER
 if not experiment_folder.exists():
-    experiment_folder.mkdir()
+    experiment_folder.mkdir()    
 
 class StiffnessValue(BaseModel):
     value: int
@@ -96,8 +99,6 @@ class VirtualObject(BaseModel):
     original_x: float = 0.0  # Center of plane
     original_y: float = 0.0  # Center of plane
     is_pinched: bool = False
-    prev_x: float = 0.0  # Track previous x position for movement detection
-    prev_y: float = 0.0  # Track previous y position for movement detection
 
     progress: float = 0.0   # Tracks the movement progress (0.0 to 1.0)
     cycle_counter: int = 0  # Counts full movement cycles
@@ -113,8 +114,6 @@ class VirtualObject(BaseModel):
         # Reset object location
         self.x = self.original_x
         self.y = self.original_y
-        self.prev_x = self.original_x
-        self.prev_y = self.original_y
         self.is_pinched = False
 
         # reset progress/Cycle Counter
@@ -138,6 +137,7 @@ class Experiment:
         self._path = path
         self._width = width
         self._height = height
+        self._virtual_object_fps = VIRTUAL_OBJECT_FPS
         self._frontend_fps = FRONTEND_FPS
         self._motors_communication_rate = MOTORS_COMMUNICATION_RATE
         self._camera_fps = camera_fps
@@ -185,8 +185,9 @@ class Experiment:
         self._running = True
 
         # Camera indices
-        self.TOP_CAMERA = 0
-        self.SIDE_CAMERA = 1
+        # ! TODO - Change back to 0, 1
+        self.TOP_CAMERA = 1
+        self.SIDE_CAMERA = 0
         
         # Video writers
         self._top_writer = None
@@ -266,6 +267,9 @@ class Experiment:
             self._side_writer.release() 
             self._side_writer = None
 
+    def _sleep_virtual_object(self):
+        sleep(1.0 / self._virtual_object_fps)
+
     def _sleep_frontend(self):
         sleep(1.0 / self._frontend_fps)
 
@@ -291,10 +295,6 @@ class Experiment:
             self._virtual_object.is_pinched = True
         elif not self._is_pinching:
             self._virtual_object.is_pinched = False
-            
-        # Store previous positions
-        self._virtual_object.prev_x = self._virtual_object.x
-        self._virtual_object.prev_y = self._virtual_object.y
             
         # Move object with fingers if pinched
         if self._virtual_object.is_pinched:
@@ -358,7 +358,7 @@ class Experiment:
                     sleep(1)
                     self._pause_time = i
                     if not self._running:
-                        break;
+                        break
             
                 self._pause_time = 0
 
@@ -373,11 +373,13 @@ class Experiment:
                 self._update_active_finger(pair.first.is_index)
                 while self._running and not self._check_comparison_end():
                     self._update_virtual_object(pair.first.value, 0)
+                    self._sleep_virtual_object()
 
                 self._reset_comparison()
                 self._update_active_finger(pair.second.is_index)
                 while self._running and not self._check_comparison_end():
                     self._update_virtual_object(pair.second.value, 1)
+                    self._sleep_virtual_object()
 
                 # Clean up video writers after pair is complete
                 self._cleanup_writers()
@@ -424,21 +426,21 @@ class Experiment:
         while self._running and self._arduino:
             if self._virtual_object.is_pinched:
                 steady_flag = False
-                x_movement = self._virtual_object.x - self._virtual_object.prev_x
-                y_movement = self._virtual_object.y - self._virtual_object.prev_y
+                obj_x = self._virtual_object.x - self._virtual_object.original_x
+                obj_y = self._virtual_object.y - self._virtual_object.original_y
                 
                 stiffness_value = self._virtual_object.stiffness_value
                 finger_code = self._active_finger[0].upper()
                 message = 'Z'
-                if abs(x_movement) > MOVEMENT_THRESHOLD or abs(y_movement) > MOVEMENT_THRESHOLD:
-                    if abs(x_movement) > abs(y_movement):
+                if abs(obj_x) > MOVEMENT_THRESHOLD or abs(obj_y) > MOVEMENT_THRESHOLD:
+                    if abs(obj_x) > abs(obj_y):
                         # TODO - Add support on arduino/motor side for this communication protocol (with stiffness values)
-                        if x_movement < 0:  # Moving left
+                        if obj_x < 0:  # Moving left
                             self._arduino.write(f'{finger_code}L{stiffness_value}'.encode())  # Left signal
                         else:  # Moving right
                             self._arduino.write(f'{finger_code}R{stiffness_value}'.encode())  # Right signal
                     else:
-                        if y_movement < 0:  # Moving up
+                        if obj_y < 0:  # Moving up
                             self._arduino.write(f'{finger_code}U{stiffness_value}'.encode())  # Up signal
                         else:  # Moving down
                             self._arduino.write(f'{finger_code}D{stiffness_value}'.encode())  # Down signal
@@ -454,44 +456,149 @@ class Experiment:
             message += f"M{motor.index}P{motor.pos}"
         message += "F"
         return message
+        
+    def _get_base_index(self, finger_idx: Literal[0, 1]) -> Literal[0, 3]:
+        """ Get's the base motor index for the given finger """
+        return finger_idx * 3
+
+    def _calculate_motor_movements(self, finger_id: FingerId, direction: str, distance: float, motor_spacing: float = 1000.0) -> list[MotorMovement]:
+        """
+        Calculate motor movements for a triangular motor system using proper kinematics.
+        
+        Motor layout (top view, coordinate system):
+            0 (top)
+            / \
+            /   \
+        1     2
+        (left) (right)
+        
+        Args:
+            finger_idx: finger
+            direction: Movement direction ("up", "down", "left", "right")
+            distance: Distance to move the object (in same units as motor_spacing)
+            motor_spacing: Distance between motors (for calculating geometry)
+            
+        Returns:
+            List of MotorMovement objects for each motor
+        """
+        direction = direction.lower()
+        base_motor_idx = self._get_base_index(finger_id.value)
+        
+        # Define motor positions in a coordinate system (equilateral triangle)
+        # Center at origin (0, 0)
+        # Motor 0 (top) at (0, h) where h = motor_spacing * sqrt(3) / 3
+        # Motor 1 (left) at (-motor_spacing/2, -h/2)
+        # Motor 2 (right) at (motor_spacing/2, -h/2)
+        
+        h = motor_spacing * math.sqrt(3) / 3  # Height from center to vertex
+        
+        motor_positions = [
+            (0, 2 * h / 3),                    # Motor 0: top
+            (-motor_spacing / 2, -h / 3),      # Motor 1: left
+            (motor_spacing / 2, -h / 3)        # Motor 2: right
+        ]
+        
+        # Object starts at center (0, 0)
+        object_start = (0, 0)
+        
+        # Calculate object's new position based on direction
+        direction_vectors = {
+            "up": (0, distance),
+            "down": (0, -distance),
+            "left": (-distance, 0),
+            "right": (distance, 0)
+        }
+        
+        if direction not in direction_vectors:
+            raise ValueError(f"Invalid direction: {direction}. Must be one of: up, down, left, right")
+        
+        dx, dy = direction_vectors[direction]
+        object_end = (object_start[0] + dx, object_start[1] + dy)
+        
+        # Calculate string length changes for each motor
+        movements = []
+        for i, (mx, my) in enumerate(motor_positions):
+            # Initial string length (distance from motor to start position)
+            initial_length = math.sqrt((mx - object_start[0])**2 + (my - object_start[1])**2)
+            
+            # Final string length (distance from motor to end position)
+            final_length = math.sqrt((mx - object_end[0])**2 + (my - object_end[1])**2)
+            
+            # Change in string length
+            # Positive = extend string (let out more), Negative = retract string (pull in)
+            delta_length = final_length - initial_length
+            
+            movements.append(MotorMovement(pos=int(delta_length), index=i+base_motor_idx))
+        
+        return movements
 
     def _technosoft_control_loop(self):
         """Thread that controls Technosoft controller based on hand movement"""
-        MOVEMENT_THRESHOLD = 5.0  # Minimum movement to trigger signal
+        is_comparison = True
         
-        while self._running and self._arduino:
-            if self._virtual_object.is_pinched:
-                x_movement = self._virtual_object.x - self._virtual_object.prev_x
-                y_movement = self._virtual_object.y - self._virtual_object.prev_y
-                
-                # TODO - Use stiffness value
+        while self._running:
+            if self._virtual_object.is_pinched:  
+                # original x/y != (0,0) since they are half of screen size              
+                obj_x = self._virtual_object.x - self._virtual_object.original_x
+                obj_y = self._virtual_object.y - self._virtual_object.original_y
+
+                finger_id = FingerId.INDEX if self._active_finger == "index" else FingerId.OTHER
+                # TODO - Use stiffness calculate motor movement
                 stiffness_value = self._virtual_object.stiffness_value
-                finger_motor_id = 1 if self._active_finger == "index" else 2
 
                 motors = []
-                
-                
+
+                # TODO (if needed) - support diagonal movement
                 # Movement Check
-                if abs(x_movement) > MOVEMENT_THRESHOLD:
-                    if x_movement < 0:  # Moving left
-                        motors.append(MotorMovement(pos=-DEBUG_POSITION, index=0))
-                    else:  # Moving right
-                        motors.append(MotorMovement(pos=DEBUG_POSITION, index=0))
+                if self._state != ExperimentState.COMPARISON:
+                    if is_comparison:
+                        is_comparison = False
+                        motors.extend([
+                            MotorMovement(pos=0, index=self._get_base_index(finger_id.value)),
+                            MotorMovement(pos=0, index=self._get_base_index(finger_id.value)+1),
+                            MotorMovement(pos=0, index=self._get_base_index(finger_id.value)+2),
+                        ])
                 else:
-                    motors.append(MotorMovement(pos=0, index=0))
-                
-                if abs(y_movement) > MOVEMENT_THRESHOLD:
-                    if y_movement < 0:  # Moving down
-                        motors.append(MotorMovement(pos=-DEBUG_POSITION, index=finger_motor_id))
-                    else:  # Moving up
-                        motors.append(MotorMovement(pos=DEBUG_POSITION, index=finger_motor_id))
-                else:
-                    motors.append(MotorMovement(pos=0, index=finger_motor_id))
+                    # Must be in comparison
+                    is_comparison = True
+                    if abs(obj_x) > abs(obj_y):
+                        # Horizontal movement
+                        if obj_x < 0:  # Moving left
+                            print(f"Moving left by {obj_x}")
+                            motors.extend(self._calculate_motor_movements(
+                                finger_id=finger_id,
+                                direction="left",  # Reverse direction
+                                distance = abs(obj_x)
+                            ))
+                        else:  # Moving right
+                            print(f"Moving right by {obj_x}")    
+                            motors.extend(self._calculate_motor_movements(
+                                finger_id=finger_id,
+                                direction="right",
+                                distance = abs(obj_x)
+                            ))
+                    else:
+                        # Vertical movement
+                        if obj_y < 0:  # Moving up
+                            print(f"Moving up by {obj_y}")    
+                            motors.extend(self._calculate_motor_movements(
+                                finger_id=finger_id,
+                                direction="up",
+                                distance = abs(obj_y)
+                            ))
+                        else:  # Moving down
+                            print(f"Moving down by {obj_y}")    
+                            motors.extend(self._calculate_motor_movements(
+                                finger_id=finger_id,
+                                direction="down",
+                                distance = abs(obj_y)
+                            ))
 
-                # Build message
-                message = self._build_message(motors)
+                if motors:
+                    # Build message
+                    message = self._build_message(motors)
 
-                self._technosoft_socket.sendto(message.encode("utf-8"), (self._server_address, self._technosoft_port))
+                    self._technosoft_socket.sendto(message.encode("utf-8"), (self._server_address, self._technosoft_port))
             self._sleep_motors()
 
     def _frontend_network_loop(self):

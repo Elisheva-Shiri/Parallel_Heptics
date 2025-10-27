@@ -18,5 +18,9 @@ dependencies = [
 dev = [
     "ipdb>=0.13.13",
     "ipython>=8.29.0",
+    "matplotlib>=3.9.2",
+    "numpy>=2.1.3",
+    "pandas>=2.3.3",
     "ruff>=0.7.4",
+    "typer>=0.20.0",
 ]
