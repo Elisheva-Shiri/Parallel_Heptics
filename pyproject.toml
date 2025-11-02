@@ -12,6 +12,7 @@ dependencies = [
     "pygame>=2.6.1",
     "pyserial>=3.5",
     "keyboard>=0.13.5",
+    "ultralytics>=8.3.223",
 ]
 
 [dependency-groups]

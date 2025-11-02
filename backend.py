@@ -6,17 +6,25 @@ import math
 from time import sleep
 import cv2
 import threading
-from typing import Any, Literal, Optional
+from typing import Literal, Optional
 from threading import Lock
 import numpy as np
-import mediapipe as mp
 import socket
 from pydantic import BaseModel
 import serial
-from structures import ExperimentControl, ExperimentState, FingerPosition, QuestionInput, StateData, TrackingObject, ExperimentPacket
+from structures import ExperimentControl, ExperimentState, FingerPosition, StateData, TrackingObject, ExperimentPacket
 from consts import BACKEND_PORT, HEIGHT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, TECHNOSOFT_PORT, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, WIDTH, PairFinger
+import queue
 from queue import Queue
 from enum import Enum, StrEnum
+from vision import ColorVision, HandPosition, MediapipeVision, YoloVision, FINGER_COLORS
+
+class VisionType(StrEnum):
+    MEDIAPIPE = "mediapipe"
+    YOLO = "yolo"
+    FRAME_COLOR = "frame_color"
+    OPTICAL_COLOR_NO_GPU = "optical_color_no_gpu"
+    OPTICAL_COLOR_GPU = "optical_color_gpu"
 
 class FingerId(Enum):
     INDEX = 0
@@ -34,6 +42,7 @@ class MotorMovement(BaseModel):
 DEBUG_POSITION = 1000
 
 MOTOR_TYPE = MotorType.TECHNOSOFT
+VISION_TYPE = VisionType.YOLO
 SIDE_CAMERA_DEBUG = True
 RECORDING_DATA = True
 
@@ -82,15 +91,6 @@ class Configuration(BaseModel):
             csv_writer = csv.writer(file)
             for pair in self.pairs:
                 csv_writer.writerow([pair.first.value, 1 if pair.first.is_index else 0, pair.second.value, 1 if pair.second.is_index else 0])
-        
-        
-
-
-class HandPosition(BaseModel):
-    thumb_x: float
-    thumb_y: float
-    active_finger_x: float  # The chosen finger for object control
-    active_finger_y: float
 
 class VirtualObject(BaseModel):
     x: float = 0.0
@@ -125,8 +125,18 @@ class VirtualObject(BaseModel):
         self.pair_index = 0
 
 class Experiment:
-    def __init__(self, config: Configuration, path: Path, pair_finger: PairFinger, width: int = WIDTH, height: int = HEIGHT, camera_fps: int = 30,
-                 server_address: str = "localhost", frontend_port: int = PYGAME_PORT, backend_port: int = BACKEND_PORT, technosoft_port: int = TECHNOSOFT_PORT):
+    def __init__(self,
+        config: Configuration,
+        path: Path,
+        pair_finger: PairFinger,
+        width: int = WIDTH,
+        height: int = HEIGHT,
+        camera_fps: int = 30,
+        server_address: str = "localhost",
+        frontend_port: int = PYGAME_PORT,
+        backend_port: int = BACKEND_PORT,
+        technosoft_port: int = TECHNOSOFT_PORT
+    ):
         
         # SETUP
         self._hand_position_lock = Lock()
@@ -141,13 +151,12 @@ class Experiment:
         self._frontend_fps = FRONTEND_FPS
         self._motors_communication_rate = MOTORS_COMMUNICATION_RATE
         self._camera_fps = camera_fps
-        # TODO - add Start screen if needed, and adjust to ExperimentState.START
+        # TODO - add Start screen if needed,
+        # and adjust to ExperimentState.START
         self._state = ExperimentState.COMPARISON
         self._pause_time = 0
         self._pair_counter = 0  # Counter for pair folders
         self._pair_finger: PairFinger = pair_finger
-        # * Initialization only until experiment loop begins
-        self._update_active_finger(False)
 
         # Frame queues for recording
         self._top_frame_queue = Queue(maxsize=30)
@@ -186,8 +195,8 @@ class Experiment:
 
         # Camera indices
         # ! TODO - Change back to 0, 1
-        self.TOP_CAMERA = 1
-        self.SIDE_CAMERA = 0
+        self.TOP_CAMERA = 0
+        self.SIDE_CAMERA = 1
         
         # Video writers
         self._top_writer = None
@@ -195,6 +204,58 @@ class Experiment:
         
         # Threshold for pinch detection (adjust as needed)
         self.BASE_PINCH_THRESHOLD = 1.5  # pixels
+
+        match VISION_TYPE:
+            case VisionType.MEDIAPIPE:
+                self._vision = MediapipeVision(
+                    width=self._width,
+                    height=self._height,
+                    static_image_mode=False,
+                    max_num_hands=1,
+                    min_detection_confidence=0.7,
+                    min_tracking_confidence=0.5,
+                    base_pinch_threshold=self.BASE_PINCH_THRESHOLD
+                )
+            case VisionType.YOLO:
+                self._vision = YoloVision(
+                    width=self._width,
+                    height=self._height,
+                    base_pinch_threshold=self.BASE_PINCH_THRESHOLD
+                )
+            case VisionType.FRAME_COLOR:
+                self._vision = ColorVision(
+                    finger_colors=FINGER_COLORS,
+                    width=self._width,
+                    height=self._height,
+                    tracking_method="frame",
+                    fps=self._camera_fps,
+                    base_pinch_threshold=self.BASE_PINCH_THRESHOLD
+                )
+            case VisionType.OPTICAL_COLOR_NO_GPU:
+                self._vision = ColorVision(
+                    finger_colors=FINGER_COLORS,
+                    width=self._width,
+                    height=self._height,
+                    tracking_method="optical_flow",
+                    fps=self._camera_fps,
+                    base_pinch_threshold=self.BASE_PINCH_THRESHOLD,
+                    use_gpu=False
+                )
+            case VisionType.OPTICAL_COLOR_GPU:
+                self._vision = ColorVision(
+                    finger_colors=FINGER_COLORS,
+                    width=self._width,
+                    height=self._height,
+                    tracking_method="optical_flow",
+                    fps=self._camera_fps,
+                    base_pinch_threshold=self.BASE_PINCH_THRESHOLD,
+                    use_gpu=True
+                )
+            case _: raise NotImplementedError("Unknown CV type")  # Should never happen
+
+        # * Initialization only until experiment loop begins
+        # * Must run after self._vision is initialized
+        self._update_active_finger(False)
 
         # Start recording threads
         self._top_recording_thread = threading.Thread(target=self._record_top_frames, daemon=True)
@@ -212,21 +273,24 @@ class Experiment:
         self._frontend_network_thread = threading.Thread(target=self._frontend_network_loop, daemon=True)
         self._frontend_network_thread.start()
 
-        if MOTOR_TYPE == MotorType.ARDUINO:
-            # Arduino serial connection
-            try:
-                self._arduino = serial.Serial('COM3', 115200)  # Windows serial port
-            except Exception as e:
-                print(f"Failed to connect to Arduino - serial control disabled. Error: {e}")
-                self._arduino = None
-                
-            # Start Arduino control thread
-            self._arduino_thread = threading.Thread(target=self._arduino_control_loop, daemon=True)
-            self._arduino_thread.start()
-
-        if MOTOR_TYPE == MotorType.TECHNOSOFT:
-            self._technosoft_thread = threading.Thread(target=self._technosoft_control_loop, daemon=True)
-            self._technosoft_thread.start()
+        match MOTOR_TYPE:
+            case MotorType.ARDUINO:
+                # Arduino serial connection
+                try:
+                    self._arduino = serial.Serial('COM3', 115200)  # Windows serial port
+                except Exception as e:
+                    print(f"Failed to connect to Arduino - serial control disabled. Error: {e}")
+                    self._arduino = None
+                    
+                # Start Arduino control thread
+                self._arduino_thread = threading.Thread(target=self._arduino_control_loop, daemon=True)
+                self._arduino_thread.start()
+            case MotorType.TECHNOSOFT:
+                self._technosoft_thread = threading.Thread(target=self._technosoft_control_loop, daemon=True)
+                self._technosoft_thread.start()
+            case MotorType.NONE:
+                ...  # No motor control needed
+            case _: raise NotImplementedError("Unknown motor type")  # Should never happen
 
         self._top_thread = threading.Thread(target=self.start_top_camera, daemon=True)
         self._top_thread.start()
@@ -324,11 +388,8 @@ class Experiment:
     def _update_active_finger(self, is_index: bool):
         # Set finger landmark based on selected pair
         self._active_finger = self._get_finger_name(is_index)
-        self._active_landmark = {
-            "index": mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP,
-            "middle": mp.solutions.hands.HandLandmark.MIDDLE_FINGER_TIP,
-            "ring": mp.solutions.hands.HandLandmark.RING_FINGER_TIP
-        }[self._active_finger]
+        self._vision.set_active_finger(self._active_finger)
+        print(f"Active finger set to {self._active_finger}")
 
     def _experiment_loop(self):
 
@@ -629,6 +690,8 @@ class Experiment:
                 try:
                     # * Send information to unity via udp socket
                     self._frontend_socket.sendto(packet.model_dump_json().encode("utf-8"), (self._server_address, self._frontend_port))
+                except queue.Empty:
+                    ...  # Expected timeout, no frames available
                 except Exception as e:
                     print(f"Failed to send UDP data: {e}")
                     
@@ -753,35 +816,29 @@ class Experiment:
 
         self._configure_camera(cap)
 
-        with mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.5
-        ) as hands:
-            while self._running:
-                ret, frame = cap.read()
-                if not ret:
-                    continue
+        while self._running:
+            ret, frame = cap.read()
+            if not ret:
+                continue
 
-                detected = self._process_top_view(frame, hands)
+            detected = self._process_top_view(frame)
+            
+            # Add frame to recording queue if recording
+            if self._top_writer:
+                try:
+                    self._top_frame_queue.put_nowait((frame, detected))
+                except:
+                    pass
                 
-                # Add frame to recording queue if recording
-                if self._top_writer:
-                    try:
-                        self._top_frame_queue.put_nowait((frame, detected))
-                    except:
-                        pass
-                    
-                cv2.imshow("Top Camera", cv2.flip(frame, 1))
-                key = cv2.waitKey(1) & 0xFF
-                if key== ord('q'):
-                    break
-                elif key == ord(' '):
-                    self._toggle_pinch()
-                
-                with self._hand_position_lock:
-                    self._current_position = detected
+            cv2.imshow("Top Camera", cv2.flip(frame, 1))
+            key = cv2.waitKey(1) & 0xFF
+            if key== ord('q'):
+                break
+            elif key == ord(' '):
+                self._toggle_pinch()
+            
+            with self._hand_position_lock:
+                self._current_position = detected
 
     def start_side_camera(self):
         """Process side camera feed to detect pinch gestures"""
@@ -792,29 +849,23 @@ class Experiment:
         
         self._configure_camera(cap)
 
-        with mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.5
-        ) as hands:
-            while self._running:
-                ret, frame = cap.read()
-                if not ret:
-                    continue
+        while self._running:
+            ret, frame = cap.read()
+            if not ret:
+                continue
 
-                self._detect_pinch(frame, hands)
+            self._detect_pinch(frame)
+            
+            # Add frame to recording queue if recording
+            if self._side_writer:
+                try:
+                    self._side_frame_queue.put_nowait(frame)
+                except:
+                    pass
                 
-                # Add frame to recording queue if recording
-                if self._side_writer:
-                    try:
-                        self._side_frame_queue.put_nowait(frame)
-                    except:
-                        pass
-                    
-                cv2.imshow("Side Camera", cv2.flip(frame, 1))
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+            cv2.imshow("Side Camera", cv2.flip(frame, 1))
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
     def get_hand_position(self) -> Optional[HandPosition]:
         """Get the current hand position"""
@@ -829,58 +880,22 @@ class Experiment:
         """Toggle pinch state when not using camera"""
         print(f"toggle pinch from {self._is_pinching} to {not self._is_pinching}")
         self._is_pinching = not self._is_pinching
+    
+    def _get_finger_color(self) -> str:
+        return {
+            "index": "green",
+            "middle": "blue",
+            "ring": "red"
+        }[self._active_finger]
+    
+    def _process_top_view(self, frame: np.ndarray) -> HandPosition:
+        return self._vision.detect_hand(frame)
 
-    def _process_top_view(self, frame: np.ndarray, hands: Any) -> HandPosition:
-        """Process top camera frame to detect finger positions"""
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = hands.process(rgb_frame)
-        
-        if results.multi_hand_landmarks:
-            hand_landmarks = results.multi_hand_landmarks[0]
-            
-            # Get positions for all fingers
-            thumb_tip = hand_landmarks.landmark[mp.solutions.hands.HandLandmark.THUMB_TIP]
-            
-            # Get active finger for object control
-            active_tip = hand_landmarks.landmark[self._active_landmark]
-            
-            return HandPosition(
-                thumb_x=self._width - thumb_tip.x * self._width,
-                thumb_y=thumb_tip.y * self._height,
-                active_finger_x=self._width - active_tip.x * self._width,
-                active_finger_y=active_tip.y * self._height
-            )
-            
-        return HandPosition(
-            thumb_x=0.0,
-            thumb_y=0.0,
-            active_finger_x=0.0,
-            active_finger_y=0.0
-        )
-
-    def _detect_pinch(self, frame: np.ndarray, hands: Any):
-        """Process side camera frame to detect pinch gesture"""
-        # ! BUG: Detect pinch logic is shit
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = hands.process(rgb_frame)
-        
-        if results.multi_hand_landmarks:
-            hand_landmarks = results.multi_hand_landmarks[0]
-            
-            thumb_tip = hand_landmarks.landmark[mp.solutions.hands.HandLandmark.THUMB_TIP]
-            finger_tip = hand_landmarks.landmark[self._active_landmark]
-            
-            distance = math.sqrt(
-                (thumb_tip.x - finger_tip.x)**2 + 
-                (thumb_tip.y - finger_tip.y)**2
-            )
-            
-            depth = abs(finger_tip.z)
-            threshold = self._calculate_pinch_threshold(depth)
-            self._is_pinching = distance < threshold
-        else:
-            self._is_pinching = False
-
+    def _detect_pinch(self, frame: np.ndarray):
+        prev_pinch = self._is_pinching
+        self._is_pinching = self._vision.detect_pinch(frame)
+        if prev_pinch != self._is_pinching:
+            print(f"Pinch changed to {self._is_pinching}")
         
     def cleanup(self):
         """Clean up resources"""
@@ -891,10 +906,16 @@ class Experiment:
         self._listening_socket.close()
         self._control_socket.close()
         self._cleanup_writers()
-        if MOTOR_TYPE == MotorType.ARDUINO:
-            self._arduino.close()
-        if MOTOR_TYPE == MotorType.TECHNOSOFT:
-            self._technosoft_socket.close()
+        self._vision.cleanup()
+
+        match MOTOR_TYPE:
+            case MotorType.ARDUINO:
+                self._arduino.close()
+            case MotorType.TECHNOSOFT:
+                self._technosoft_socket.close()
+            case MotorType.NONE:
+                ...  # No cleanup needed
+            case _: raise NotImplementedError("Unknown motor type")  # Should never happen
 
 def start_experiment(config: Configuration, path: Path, pair_finger: PairFinger):
     """Initialize and start the hand tracking system"""
