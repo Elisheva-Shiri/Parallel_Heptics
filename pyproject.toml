@@ -13,11 +13,14 @@ dependencies = [
     "pyserial>=3.5",
     "keyboard>=0.13.5",
     "ultralytics>=8.3.223",
+    "yappi>=1.7.3",
+    "snakeviz>=2.2.2",
 ]
 
 [dependency-groups]
 dev = [
     "ipdb>=0.13.13",
+    "ipykernel>=7.1.0",
     "ipython>=8.29.0",
     "matplotlib>=3.9.2",
     "numpy>=2.1.3",

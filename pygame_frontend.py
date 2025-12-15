@@ -1,13 +1,13 @@
 import pygame
 import socket
-from consts import BACKEND_PORT, HEIGHT, PYGAME_PORT, TARGET_CYCLE_COUNT, FRONTEND_FPS, WIDTH
+from consts import BACKEND_PORT, TOP_HEIGHT, PYGAME_PORT, TARGET_CYCLE_COUNT, FRONTEND_FPS, TOP_WIDTH
 from structures import ExperimentControl, ExperimentPacket, ExperimentState, FingerPosition, QuestionInput, TrackingObject
 
 FIRST_COLOR = (255, 165, 0)  # Orange
 SECOND_COLOR = (0, 0, 255)  # Blue
 
 class PygameFrontEnd:
-    def __init__(self, width: int = WIDTH, height: int = HEIGHT, server_address: str ="localhost", frontend_port: int = PYGAME_PORT, backend_port: int = BACKEND_PORT):
+    def __init__(self, width: int = TOP_WIDTH, height: int = TOP_HEIGHT, server_address: str ="localhost", frontend_port: int = PYGAME_PORT, backend_port: int = BACKEND_PORT):
         self._width = width
         self._height = height
         self._server_address=server_address
