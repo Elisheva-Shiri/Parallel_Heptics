@@ -27,7 +27,7 @@ class VisionType(StrEnum):
     OPTICAL_COLOR_GPU = "optical_color_gpu"
 
 class FingerId(Enum):
-    INDEX = 2
+    INDEX = 0
     OTHER = 1
 
 class MotorType(StrEnum):
@@ -40,6 +40,7 @@ class MotorMovement(BaseModel):
     index: int
 
 DEBUG_POSITION = 1000
+DEBUG_SINGLE_MOTOR = False
 
 MOTOR_TYPE = MotorType.TECHNOSOFT
 VISION_TYPE = VisionType.MEDIAPIPE
@@ -563,6 +564,8 @@ class Experiment:
                             ))
 
                 if motors:
+                    if DEBUG_SINGLE_MOTOR:
+                        motors = [motors[0]]
                     message = self._build_message(motors)
                     self._technosoft_socket.sendto(message.encode("utf-8"), (self._server_address, self._technosoft_port))
             self._sleep_motors()
