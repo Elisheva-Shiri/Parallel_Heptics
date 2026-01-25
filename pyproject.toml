@@ -15,6 +15,7 @@ dependencies = [
     "ultralytics>=8.3.223",
     "yappi>=1.7.3",
     "snakeviz>=2.2.2",
+    "typer>=0.20.0",
 ]
 
 [dependency-groups]
