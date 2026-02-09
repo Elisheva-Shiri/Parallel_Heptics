@@ -19,6 +19,17 @@ from queue import Queue
 from enum import Enum, StrEnum
 from vision import ColorVision, HandPosition, MediapipeVision, YoloVision, FINGER_COLORS
 
+DEBUG_POSITION = 1000
+DEBUG_SINGLE_MOTOR = False
+DEBUG_FLIP_Y = False #in the lab setup
+DEBUG_SIDE_CAMERA_OFF = True
+DEBUG_ALLOW_PRINTS = False
+
+original_print = print
+def print(*args, **kwargs):
+    if DEBUG_ALLOW_PRINTS:
+        original_print(*args, **kwargs)
+
 class VisionType(StrEnum):
     MEDIAPIPE = "mediapipe"
     YOLO = "yolo"
@@ -39,13 +50,12 @@ class MotorMovement(BaseModel):
     pos: int
     index: int
 
-DEBUG_POSITION = 1000
-DEBUG_SINGLE_MOTOR = False
-
+MOVE_FACTOR = 1
 MOTOR_TYPE = MotorType.TECHNOSOFT
 VISION_TYPE = VisionType.MEDIAPIPE
-SIDE_CAMERA_DEBUG = False
 RECORDING_DATA = True
+
+
 
 # Create experiment folder if it doesn't exist
 REAL_EXPERIMENTS_FOLDER = Path("live_experiments")
@@ -66,6 +76,7 @@ class StiffnessPair(BaseModel):
 class Configuration(BaseModel):
     pairs: list[StiffnessPair]
 
+    # * Special constructor that accepts path and returns Configuration (instead of acception "pairs")
     @staticmethod
     def read_configuration(path: str):
         if not Path(path).exists():
@@ -106,15 +117,21 @@ class VirtualObject(BaseModel):
     stiffness_value: int = 0 # Object stiffness value as read from the configuration
     pair_index: int = 0 # 0 or 1
 
+
     def model_post_init(self, __context) -> None:
         self.reset()
 
     def reset(self):
+        # Reset object location
         self.x = self.original_x
         self.y = self.original_y
         self.is_pinched = False
+
+        # reset progress/Cycle Counter
         self.progress = 0.0
         self.cycle_counter = 0
+
+        # Reset the stiffness value/pair index since the previous value is no longer 
         self.stiffness_value = 0
         self.pair_index = 0
 
@@ -132,8 +149,12 @@ class Experiment:
         server_address: str = "localhost",
         frontend_port: int = PYGAME_PORT,
         backend_port: int = BACKEND_PORT,
-        technosoft_port: int = TECHNOSOFT_PORT
+        technosoft_port: int = TECHNOSOFT_PORT,
+        arduino_port: str = 'COM13',
+        arduino_baud: int = 115200
     ):
+        
+        # SETUP
         self._hand_position_lock = Lock()
         self._visualization_lock = Lock()
         self._current_position: Optional[HandPosition] = None
@@ -149,18 +170,26 @@ class Experiment:
         self._motors_communication_rate = MOTORS_COMMUNICATION_RATE
         self._side_camera_location: Literal["top", "bottom", "left", "right"] = side_camera_location
         self._camera_fps = camera_fps
+        # TODO - add Start screen if needed,
+        # and adjust to ExperimentState.START
         self._state = ExperimentState.COMPARISON
         self._pause_time = 0
-        self._pair_counter = 0
+        self._pair_counter = 0  # Counter for pair folders
         self._pair_finger: PairFinger = pair_finger
+
+        # Frame queues for recording
         self._top_frame_queue = Queue(maxsize=30)
         self._side_frame_queue = Queue(maxsize=30)
-        self.CENTER_THRESHOLD = 20
-        self.EDGE_THRESHOLD = 30
-        self.last_x = self._top_width/2
-        self.last_y = self._top_height/2
-        self.reached_edge = False
-        self.in_center = True
+        
+        # Movement tracking thresholds
+        self.CENTER_THRESHOLD = 20  # Pixels from center to start movement
+        self.EDGE_THRESHOLD = 30  # Pixels from edge to count as reached edge
+        self.last_x = self._top_width/2  # Track last x position
+        self.last_y = self._top_height/2  # Track last y position
+        self.reached_edge = False  # Track if reached edge
+        self.in_center = True  # Track if in center
+        
+        # UDP server config
         self._server_address = server_address
         self._frontend_port = frontend_port
         self._backend_port = backend_port
@@ -168,25 +197,30 @@ class Experiment:
         self._frontend_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._technosoft_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
+        
+        # Bind sockets
         print("Waiting for connection")
         self._listening_socket.bind((self._server_address, self._backend_port))
         self._listening_socket.listen()
         self._control_socket, _ = self._listening_socket.accept()
         print("Connection accepted")
 
+        # Create virtual object at center of screen
         self._virtual_object = VirtualObject(
             original_x=self._top_width/2,
             original_y=self._top_height/2,
         )
         self._running = True
 
-        self.TOP_CAMERA = 0
-        self.SIDE_CAMERA = 1
-
+        # Camera indices
+        self.TOP_CAMERA = 1
+        self.SIDE_CAMERA = 2
+        
+        # Video writers
         self._top_writer = None
         self._side_writer = None
-
+        
+        # Threshold for pinch detection (adjust as needed)
         self.BASE_PINCH_THRESHOLD = 50  # pixels
 
         match VISION_TYPE:
@@ -247,64 +281,74 @@ class Experiment:
                 )
             case _: raise NotImplementedError("Unknown CV type")  # Should never happen
 
+        # * Initialization only until experiment loop begins
+        # * Must run after self._vision is initialized
         self._update_active_finger(False)
 
+        # Start recording threads
         self._top_recording_thread = threading.Thread(target=self._record_top_frames, daemon=True)
         self._top_recording_thread.start()
-        if not SIDE_CAMERA_DEBUG:
+        
+        if not DEBUG_SIDE_CAMERA_OFF:
             self._side_recording_thread = threading.Thread(target=self._record_side_frames, daemon=True)
             self._side_recording_thread.start()
 
+        # Start Experiment Management thread
         self._experiment_thread = threading.Thread(target=self._experiment_loop, daemon=True)
         self._experiment_thread.start()
 
+        # Start UDP sender thread
         self._frontend_network_thread = threading.Thread(target=self._frontend_network_loop, daemon=True)
         self._frontend_network_thread.start()
 
         match MOTOR_TYPE:
             case MotorType.ARDUINO:
-                try:
-                    self._arduino = serial.Serial('COM3', 115200)
-                except Exception as e:
-                    print(f"Failed to connect to Arduino - serial control disabled. Error: {e}")
-                    self._arduino = None
-                    
-                self._arduino_thread = threading.Thread(target=self._arduino_control_loop, daemon=True)
-                self._arduino_thread.start()
+                # Initialize Arduino with proper ESP32 boot handling
+                self._arduino = self._initialize_arduino(arduino_port, arduino_baud)
+
+                if self._arduino:
+                    # Start Arduino control thread
+                    self._arduino_thread = threading.Thread(target=self._arduino_control_loop, daemon=True)
+                    self._arduino_thread.start()
             case MotorType.TECHNOSOFT:
                 self._technosoft_thread = threading.Thread(target=self._technosoft_control_loop, daemon=True)
                 self._technosoft_thread.start()
             case MotorType.NONE:
-                ...
-            case _: raise NotImplementedError("Unknown motor type")
+                ...  # No motor control needed
+            case _: raise NotImplementedError("Unknown motor type")  # Should never happen
 
         self._top_thread = threading.Thread(target=self.start_top_camera, daemon=True)
         self._top_thread.start()
 
-        if not SIDE_CAMERA_DEBUG:
+        if not DEBUG_SIDE_CAMERA_OFF:
             self._side_thread = threading.Thread(target=self.start_side_camera, daemon=True)
             self._side_thread.start()
 
     def _get_pair_path(self) -> Path:
+        """Get the path for the current pair of stiffness values"""
         return self._path / f"pair_{self._pair_counter:03d}"
 
     def _create_pair_folder(self) -> None:
+        """Create a folder for the current pair of stiffness values"""
         pair_path = self._get_pair_path()
         pair_path.mkdir()
         
     def _initialize_writers(self) -> None:
+        # Initialize video writers for this pair
         if RECORDING_DATA:
             pair_path = self._get_pair_path()
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')    
             self._top_writer = cv2.VideoWriter(str(pair_path / 'top_camera.mp4'), fourcc, self._camera_fps, (self._top_width, self._top_height))
-            if not SIDE_CAMERA_DEBUG:
+            if not DEBUG_SIDE_CAMERA_OFF:
                 self._side_writer = cv2.VideoWriter(str(pair_path / 'side_camera.mp4'), fourcc, self._camera_fps, (self._top_width, self._top_height))
 
     def _setup_pair(self) -> None:
+        """ Setup everything needed for a new pair """
         self._create_pair_folder()
         self._initialize_writers()
 
     def _cleanup_writers(self):
+        """Clean up video writers after pair is complete"""
         if self._top_writer:
             self._top_writer.release()
             self._top_writer = None
@@ -322,31 +366,37 @@ class Experiment:
         sleep(1.0 / self._motors_communication_rate)
 
     def _update_virtual_object(self, stiffness_value: int, pair_index: int) -> None:
+        """Update virtual object position based on hand position and pinch state"""
         if self._current_position is None:
             return
 
+        # Check if fingers are near object for pinching
         finger_midpoint_x = (self._current_position.thumb_x + self._current_position.active_finger_x) / 2
         finger_midpoint_y = (self._current_position.thumb_y + self._current_position.active_finger_y) / 2
-
+        
         distance_to_object = math.sqrt(
             (finger_midpoint_x - self._virtual_object.x)**2 + 
             (finger_midpoint_y - self._virtual_object.y)**2
         )
         
+        # Update object pinch state
         if self._is_pinching and distance_to_object < self._virtual_object.size * 0.5:
             self._virtual_object.is_pinched = True
         elif not self._is_pinching:
             self._virtual_object.is_pinched = False
-
+            
+        # Move object with fingers if pinched
         if self._virtual_object.is_pinched:
             self._virtual_object.x = finger_midpoint_x
             self._virtual_object.y = finger_midpoint_y
             self._update_movement_progress()
         else:
+            # Return to original position when released
             self._virtual_object.x = self._virtual_object.original_x
             self._virtual_object.y = self._virtual_object.original_y
             self._virtual_object.progress = 0.0
 
+        # Update stiffness and index
         self._virtual_object.stiffness_value = stiffness_value
         self._virtual_object.pair_index = pair_index
 
@@ -361,16 +411,19 @@ class Experiment:
         return "index" if is_index else self._pair_finger
 
     def _update_active_finger(self, is_index: bool):
+        # Set finger landmark based on selected pair
         self._active_finger = self._get_finger_name(is_index)
         self._vision.set_active_finger(self._active_finger)
         print(f"Active finger set to {self._active_finger}")
 
     def _experiment_loop(self):
+
         for pair in self._config.pairs:
             if not self._running:
                 print("Exit via Ctrl-C")
                 break
 
+            # Read the next pair and decide action
             if pair.first.value == -1:
                 if pair.second.value != -1:
                     raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
@@ -387,6 +440,7 @@ class Experiment:
                 self._pause_time = PAUSE_SLEEP_SECONDS
                 self._state = ExperimentState.PAUSE
                 for i in range(PAUSE_SLEEP_SECONDS, 0, -1):
+                    # sleeping one second at a time to update frontend + exit via Ctrl-C during pause
                     sleep(1)
                     self._pause_time = i
                     if not self._running:
@@ -400,6 +454,7 @@ class Experiment:
                 self._setup_pair()
                 self._state = ExperimentState.COMPARISON
 
+                # For each object in pair pass the stiffness value and pair index to the virtual
                 self._reset_comparison()
                 self._update_active_finger(pair.first.is_index)
                 while self._running and not self._check_comparison_end():
@@ -412,6 +467,7 @@ class Experiment:
                     self._update_virtual_object(pair.second.value, 1)
                     self._sleep_virtual_object()
 
+                # Clean up video writers after pair is complete
                 self._cleanup_writers()
 
                 if not self._running:
@@ -421,11 +477,15 @@ class Experiment:
                 print("Question")
                 question_timestamp = datetime.now()
                 self._state = ExperimentState.QUESTION
+                # .recv is a blocking call, waiting for input from the frontend
+                # TODO - add support for exit via Ctrl-C
                 answer_data = self._control_socket.recv(1024)
                 answer = ExperimentControl.model_validate_json(answer_data)
 
+                # Write to answers CSV in experiment folder
                 answers_file = self._path / 'answers.csv'
 
+                # Add headers if file does not exist
                 if not answers_file.exists():
                     with open(answers_file, 'w', newline='') as f:
                         writer = csv.writer(f)
@@ -443,34 +503,129 @@ class Experiment:
                         (datetime.now() - question_timestamp).total_seconds(),
                         answer.questionInput])
 
+    def _initialize_arduino(self, port: str, baud: int) -> Optional[serial.Serial]:
+        """
+        Initialize Arduino/ESP32 connection with proper boot handling.
+        Waits for ESP32 to complete boot and motor detection before returning.
+        """
+        try:
+            print(f"Connecting to Arduino on {port}...")
+            arduino = serial.Serial(port=port, baudrate=baud, timeout=0.1)
+            print(f"Connected to {port}")
+            print("Waiting for ESP32 to initialize...")
+
+            # Wait for and display boot messages
+            sleep(0.5)
+            while arduino.in_waiting > 0:
+                line = arduino.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    print(f"  [ESP32] {line}")
+
+            # Wait for motor detection to complete (ESP32 runs detectConnectedMotors on boot)
+            print("Waiting for motor detection...")
+            sleep(3)
+            while arduino.in_waiting > 0:
+                line = arduino.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    print(f"  [ESP32] {line}")
+
+            # Validate connection by requesting status
+            print("Validating connection...")
+            arduino.write(b"STATUS\n")
+            arduino.flush()
+
+            # Wait for response
+            start_time = datetime.now()
+            response_received = False
+            while (datetime.now() - start_time).total_seconds() < 2:
+                if arduino.in_waiting > 0:
+                    line = arduino.readline().decode('utf-8', errors='ignore').strip()
+                    if line:
+                        print(f"  [ESP32] {line}")
+                        if "Motor" in line or "===" in line:
+                            response_received = True
+                sleep(0.05)
+
+            if response_received:
+                print("Arduino/ESP32 initialized successfully!")
+                return arduino
+            else:
+                print("Warning: No response from ESP32 STATUS command, but continuing...")
+                return arduino
+
+        except serial.SerialException as e:
+            print(f"Failed to connect to Arduino - serial control disabled. Error: {e}")
+            return None
+
     def _arduino_control_loop(self):
-        MOVEMENT_THRESHOLD = 5.0
-        steady_flag = True
-        
+        """Thread that controls Arduino based on hand movement using motor kinematics"""
+        is_comparison = True
+
         while self._running and self._arduino:
             if self._virtual_object.is_pinched:
-                steady_flag = False
+                # Calculate object displacement from center
                 obj_x = self._virtual_object.x - self._virtual_object.original_x
                 obj_y = self._virtual_object.y - self._virtual_object.original_y
-                
+
+                finger_id = FingerId.INDEX if self._active_finger == "index" else FingerId.OTHER
                 stiffness_value = self._virtual_object.stiffness_value
-                finger_code = self._active_finger[0].upper()
-                message = 'Z'
-                if abs(obj_x) > MOVEMENT_THRESHOLD or abs(obj_y) > MOVEMENT_THRESHOLD:
+
+                motors = []
+
+                # Check experiment state for motor control
+                if self._state != ExperimentState.COMPARISON:
+                    if is_comparison:
+                        is_comparison = False
+                        # Reset motors to zero position when leaving comparison state
+                        motors.extend([
+                            MotorMovement(pos=0, index=self._get_base_index(finger_id.value)),
+                            MotorMovement(pos=0, index=self._get_base_index(finger_id.value)+1),
+                            MotorMovement(pos=0, index=self._get_base_index(finger_id.value)+2),
+                        ])
+                else:
+                    # In comparison state - calculate motor movements based on direction
+                    is_comparison = True
                     if abs(obj_x) > abs(obj_y):
-                        if obj_x < 0:
-                            self._arduino.write(f'{finger_code}L{stiffness_value}'.encode())
-                        else:
-                            self._arduino.write(f'{finger_code}R{stiffness_value}'.encode())
+                        # Horizontal movement
+                        if obj_x < 0:  # Moving left
+                            motors.extend(self._calculate_motor_movements(
+                                finger_id=finger_id,
+                                direction="left",
+                                distance=abs(obj_x)
+                            ))
+                        else:  # Moving right
+                            motors.extend(self._calculate_motor_movements(
+                                finger_id=finger_id,
+                                direction="right",
+                                distance=abs(obj_x)
+                            ))
                     else:
-                        if obj_y < 0:
-                            self._arduino.write(f'{finger_code}U{stiffness_value}'.encode())
-                        else:
-                            self._arduino.write(f'{finger_code}D{stiffness_value}'.encode())
-            elif not steady_flag:
-                self._arduino.write(b'S')
-                steady_flag = True
-            self._sleep_frontend()
+                        # Vertical movement
+                        if obj_y < 0:  # Moving up
+                            motors.extend(self._calculate_motor_movements(
+                                finger_id=finger_id,
+                                direction="up",
+                                distance=abs(obj_y)
+                            ))
+                        else:  # Moving down
+                            motors.extend(self._calculate_motor_movements(
+                                finger_id=finger_id,
+                                direction="down",
+                                distance=abs(obj_y)
+                            ))
+
+                if motors:
+                    for motor in motors:
+                        motor.pos = int(motor.pos * MOVE_FACTOR)
+
+                    # Build and send message via serial
+                    message = self._build_message(motors)
+                    print(message)
+                    self._arduino.write(message.encode())
+                    sleep(1)
+                    print(self._arduino.read_all())
+
+            self._sleep_motors()
 
     def _build_message(self, motors: list[MotorMovement]) -> str:
         message = "Z"
@@ -480,48 +635,105 @@ class Experiment:
         return message
         
     def _get_base_index(self, finger_idx: Literal[0, 1]) -> Literal[0, 3]:
+        """ Get's the base motor index for the given finger """
         return finger_idx * 3
 
     def _calculate_motor_movements(self, finger_id: FingerId, direction: str, distance: float, motor_spacing: float = 1000.0) -> list[MotorMovement]:
+        """
+        Calculate motor movements for a triangular motor system using proper kinematics.
+        
+        Motor layout (top view, coordinate system):
+            0 (top)
+            / \
+            /   \
+        1     2
+        (left) (right)
+        
+        Args:
+            finger_idx: finger
+            direction: Movement direction ("up", "down", "left", "right")
+            distance: Distance to move the object (in same units as motor_spacing)
+            motor_spacing: Distance between motors (for calculating geometry)
+            
+        Returns:
+            List of MotorMovement objects for each motor
+        """
         direction = direction.lower()
         base_motor_idx = self._get_base_index(finger_id.value)
-        h = motor_spacing * math.sqrt(3) / 3
-
+        
+        # Define motor positions in a coordinate system (equilateral triangle)
+        # Center at origin (0, 0)
+        # Motor 0 (top) at (0, h) where h = motor_spacing * sqrt(3) / 3
+        # Motor 1 (left) at (-motor_spacing/2, -h/2)
+        # Motor 2 (right) at (motor_spacing/2, -h/2)
+        
+        h = motor_spacing * math.sqrt(3) / 3  # Height from center to vertex
+        
         motor_positions = [
-            (0, 2 * h / 3),
-            (-motor_spacing / 2, -h / 3),
-            (motor_spacing / 2, -h / 3)
+            (0, 2 * h / 3),                    # Motor 0: top
+            (-motor_spacing / 2, -h / 3),      # Motor 1: left
+            (motor_spacing / 2, -h / 3)        # Motor 2: right
         ]
+        
+        # Object starts at center (0, 0)
         object_start = (0, 0)
+        
+        # Calculate object's new position based on direction
         direction_vectors = {
             "up": (0, distance),
             "down": (0, -distance),
             "left": (-distance, 0),
             "right": (distance, 0)
         }
+        
         if direction not in direction_vectors:
             raise ValueError(f"Invalid direction: {direction}. Must be one of: up, down, left, right")
+        
         dx, dy = direction_vectors[direction]
         object_end = (object_start[0] + dx, object_start[1] + dy)
+        
+        # Calculate string length changes for each motor
         movements = []
         for i, (mx, my) in enumerate(motor_positions):
+            # Initial string length (distance from motor to start position)
             initial_length = math.sqrt((mx - object_start[0])**2 + (my - object_start[1])**2)
+            
+            # Final string length (distance from motor to end position)
             final_length = math.sqrt((mx - object_end[0])**2 + (my - object_end[1])**2)
+            
+            # Change in string length
+            # Positive = extend string (let out more), Negative = retract string (pull in)
             delta_length = final_length - initial_length
+            
             movements.append(MotorMovement(pos=int(delta_length), index=i+base_motor_idx))
+        
         return movements
 
     def _technosoft_control_loop(self):
+        """Thread that controls Technosoft controller based on hand movement"""
         is_comparison = True
         
         while self._running:
             if self._virtual_object.is_pinched:
+                og_obj_x = 0
+                og_obj_y = 0
+                # original x/y != (0,0) since they are half of screen size              
                 obj_x = self._virtual_object.x - self._virtual_object.original_x
                 obj_y = self._virtual_object.y - self._virtual_object.original_y
+                if (obj_x == og_obj_x and obj_y == og_obj_y):
+                    continue
+
+                og_obj_x = obj_x
+                og_obj_y = obj_y
 
                 finger_id = FingerId.INDEX if self._active_finger == "index" else FingerId.OTHER
+                # TODO - Use stiffness calculate motor movement
                 stiffness_value = self._virtual_object.stiffness_value
+
                 motors = []
+
+                # TODO (if needed) - support diagonal movement
+                # Movement Check
                 if self._state != ExperimentState.COMPARISON:
                     if is_comparison:
                         is_comparison = False
@@ -531,16 +743,18 @@ class Experiment:
                             MotorMovement(pos=0, index=self._get_base_index(finger_id.value)+2),
                         ])
                 else:
+                    # Must be in comparison
                     is_comparison = True
                     if abs(obj_x) > abs(obj_y):
-                        if obj_x < 0:
+                        # Horizontal movement
+                        if obj_x < 0:  # Moving left
                             print(f"Moving left by {obj_x}")
                             motors.extend(self._calculate_motor_movements(
                                 finger_id=finger_id,
-                                direction="left",
+                                direction="left",  # Reverse direction
                                 distance = abs(obj_x)
                             ))
-                        else:
+                        else:  # Moving right
                             print(f"Moving right by {obj_x}")    
                             motors.extend(self._calculate_motor_movements(
                                 finger_id=finger_id,
@@ -548,14 +762,15 @@ class Experiment:
                                 distance = abs(obj_x)
                             ))
                     else:
-                        if obj_y < 0:
+                        # Vertical movement
+                        if obj_y < 0:  # Moving up
                             print(f"Moving up by {obj_y}")    
                             motors.extend(self._calculate_motor_movements(
                                 finger_id=finger_id,
                                 direction="up",
                                 distance = abs(obj_y)
                             ))
-                        else:
+                        else:  # Moving down
                             print(f"Moving down by {obj_y}")    
                             motors.extend(self._calculate_motor_movements(
                                 finger_id=finger_id,
@@ -564,20 +779,28 @@ class Experiment:
                             ))
 
                 if motors:
+                    for motor in motors:
+                        motor.pos = int(motor.pos * MOVE_FACTOR)
+
+                    # Build message
                     if DEBUG_SINGLE_MOTOR:
                         motors = [motors[0]]
                     message = self._build_message(motors)
+
                     self._technosoft_socket.sendto(message.encode("utf-8"), (self._server_address, self._technosoft_port))
             self._sleep_motors()
 
     def _frontend_network_loop(self):
+        """Thread that sends hand position data over UDP"""
         while self._running:
             current_pos = self.get_hand_position()
             if current_pos:
+                # Convert to list of finger positions
                 finger_positions = [
                     FingerPosition(x=current_pos.thumb_x / self._top_width, z=current_pos.thumb_y / self._top_height),
                     FingerPosition(x=current_pos.active_finger_x / self._top_width, z=current_pos.active_finger_y / self._top_height)
                 ]
+
                 packet = ExperimentPacket(
                     stateData=StateData(state=self._state.value, pauseTime=self._pause_time),
                     landmarks=finger_positions,
@@ -591,15 +814,19 @@ class Experiment:
                         pairIndex=self._virtual_object.pair_index
                     )
                 )
+
                 try:
+                    # * Send information to unity via udp socket
                     self._frontend_socket.sendto(packet.model_dump_json().encode("utf-8"), (self._server_address, self._frontend_port))
                 except queue.Empty:
-                    ...
+                    ...  # Expected timeout, no frames available
                 except Exception as e:
                     print(f"Failed to send UDP data: {e}")
+                    
             self._sleep_frontend()
 
     def _calculate_pinch_threshold(self, depth: float) -> float:
+        """Adjust threshold based on depth (distance from side camera)"""
         return self.BASE_PINCH_THRESHOLD * (depth)
     
     def _configure_camera(self, cap: cv2.VideoCapture):
@@ -609,6 +836,12 @@ class Experiment:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._top_height)
 
     def _update_movement_progress(self):
+        """Update movement progress based on object position"""
+        # ! BUG: Bar does not respond on the way back from edge to center
+        # ! Proposed Solution: Half bar to edge in color X, Half bar to centery in color Y
+
+        # ! BUG: If we unpinch after reaching edge, it moves object to center which increases the count by one when pinching again
+        # ! Proposed Solution: Track movement back (half bar-half bar), only successful on reaching center by movement (same as solution above)
         if not self._virtual_object.is_pinched:
             self._virtual_object.progress = 0.0
             self.reached_edge = False
@@ -621,43 +854,61 @@ class Experiment:
             (self._virtual_object.x - center_x)**2 + 
             (self._virtual_object.y - center_y)**2
         )
+        
+        # Check if in center region
         if distance_from_center < self.CENTER_THRESHOLD:
             if not self.in_center and self.reached_edge:
+                # Completed full movement
                 self._virtual_object.cycle_counter += 1
                 self._virtual_object.progress = 0.0
                 self.reached_edge = False
             self.in_center = True
         else:
             self.in_center = False
+            
+        # Check if reached edge
         max_distance = min(self._top_width/2, self._top_height/2) - self.EDGE_THRESHOLD
         if distance_from_center > max_distance:
             self.reached_edge = True
+            
+        # Update progress
         if not self.reached_edge:
             self._virtual_object.progress = min(distance_from_center / max_distance, 1.0)
+            
+            # If moving back to center before reaching edge, progress drops
             last_distance = math.sqrt(
                 (self.last_x - center_x)**2 + 
                 (self.last_y - center_y)**2
             )
             if distance_from_center < last_distance:
                 self._virtual_object.progress = max(0.0, self._virtual_object.progress - 0.1)
+                
         self.last_x = self._virtual_object.x
         self.last_y = self._virtual_object.y
 
     def _record_top_frames(self):
+        """Thread for recording frames from top camera"""
         while self._running:
             if self._top_writer:
                 try:
                     data: tuple[np.ndarray, HandPosition] = self._top_frame_queue.get(timeout=1)
                     frame, hand_position = data
                     self._top_writer.write(frame)
+                    
+                    # Write hand position data to CSV
                     pair_path = self._get_pair_path()
                     tracking_file = pair_path / 'tracking.csv'
+
                     position_dict = hand_position.model_dump()
+                    
+                    # Create CSV with headers if it doesn't exist
                     if not tracking_file.exists():
                         headers = ['timestamp', 'pinching', 'stiffness', 'object_x', 'object_y', 'finger', *list(position_dict.keys())]
                         with open(tracking_file, 'w', newline='') as f:
                             writer = csv.writer(f)
                             writer.writerow(headers)
+                    
+                    # Append position data
                     with open(tracking_file, 'a', newline='') as f:
                         writer = csv.writer(f)
                         row_data = [
@@ -670,10 +921,12 @@ class Experiment:
                             *list(position_dict.values())
                         ]
                         writer.writerow(row_data)
+                        
                 except Exception as e:
                     print(e)
 
     def _record_side_frames(self):
+        """Thread for recording frames from side camera"""
         while self._running:
             if self._side_writer:
                 try:
@@ -696,11 +949,12 @@ class Experiment:
                 continue
 
             # Flip frame in y *after* reading (to invert the y axis)
-            flipped_frame = cv2.flip(frame, 0)
+            if DEBUG_FLIP_Y:
+                frame = cv2.flip(frame, 0)
 
-            detected = self._process_top_view(flipped_frame)
+            detected = self._process_top_view(frame)
             
-            # Add frame to recording queue if recording (should save original frame, not flipped)
+            # Add frame to recording queue if recording
             if self._top_writer:
                 try:
                     self._top_frame_queue.put_nowait((frame, detected))
@@ -718,11 +972,14 @@ class Experiment:
                 self._current_position = detected
 
     def start_side_camera(self):
+        """Process side camera feed to detect pinch gestures"""
         RETRIES = 10
+        
         cap = cv2.VideoCapture(self.SIDE_CAMERA, cv2.CAP_DSHOW)
         for _ in range(RETRIES-1):
             if cap.isOpened():
                 break
+
             cap = cv2.VideoCapture(self.SIDE_CAMERA, cv2.CAP_DSHOW)
 
         if not cap.isOpened():
@@ -730,6 +987,7 @@ class Experiment:
             return
         
         self._configure_camera(cap)
+        # Sleeping 3 seconds to give time for the camera to warm up
         sleep(3)
 
         while self._running:
@@ -739,6 +997,7 @@ class Experiment:
 
             self._detect_pinch(frame)
             
+            # Add frame to recording queue if recording
             if self._side_writer:
                 try:
                     self._side_frame_queue.put_nowait(frame)
@@ -750,15 +1009,19 @@ class Experiment:
                 break
 
     def get_hand_position(self, with_lock = True) -> Optional[HandPosition]:
+        """Get the current hand position"""
         if with_lock:
             with self._hand_position_lock:
                 return self._current_position
+        
         return self._current_position
 
     def is_pinching(self) -> bool:
+        """Get current pinch state"""
         return self._is_pinching
 
     def _toggle_pinch(self):
+        """Toggle pinch state when not using camera"""
         print(f"toggle pinch from {self._is_pinching} to {not self._is_pinching}")
         self._is_pinching = not self._is_pinching
     
@@ -795,6 +1058,7 @@ class Experiment:
             print(f"Pinch changed to {self._is_pinching}")
         
     def cleanup(self):
+        """Clean up resources"""
         self._running = False
         keyboard.unhook_all()
         cv2.destroyAllWindows()
@@ -806,18 +1070,22 @@ class Experiment:
 
         match MOTOR_TYPE:
             case MotorType.ARDUINO:
-                self._arduino.close()
+                if self._arduino:
+                    self._arduino.close()
             case MotorType.TECHNOSOFT:
                 self._technosoft_socket.close()
             case MotorType.NONE:
-                ...
-            case _: raise NotImplementedError("Unknown motor type")
+                ...  # No cleanup needed
+            case _: raise NotImplementedError("Unknown motor type")  # Should never happen
 
 def start_experiment(config: Configuration, path: Path, pair_finger: PairFinger):
+    """Initialize and start the hand tracking system"""
     experiment = Experiment(config, path, pair_finger)
+    
     return experiment
 
 def get_pair_finger() -> PairFinger:
+    # Get user input for M or R
     while True:
         user_input = input("Please enter M or R: ").upper()
         if user_input in ['M', 'R']:
@@ -826,30 +1094,44 @@ def get_pair_finger() -> PairFinger:
     return "middle" if user_input == "M" else "ring"
 
 def create_experiment_folder(config: Configuration, pair_finger: PairFinger):
+    # Check if experiment folder exists, create if not
     experiment_path = Path(experiment_folder)
     if not experiment_path.exists():
         experiment_path.mkdir()
+    
+    # Get list of existing folders and find highest number
     existing_folders = [f for f in experiment_path.iterdir() if f.is_dir()]
     if not existing_folders:
+        # Create first folder 001 if no folders exist
         folder_id = 1
     else:
+        # Get highest numbered folder and increment
         folder_id = max(int(folder.name.split('_')[-1]) for folder in existing_folders) + 1
+
+    # Create folder name with timestamp, ID and user input
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
     folder_path = experiment_path / f"{timestamp}_{pair_finger}_{folder_id:03d}"
+    
+    # Create the new folder
     folder_path.mkdir()
+
+    # Write configuration to new folder
     config.write_configuration(folder_path / "configuration.csv")
+
     return folder_path
 
 def main():
     config = Configuration.read_configuration('configuration.csv')
     pair_finger = get_pair_finger()
     path = create_experiment_folder(config, pair_finger)
+    
     experiment = start_experiment(config, path, pair_finger)
     try:
         while True:
             sleep(0.1)
     except KeyboardInterrupt:
         experiment.cleanup()
+
 
 if __name__ == "__main__":
     main()
