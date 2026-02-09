@@ -11,9 +11,8 @@ from threading import Lock
 import numpy as np
 import socket
 from pydantic import BaseModel
-import serial
 from structures import ExperimentControl, ExperimentState, FingerPosition, StateData, TrackingObject, ExperimentPacket
-from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, TECHNOSOFT_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, PairFinger
+from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, PairFinger
 import queue
 from queue import Queue
 from enum import Enum, StrEnum
@@ -21,7 +20,7 @@ from vision import ColorVision, HandPosition, MediapipeVision, YoloVision, FINGE
 
 DEBUG_POSITION = 1000
 DEBUG_SINGLE_MOTOR = False
-DEBUG_FLIP_Y = False #in the lab setup
+DEBUG_FLIP_Y = False
 DEBUG_SIDE_CAMERA_OFF = True
 DEBUG_ALLOW_PRINTS = False
 
@@ -42,16 +41,21 @@ class FingerId(Enum):
     OTHER = 1
 
 class MotorType(StrEnum):
-    ARDUINO = "arduino"
-    TECHNOSOFT = "technosoft"
+    HARDWARE = "hardware"
     NONE = "none"
+
+class MovementStrategy(StrEnum):
+    CARDINAL = "cardinal"
+    CARDINAL_DIAGONAL = "cardinal_diagonal"
+    FREE_FORM = "free_form"
 
 class MotorMovement(BaseModel):
     pos: int
     index: int
 
 MOVE_FACTOR = 1
-MOTOR_TYPE = MotorType.TECHNOSOFT
+MOTOR_TYPE = MotorType.HARDWARE
+MOVEMENT_STRATEGY = MovementStrategy.CARDINAL_DIAGONAL
 VISION_TYPE = VisionType.MEDIAPIPE
 RECORDING_DATA = True
 
@@ -149,9 +153,7 @@ class Experiment:
         server_address: str = "localhost",
         frontend_port: int = PYGAME_PORT,
         backend_port: int = BACKEND_PORT,
-        technosoft_port: int = TECHNOSOFT_PORT,
-        arduino_port: str = 'COM13',
-        arduino_baud: int = 115200
+        hardware_port: int = HARDWARE_PORT
     ):
         
         # SETUP
@@ -193,9 +195,9 @@ class Experiment:
         self._server_address = server_address
         self._frontend_port = frontend_port
         self._backend_port = backend_port
-        self._technosoft_port = technosoft_port
+        self._hardware_port = hardware_port
         self._frontend_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._technosoft_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._hardware_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         
         # Bind sockets
@@ -302,17 +304,9 @@ class Experiment:
         self._frontend_network_thread.start()
 
         match MOTOR_TYPE:
-            case MotorType.ARDUINO:
-                # Initialize Arduino with proper ESP32 boot handling
-                self._arduino = self._initialize_arduino(arduino_port, arduino_baud)
-
-                if self._arduino:
-                    # Start Arduino control thread
-                    self._arduino_thread = threading.Thread(target=self._arduino_control_loop, daemon=True)
-                    self._arduino_thread.start()
-            case MotorType.TECHNOSOFT:
-                self._technosoft_thread = threading.Thread(target=self._technosoft_control_loop, daemon=True)
-                self._technosoft_thread.start()
+            case MotorType.HARDWARE:
+                self._hardware_thread = threading.Thread(target=self._hardware_control_loop, daemon=True)
+                self._hardware_thread.start()
             case MotorType.NONE:
                 ...  # No motor control needed
             case _: raise NotImplementedError("Unknown motor type")  # Should never happen
@@ -503,130 +497,6 @@ class Experiment:
                         (datetime.now() - question_timestamp).total_seconds(),
                         answer.questionInput])
 
-    def _initialize_arduino(self, port: str, baud: int) -> Optional[serial.Serial]:
-        """
-        Initialize Arduino/ESP32 connection with proper boot handling.
-        Waits for ESP32 to complete boot and motor detection before returning.
-        """
-        try:
-            print(f"Connecting to Arduino on {port}...")
-            arduino = serial.Serial(port=port, baudrate=baud, timeout=0.1)
-            print(f"Connected to {port}")
-            print("Waiting for ESP32 to initialize...")
-
-            # Wait for and display boot messages
-            sleep(0.5)
-            while arduino.in_waiting > 0:
-                line = arduino.readline().decode('utf-8', errors='ignore').strip()
-                if line:
-                    print(f"  [ESP32] {line}")
-
-            # Wait for motor detection to complete (ESP32 runs detectConnectedMotors on boot)
-            print("Waiting for motor detection...")
-            sleep(3)
-            while arduino.in_waiting > 0:
-                line = arduino.readline().decode('utf-8', errors='ignore').strip()
-                if line:
-                    print(f"  [ESP32] {line}")
-
-            # Validate connection by requesting status
-            print("Validating connection...")
-            arduino.write(b"STATUS\n")
-            arduino.flush()
-
-            # Wait for response
-            start_time = datetime.now()
-            response_received = False
-            while (datetime.now() - start_time).total_seconds() < 2:
-                if arduino.in_waiting > 0:
-                    line = arduino.readline().decode('utf-8', errors='ignore').strip()
-                    if line:
-                        print(f"  [ESP32] {line}")
-                        if "Motor" in line or "===" in line:
-                            response_received = True
-                sleep(0.05)
-
-            if response_received:
-                print("Arduino/ESP32 initialized successfully!")
-                return arduino
-            else:
-                print("Warning: No response from ESP32 STATUS command, but continuing...")
-                return arduino
-
-        except serial.SerialException as e:
-            print(f"Failed to connect to Arduino - serial control disabled. Error: {e}")
-            return None
-
-    def _arduino_control_loop(self):
-        """Thread that controls Arduino based on hand movement using motor kinematics"""
-        is_comparison = True
-
-        while self._running and self._arduino:
-            if self._virtual_object.is_pinched:
-                # Calculate object displacement from center
-                obj_x = self._virtual_object.x - self._virtual_object.original_x
-                obj_y = self._virtual_object.y - self._virtual_object.original_y
-
-                finger_id = FingerId.INDEX if self._active_finger == "index" else FingerId.OTHER
-                stiffness_value = self._virtual_object.stiffness_value
-
-                motors = []
-
-                # Check experiment state for motor control
-                if self._state != ExperimentState.COMPARISON:
-                    if is_comparison:
-                        is_comparison = False
-                        # Reset motors to zero position when leaving comparison state
-                        motors.extend([
-                            MotorMovement(pos=0, index=self._get_base_index(finger_id.value)),
-                            MotorMovement(pos=0, index=self._get_base_index(finger_id.value)+1),
-                            MotorMovement(pos=0, index=self._get_base_index(finger_id.value)+2),
-                        ])
-                else:
-                    # In comparison state - calculate motor movements based on direction
-                    is_comparison = True
-                    if abs(obj_x) > abs(obj_y):
-                        # Horizontal movement
-                        if obj_x < 0:  # Moving left
-                            motors.extend(self._calculate_motor_movements(
-                                finger_id=finger_id,
-                                direction="left",
-                                distance=abs(obj_x)
-                            ))
-                        else:  # Moving right
-                            motors.extend(self._calculate_motor_movements(
-                                finger_id=finger_id,
-                                direction="right",
-                                distance=abs(obj_x)
-                            ))
-                    else:
-                        # Vertical movement
-                        if obj_y < 0:  # Moving up
-                            motors.extend(self._calculate_motor_movements(
-                                finger_id=finger_id,
-                                direction="up",
-                                distance=abs(obj_y)
-                            ))
-                        else:  # Moving down
-                            motors.extend(self._calculate_motor_movements(
-                                finger_id=finger_id,
-                                direction="down",
-                                distance=abs(obj_y)
-                            ))
-
-                if motors:
-                    for motor in motors:
-                        motor.pos = int(motor.pos * MOVE_FACTOR)
-
-                    # Build and send message via serial
-                    message = self._build_message(motors)
-                    print(message)
-                    self._arduino.write(message.encode())
-                    sleep(1)
-                    print(self._arduino.read_all())
-
-            self._sleep_motors()
-
     def _build_message(self, motors: list[MotorMovement]) -> str:
         message = "Z"
         for motor in motors:
@@ -638,23 +508,57 @@ class Experiment:
         """ Get's the base motor index for the given finger """
         return finger_idx * 3
 
-    def _calculate_motor_movements(self, finger_id: FingerId, direction: str, distance: float, motor_spacing: float = 1000.0) -> list[MotorMovement]:
+    def _determine_movement_direction(self, obj_x: float, obj_y: float) -> tuple[str, float]:
+        """Determine movement direction and distance from displacement.
+
+        Uses a 50% ratio threshold to detect diagonal movement when
+        MOVEMENT_STRATEGY is CARDINAL_DIAGONAL.
+
+        Returns:
+            tuple of (direction: str, distance: float)
         """
-        Calculate motor movements for a triangular motor system using proper kinematics.
-        
+        DIAGONAL_THRESHOLD = 0.5
+
+        if obj_x == 0 and obj_y == 0:
+            return ("none", 0)
+
+        abs_x, abs_y = abs(obj_x), abs(obj_y)
+
+        # Check if movement is diagonal (only when strategy allows)
+        if MOVEMENT_STRATEGY == MovementStrategy.CARDINAL_DIAGONAL:
+            if abs_x > 0 and abs_y > 0:
+                ratio = min(abs_x, abs_y) / max(abs_x, abs_y)
+                if ratio >= DIAGONAL_THRESHOLD:
+                    distance = math.sqrt(obj_x**2 + obj_y**2)
+                    if obj_x < 0:
+                        direction = "up-left" if obj_y < 0 else "down-left"
+                    else:
+                        direction = "up-right" if obj_y < 0 else "down-right"
+                    return (direction, distance)
+
+        # Cardinal movement (always used for CARDINAL strategy, or when diagonal threshold not met)
+        if abs_x > abs_y:
+            return ("left" if obj_x < 0 else "right", abs_x)
+        else:
+            return ("up" if obj_y < 0 else "down", abs_y)
+
+    def _calculate_cardinal_motor_movements(self, finger_id: FingerId, direction: str, distance: float, motor_spacing: float = 1000.0) -> list[MotorMovement]:
+        """
+        Calculate motor movements for cardinal directions only (up, down, left, right).
+
         Motor layout (top view, coordinate system):
             0 (top)
             / \
             /   \
         1     2
         (left) (right)
-        
+
         Args:
-            finger_idx: finger
+            finger_id: finger identifier
             direction: Movement direction ("up", "down", "left", "right")
             distance: Distance to move the object (in same units as motor_spacing)
             motor_spacing: Distance between motors (for calculating geometry)
-            
+
         Returns:
             List of MotorMovement objects for each motor
         """
@@ -706,18 +610,148 @@ class Experiment:
             delta_length = final_length - initial_length
             
             movements.append(MotorMovement(pos=int(delta_length), index=i+base_motor_idx))
-        
+
         return movements
 
-    def _technosoft_control_loop(self):
-        """Thread that controls Technosoft controller based on hand movement"""
+    def _calculate_diagonal_motor_movements(self, finger_id: FingerId, direction: str, distance: float, motor_spacing: float = 1000.0) -> list[MotorMovement]:
+        """
+        Calculate motor movements for all directions including diagonals.
+
+        Motor layout (top view, coordinate system):
+            0 (top)
+            / \
+            /   \
+        1     2
+        (left) (right)
+
+        Args:
+            finger_id: finger identifier
+            direction: Movement direction (cardinal or diagonal)
+            distance: Distance to move the object (in same units as motor_spacing)
+            motor_spacing: Distance between motors (for calculating geometry)
+
+        Returns:
+            List of MotorMovement objects for each motor
+        """
+        direction = direction.lower()
+        base_motor_idx = self._get_base_index(finger_id.value)
+
+        h = motor_spacing * math.sqrt(3) / 3
+        motor_positions = [
+            (0, 2 * h / 3),
+            (-motor_spacing / 2, -h / 3),
+            (motor_spacing / 2, -h / 3)
+        ]
+
+        object_start = (0, 0)
+
+        # Extended direction vectors with diagonals (normalized)
+        direction_vectors = {
+            "up": (0, distance),
+            "down": (0, -distance),
+            "left": (-distance, 0),
+            "right": (distance, 0),
+            "up-left": (-distance / math.sqrt(2), distance / math.sqrt(2)),
+            "up-right": (distance / math.sqrt(2), distance / math.sqrt(2)),
+            "down-left": (-distance / math.sqrt(2), -distance / math.sqrt(2)),
+            "down-right": (distance / math.sqrt(2), -distance / math.sqrt(2)),
+        }
+
+        if direction not in direction_vectors:
+            raise ValueError(f"Invalid direction: {direction}. Must be one of: {', '.join(direction_vectors.keys())}")
+
+        dx, dy = direction_vectors[direction]
+        object_end = (object_start[0] + dx, object_start[1] + dy)
+
+        movements = []
+        for i, (mx, my) in enumerate(motor_positions):
+            initial_length = math.sqrt((mx - object_start[0])**2 + (my - object_start[1])**2)
+            final_length = math.sqrt((mx - object_end[0])**2 + (my - object_end[1])**2)
+            delta_length = final_length - initial_length
+            movements.append(MotorMovement(pos=int(delta_length), index=i + base_motor_idx))
+
+        return movements
+
+    def _calculate_motor_movements(self, finger_id: FingerId, direction: str, distance: float, motor_spacing: float = 1000.0) -> list[MotorMovement]:
+        """
+        Wrapper that selects the appropriate motor movement calculation strategy
+        based on MOVEMENT_STRATEGY.
+
+        Args:
+            finger_id: finger identifier
+            direction: Movement direction (cardinal, or diagonal if strategy allows)
+            distance: Distance to move the object (in same units as motor_spacing)
+            motor_spacing: Distance between motors (for calculating geometry)
+
+        Returns:
+            List of MotorMovement objects for each motor
+        """
+        match MOVEMENT_STRATEGY:
+            case MovementStrategy.CARDINAL:
+                return self._calculate_cardinal_motor_movements(finger_id, direction, distance, motor_spacing)
+            case MovementStrategy.CARDINAL_DIAGONAL:
+                return self._calculate_diagonal_motor_movements(finger_id, direction, distance, motor_spacing)
+            case _:
+                raise NotImplementedError(f"Unknown movement strategy: {MOVEMENT_STRATEGY}")
+
+    def _calculate_freeform_motor_movements(
+        self,
+        finger_id: FingerId,
+        obj_x: float,
+        obj_y: float,
+        motor_spacing: float = 1000.0
+    ) -> list[MotorMovement]:
+        """
+        Calculate motor movements for free-form movement in any direction.
+
+        Args:
+            finger_id: finger identifier
+            obj_x: X displacement from center
+            obj_y: Y displacement from center
+            motor_spacing: Distance between motors
+
+        Returns:
+            List of MotorMovement objects for each motor
+        """
+        base_motor_idx = self._get_base_index(finger_id.value)
+
+        # Clamp to screen-based max radius
+        max_radius = min(self._top_width / 2, self._top_height / 2) - self.EDGE_THRESHOLD
+        distance = math.sqrt(obj_x**2 + obj_y**2)
+        if distance > max_radius:
+            scale = max_radius / distance
+            obj_x *= scale
+            obj_y *= scale
+
+        # Motor geometry (same as other methods)
+        h = motor_spacing * math.sqrt(3) / 3
+        motor_positions = [
+            (0, 2 * h / 3),
+            (-motor_spacing / 2, -h / 3),
+            (motor_spacing / 2, -h / 3)
+        ]
+
+        object_start = (0, 0)
+        object_end = (obj_x, obj_y)
+
+        movements = []
+        for i, (mx, my) in enumerate(motor_positions):
+            initial_length = math.sqrt((mx - object_start[0])**2 + (my - object_start[1])**2)
+            final_length = math.sqrt((mx - object_end[0])**2 + (my - object_end[1])**2)
+            delta_length = final_length - initial_length
+            movements.append(MotorMovement(pos=int(delta_length), index=i + base_motor_idx))
+
+        return movements
+
+    def _hardware_control_loop(self):
+        """Thread that controls hardware via UDP based on hand movement"""
         is_comparison = True
-        
+
         while self._running:
             if self._virtual_object.is_pinched:
                 og_obj_x = 0
                 og_obj_y = 0
-                # original x/y != (0,0) since they are half of screen size              
+                # original x/y != (0,0) since they are half of screen size
                 obj_x = self._virtual_object.x - self._virtual_object.original_x
                 obj_y = self._virtual_object.y - self._virtual_object.original_y
                 if (obj_x == og_obj_x and obj_y == og_obj_y):
@@ -732,8 +766,6 @@ class Experiment:
 
                 motors = []
 
-                # TODO (if needed) - support diagonal movement
-                # Movement Check
                 if self._state != ExperimentState.COMPARISON:
                     if is_comparison:
                         is_comparison = False
@@ -743,39 +775,22 @@ class Experiment:
                             MotorMovement(pos=0, index=self._get_base_index(finger_id.value)+2),
                         ])
                 else:
-                    # Must be in comparison
+                    # In comparison state - calculate motor movements based on direction
                     is_comparison = True
-                    if abs(obj_x) > abs(obj_y):
-                        # Horizontal movement
-                        if obj_x < 0:  # Moving left
-                            print(f"Moving left by {obj_x}")
-                            motors.extend(self._calculate_motor_movements(
-                                finger_id=finger_id,
-                                direction="left",  # Reverse direction
-                                distance = abs(obj_x)
-                            ))
-                        else:  # Moving right
-                            print(f"Moving right by {obj_x}")    
-                            motors.extend(self._calculate_motor_movements(
-                                finger_id=finger_id,
-                                direction="right",
-                                distance = abs(obj_x)
-                            ))
+                    if MOVEMENT_STRATEGY == MovementStrategy.FREE_FORM:
+                        motors.extend(self._calculate_freeform_motor_movements(
+                            finger_id=finger_id,
+                            obj_x=obj_x,
+                            obj_y=obj_y
+                        ))
                     else:
-                        # Vertical movement
-                        if obj_y < 0:  # Moving up
-                            print(f"Moving up by {obj_y}")    
+                        direction, distance = self._determine_movement_direction(obj_x, obj_y)
+                        if direction != "none":
+                            print(f"Moving {direction} by {distance}")
                             motors.extend(self._calculate_motor_movements(
                                 finger_id=finger_id,
-                                direction="up",
-                                distance = abs(obj_y)
-                            ))
-                        else:  # Moving down
-                            print(f"Moving down by {obj_y}")    
-                            motors.extend(self._calculate_motor_movements(
-                                finger_id=finger_id,
-                                direction="down",
-                                distance = abs(obj_y)
+                                direction=direction,
+                                distance=distance
                             ))
 
                 if motors:
@@ -787,7 +802,7 @@ class Experiment:
                         motors = [motors[0]]
                     message = self._build_message(motors)
 
-                    self._technosoft_socket.sendto(message.encode("utf-8"), (self._server_address, self._technosoft_port))
+                    self._hardware_socket.sendto(message.encode("utf-8"), (self._server_address, self._hardware_port))
             self._sleep_motors()
 
     def _frontend_network_loop(self):
@@ -1069,11 +1084,8 @@ class Experiment:
         self._vision.cleanup()
 
         match MOTOR_TYPE:
-            case MotorType.ARDUINO:
-                if self._arduino:
-                    self._arduino.close()
-            case MotorType.TECHNOSOFT:
-                self._technosoft_socket.close()
+            case MotorType.HARDWARE:
+                self._hardware_socket.close()
             case MotorType.NONE:
                 ...  # No cleanup needed
             case _: raise NotImplementedError("Unknown motor type")  # Should never happen
