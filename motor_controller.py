@@ -4,10 +4,17 @@ from enum import Enum, StrEnum
 
 
 class FingerId(Enum):
-    """Finger groups controlled by this module."""
+    """Finger groups controlled by this module.
 
-    INDEX = 0
-    OTHER = 1
+    Each value * 3 gives the base motor pin index for that finger's
+    3-motor cluster on the 16-channel servo driver.
+    """
+
+    THUMB = 0   # pins 0, 1, 2
+    INDEX = 1   # pins 3, 4, 5
+    MIDDLE = 2  # pins 6, 7, 8
+    RING = 3    # pins 9, 10, 11
+    PINKY = 4   # pins 12, 13, 14
 
 
 class MovementStrategy(StrEnum):

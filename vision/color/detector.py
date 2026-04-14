@@ -16,7 +16,6 @@ class TrackedObject:
     velocity: Tuple[float, float]
     angle: float
     prev_position: Optional[Tuple[float, float]] = None
-
 @dataclass
 class FlowTrackedObject:
     """Enhanced tracked object for optical flow tracking."""

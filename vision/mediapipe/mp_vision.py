@@ -46,9 +46,11 @@ class MediapipeVision(BaseVision):
 
     def set_active_finger(self, finger: str):
         self._active_finger_landmark = {
+            "thumb": mp.solutions.hands.HandLandmark.THUMB_TIP,
             "index": mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP,
             "middle": mp.solutions.hands.HandLandmark.MIDDLE_FINGER_TIP,
-            "ring": mp.solutions.hands.HandLandmark.RING_FINGER_TIP
+            "ring": mp.solutions.hands.HandLandmark.RING_FINGER_TIP,
+            "pinky": mp.solutions.hands.HandLandmark.PINKY_TIP,
         }[finger]
 
     def detect_hand(self, frame: np.ndarray) -> HandPosition:
@@ -78,6 +80,23 @@ class MediapipeVision(BaseVision):
             active_finger_y=0.0
         )
     
+    def detect_side_hand(self, frame: np.ndarray) -> HandPosition:
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self._mp_side_hands.process(rgb_frame)
+
+        if results.multi_hand_landmarks:
+            hand_landmarks = results.multi_hand_landmarks[0]
+            thumb_tip = hand_landmarks.landmark[mp.solutions.hands.HandLandmark.THUMB_TIP]
+            active_tip = hand_landmarks.landmark[self._active_finger_landmark]
+            return HandPosition(
+                thumb_x=self._side_width - thumb_tip.x * self._side_width,
+                thumb_y=thumb_tip.y * self._side_height,
+                active_finger_x=self._side_width - active_tip.x * self._side_width,
+                active_finger_y=active_tip.y * self._side_height
+            )
+
+        return HandPosition(thumb_x=0.0, thumb_y=0.0, active_finger_x=0.0, active_finger_y=0.0)
+
     def detect_pinch(
         self, 
         frame: np.ndarray,
