@@ -22,9 +22,9 @@
 // Configuration
 // ============================================================================
 
-#define NUM_MOTORS 3           // 3 servos on PCA9685 channels 0-2
+#define NUM_MOTORS 15          // 5 fingers x 3 servos on PCA9685 channels 0-14
 #define SERIAL_BAUD 115200
-#define MAX_MESSAGE_LENGTH 128
+#define MAX_MESSAGE_LENGTH 256
 #define COMMAND_QUEUE_SIZE 10
 
 // PCA9685 I2C configuration
@@ -34,14 +34,14 @@
 #define PCA9685_FREQ 50        // 50 Hz for standard servos
 
 // Servo channel mapping on PCA9685
-const int SERVO_CHANNELS[NUM_MOTORS] = {0, 1, 2};
+const int SERVO_CHANNELS[NUM_MOTORS] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
 
 // Servo pulse range in PCA9685 ticks (12-bit, 4096 ticks per cycle)
 // At 50 Hz (20ms period): 1 tick = 20000/4096 ≈ 4.88 µs
 // SG92R typical range: 500-2400 µs → ~130-500 ticks
 // Calibrate these per servo using the CAL command
-int servoMinTick[NUM_MOTORS] = {130, 130, 130};
-int servoMaxTick[NUM_MOTORS] = {500, 500, 500};
+int servoMinTick[NUM_MOTORS] = {130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130};
+int servoMaxTick[NUM_MOTORS] = {500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500};
 
 // Position mapping
 const int POSITION_RANGE = 1000;  // Backend sends positions in range [-1000, 1000]
@@ -605,8 +605,8 @@ void motorTask(void* parameter) {
     initializeMotorHardware();
     serialPrintln("PCA9685 initialized, servos centered");
 
-    serialPrintf("Servo channels: %d, %d, %d\r\n",
-        SERVO_CHANNELS[0], SERVO_CHANNELS[1], SERVO_CHANNELS[2]);
+    serialPrintf("Servo channels: %d total (0-%d)\r\n",
+        NUM_MOTORS, NUM_MOTORS - 1);
     serialPrintln("Servo controller ready");
     serialPrintln("Type HELP for available commands");
 

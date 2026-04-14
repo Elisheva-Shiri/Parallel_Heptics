@@ -25,9 +25,10 @@ class ColorVision(BaseVision):
         self._side_height = side_height
         self.base_pinch_threshold = base_pinch_threshold
 
-        self._thumb_color = self._finger_colors["thumb"]
-        # Initialize active finger to index
-        self._active_finger_color = self._finger_colors["index"]
+        self._thumb_color = self._finger_colors.get("thumb", "")
+        self._active_finger_color = next(
+            (c for f, c in self._finger_colors.items() if f != "thumb"), ""
+        )
         self._top_detector = Detector(tracking_method, fps, use_gpu, min_contour_area)
         self._side_detector = Detector(tracking_method, fps, use_gpu, min_contour_area)
     
@@ -70,6 +71,12 @@ class ColorVision(BaseVision):
         active_finger = tracked_objs.get(self._active_finger_color, None)
         return self._get_hand_pos(thumb, active_finger, "top")
     
+    def detect_side_hand(self, frame: np.ndarray) -> HandPosition:
+        tracked_objs, _ = self._side_detector.update(frame)
+        thumb = tracked_objs.get(self._thumb_color, None)
+        active_finger = tracked_objs.get(self._active_finger_color, None)
+        return self._get_hand_pos(thumb, active_finger, "side")
+
     def detect_pinch(
         self, 
         frame: np.ndarray, 

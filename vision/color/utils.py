@@ -3,8 +3,8 @@ import numpy as np
 # Color detection HSV ranges
 COLOR_RANGES = {
     'red': [
-        {'lower': np.array([0, 100, 100]), 'upper': np.array([10, 255, 255])},  # Red lower range
-        {'lower': np.array([160, 100, 100]), 'upper': np.array([180, 255, 255])}  # Red upper range
+        {'lower': np.array([0, 100, 100]), 'upper': np.array([10, 255, 255])},
+        {'lower': np.array([160, 100, 100]), 'upper': np.array([180, 255, 255])}
     ],
     'blue': [
         {'lower': np.array([100, 100, 100]), 'upper': np.array([130, 255, 255])}
@@ -14,14 +14,10 @@ COLOR_RANGES = {
     ],
     'green': [
         {'lower': np.array([40, 100, 100]), 'upper': np.array([80, 255, 255])}
-    ]
-}
-
-FINGER_COLORS = {
-    "thumb": "yellow", 
-    "index": "green",
-    "middle": "blue",
-    "ring": "red"
+    ],
+    'magenta': [
+        {'lower': np.array([140, 100, 100]), 'upper': np.array([160, 255, 255])}
+    ],
 }
 
 def calculate_orientation_angle(dx: float, dy: float, prev_angle: float = -1) -> float:

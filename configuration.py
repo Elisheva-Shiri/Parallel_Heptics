@@ -2,7 +2,7 @@ import csv
 import os
 import random
 from typing import List, Tuple, Union
-from consts import PairFinger
+from consts import FINGER_NAMES
 
 def mix_values(comparisons: List[int]) -> List[int]:
     """Randomly shuffle the comparison values."""

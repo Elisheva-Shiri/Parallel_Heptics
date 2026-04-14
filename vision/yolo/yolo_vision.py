@@ -9,6 +9,7 @@ THUMB_TIP = 4
 INDEX_TIP = 8
 MIDDLE_TIP = 12
 RING_TIP = 16
+PINKY_TIP = 20
 
 class YoloVision(BaseVision):
     def __init__(
@@ -27,9 +28,11 @@ class YoloVision(BaseVision):
 
     def set_active_finger(self, finger: str):
         self._active_finger_tip = {
+            "thumb": THUMB_TIP,
             "index": INDEX_TIP,
             "middle": MIDDLE_TIP,
-            "ring": RING_TIP
+            "ring": RING_TIP,
+            "pinky": PINKY_TIP,
         }[finger]
 
     def detect_hand(self, frame: np.ndarray) -> HandPosition:
@@ -51,6 +54,23 @@ class YoloVision(BaseVision):
                 active_finger_x=0.0,
                 active_finger_y=0.0
             )
+
+        return HandPosition(
+            thumb_x=self._width - keypoints[THUMB_TIP][0],
+            thumb_y=keypoints[THUMB_TIP][1],
+            active_finger_x=self._width - keypoints[self._active_finger_tip][0],
+            active_finger_y=keypoints[self._active_finger_tip][1]
+        )
+
+    def detect_side_hand(self, frame: np.ndarray) -> HandPosition:
+        results = self.side_model(frame)
+        result = results[0]
+        if not result.keypoints or len(result.keypoints.xy) == 0:
+            return HandPosition(thumb_x=0.0, thumb_y=0.0, active_finger_x=0.0, active_finger_y=0.0)
+
+        keypoints = result.keypoints.xy[0]
+        if keypoints is None or len(keypoints) <= self._active_finger_tip:
+            return HandPosition(thumb_x=0.0, thumb_y=0.0, active_finger_x=0.0, active_finger_y=0.0)
 
         return HandPosition(
             thumb_x=self._width - keypoints[THUMB_TIP][0],
