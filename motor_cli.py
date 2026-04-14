@@ -32,7 +32,7 @@ def calculate_motor_movements(
         0 (top)
         / \
        /   \
-      1     2
+      2     1
     (left) (right)
 
     Args:
@@ -50,8 +50,8 @@ def calculate_motor_movements(
 
     motor_positions = [
         (0, 2 * h / 3),                    # Motor 0: top
-        (-motor_spacing / 2, -h / 3),      # Motor 1: left
-        (motor_spacing / 2, -h / 3)        # Motor 2: right
+        (motor_spacing / 2, -h / 3),       # Motor 1: bottom-right
+        (-motor_spacing / 2, -h / 3)       # Motor 2: bottom-left
     ]
 
     object_start = (0, 0)

@@ -1,7 +1,7 @@
 import typer
 import socket
 
-from backend import MotorMovement
+from motor_controller import MotorMovement
 
 def build_message(motors: list[MotorMovement]) -> str:
     message = "Z"

@@ -1,6 +1,6 @@
 import pygame
 import socket
-from consts import BACKEND_PORT, TOP_HEIGHT, PYGAME_PORT, TARGET_CYCLE_COUNT, FRONTEND_FPS, TOP_WIDTH
+from consts import BACKEND_PORT, TOP_HEIGHT, PYGAME_PORT, FRONTEND_FPS, TOP_WIDTH
 from structures import ExperimentControl, ExperimentPacket, ExperimentState, FingerPosition, QuestionInput, TrackingObject
 
 FIRST_COLOR = (255, 165, 0)  # Orange
@@ -20,7 +20,7 @@ class PygameFrontEnd:
         self._left_button_sent: bool = False
         self._right_button_timer = 0
         self._right_button_sent: bool = False
-        self._button_hold_time = 2 * FRONTEND_FPS  # 2 seconds worth of frames
+        self._button_hold_time = FRONTEND_FPS  # 1 second worth of frames (2x faster fill)
 
         # Initialize socket to receive backend information
         self._data_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -63,21 +63,30 @@ class PygameFrontEnd:
         bar_width = 200
         bar_height = 20
         bar_x = (self._width - bar_width) // 2
-        bar_y = self._height - 40
+        bar_y = 40
+        half_width = bar_width // 2
+        outbound_progress = max(0.0, min(tracking_obj.progress, 1.0))
+        return_progress = max(0.0, min(tracking_obj.returnProgress, 1.0))
         
         # Background bar
         pygame.draw.rect(self.screen, (64, 64, 64),
                         (bar_x, bar_y, bar_width, bar_height))
         
-        # Progress fill
-        fill_width = int(bar_width * tracking_obj.progress)
-        if fill_width > 0:
-            pygame.draw.rect(self.screen, (0, 255, 0),
-                            (bar_x, bar_y, fill_width, bar_height))
+        # First half: center -> side (light green)
+        first_fill_width = int(half_width * outbound_progress)
+        if first_fill_width > 0:
+            pygame.draw.rect(self.screen, (144, 238, 144),
+                            (bar_x, bar_y, first_fill_width, bar_height))
+
+        # Second half: side -> center (green)
+        second_fill_width = int(half_width * return_progress)
+        if second_fill_width > 0:
+            pygame.draw.rect(self.screen, (0, 200, 0),
+                            (bar_x + half_width, bar_y, second_fill_width, bar_height))
             
         # Draw movement counter
-        counter_text = self._font.render(f"{tracking_obj.cycleCount}/{TARGET_CYCLE_COUNT}", True, (255, 255, 255))
-        self.screen.blit(counter_text, (self._width - 50, self._height - 40))
+        counter_text = self._font.render(f"{tracking_obj.cycleCount}/{tracking_obj.targetCycleCount}", True, (255, 255, 255))
+        self.screen.blit(counter_text, (self._width - 50, 40))
 
     def _draw_question(self, landmarks: list[FingerPosition]) -> None:
         # Draw title
@@ -88,8 +97,8 @@ class PygameFrontEnd:
         # Draw buttons
         button_width = 100
         button_height = 100
-        left_button = pygame.Rect(50, self._height/2 - button_height/2, button_width, button_height)
-        right_button = pygame.Rect(self._width - 150, self._height/2 - button_height/2, button_width, button_height)
+        left_button = pygame.Rect(90, self._height/2 - button_height/2, button_width, button_height)
+        right_button = pygame.Rect(self._width - 190, self._height/2 - button_height/2, button_width, button_height)
         
         pygame.draw.rect(self.screen, FIRST_COLOR, left_button)
         pygame.draw.rect(self.screen, SECOND_COLOR, right_button)
@@ -134,13 +143,13 @@ class PygameFrontEnd:
         # Draw progress bars for button holds
         if self._left_button_timer > 0:
             progress = self._left_button_timer / self._button_hold_time
-            pygame.draw.rect(self.screen, (64, 64, 64), (50, self._height/2 + 60, button_width, 10))
-            pygame.draw.rect(self.screen, (0, 255, 0), (50, self._height/2 + 60, button_width * progress, 10))
+            pygame.draw.rect(self.screen, (64, 64, 64), (left_button.x, left_button.bottom + 10, button_width, 10))
+            pygame.draw.rect(self.screen, (0, 255, 0), (left_button.x, left_button.bottom + 10, button_width * progress, 10))
 
         if self._right_button_timer > 0:
             progress = self._right_button_timer / self._button_hold_time
-            pygame.draw.rect(self.screen, (64, 64, 64), (self._width - 150, self._height/2 + 60, button_width, 10))
-            pygame.draw.rect(self.screen, (0, 255, 0), (self._width - 150, self._height/2 + 60, button_width * progress, 10))
+            pygame.draw.rect(self.screen, (64, 64, 64), (right_button.x, right_button.bottom + 10, button_width, 10))
+            pygame.draw.rect(self.screen, (0, 255, 0), (right_button.x, right_button.bottom + 10, button_width * progress, 10))
 
     def _draw_pause(self, pause_time: int):
         # Draw pause screen title
@@ -174,7 +183,7 @@ class PygameFrontEnd:
         
         # Draw all fingers as circles
         for finger_position in packet.landmarks:
-            pygame.draw.circle(self.screen, (255, 0, 0),
+            pygame.draw.circle(self.screen, (211, 211, 211),
                             (int(finger_position.x * self._width), int(finger_position.z * self._height)), 5)
         
         match packet.stateData.state:
