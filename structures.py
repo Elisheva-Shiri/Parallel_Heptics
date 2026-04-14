@@ -24,7 +24,9 @@ class TrackingObject(Position):
     isPinched: bool
     # TODO - move progress/cycleCount to another object
     progress: float
+    returnProgress: float
     cycleCount: int
+    targetCycleCount: int
     pairIndex: int
 
 class StateData(BaseModel):

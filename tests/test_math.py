@@ -14,7 +14,7 @@ def calculate_motor_movements(direction: str, distance: float = 10.0, motor_spac
           0 (top)
          / \
         /   \
-       1     2
+       2     1
     (left) (right)
     
     Args:
@@ -30,15 +30,15 @@ def calculate_motor_movements(direction: str, distance: float = 10.0, motor_spac
     # Define motor positions in a coordinate system (equilateral triangle)
     # Center at origin (0, 0)
     # Motor 0 (top) at (0, h) where h = motor_spacing * sqrt(3) / 3
-    # Motor 1 (left) at (-motor_spacing/2, -h/2)
-    # Motor 2 (right) at (motor_spacing/2, -h/2)
+    # Motor 1 (bottom-right) at (motor_spacing/2, -h/2)
+    # Motor 2 (bottom-left) at (-motor_spacing/2, -h/2)
     
     h = motor_spacing * math.sqrt(3) / 3  # Height from center to vertex
     
     motor_positions = [
         (0, 2 * h / 3),                    # Motor 0: top
-        (-motor_spacing / 2, -h / 3),      # Motor 1: left
-        (motor_spacing / 2, -h / 3)        # Motor 2: right
+        (motor_spacing / 2, -h / 3),       # Motor 1: bottom-right
+        (-motor_spacing / 2, -h / 3)       # Motor 2: bottom-left
     ]
     
     # Object starts at center (0, 0)

@@ -12,17 +12,20 @@ import numpy as np
 import socket
 from pydantic import BaseModel
 from structures import ExperimentControl, ExperimentState, FingerPosition, StateData, TrackingObject, ExperimentPacket
-from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, PairFinger
+from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, PairFinger, CENTER_THRESHOLD, EDGE_THRESHOLD
 import queue
 from queue import Queue
-from enum import Enum, StrEnum
+from enum import StrEnum
 from vision import ColorVision, HandPosition, MediapipeVision, YoloVision, FINGER_COLORS
+from motor_controller import FingerId, HandOrientation, MovementStrategy, MotorController
+from haptic_mapping import map_object_displacement_to_tactor
 
 DEBUG_POSITION = 1000
 DEBUG_SINGLE_MOTOR = False
 DEBUG_FLIP_Y = False
 DEBUG_SIDE_CAMERA_OFF = True
 DEBUG_ALLOW_PRINTS = False
+DEBUG_LOG_MOTOR_RANGE = True  # Log min/max motor positions on shutdown (no per-message overhead)
 
 original_print = print
 def print(*args, **kwargs):
@@ -36,29 +39,16 @@ class VisionType(StrEnum):
     OPTICAL_COLOR_NO_GPU = "optical_color_no_gpu"
     OPTICAL_COLOR_GPU = "optical_color_gpu"
 
-class FingerId(Enum):
-    INDEX = 0
-    OTHER = 1
-
 class MotorType(StrEnum):
     HARDWARE = "hardware"
     NONE = "none"
 
-class MovementStrategy(StrEnum):
-    CARDINAL = "cardinal"
-    CARDINAL_DIAGONAL = "cardinal_diagonal"
-    FREE_FORM = "free_form"
-
-class MotorMovement(BaseModel):
-    pos: int
-    index: int
-
-MOVE_FACTOR = 1
+MOVE_FACTOR = 3
 MOTOR_TYPE = MotorType.HARDWARE
-MOVEMENT_STRATEGY = MovementStrategy.CARDINAL_DIAGONAL
+MOVEMENT_STRATEGY = MovementStrategy.FREE_FORM
+MOTOR_OPPOSES_OBJECT_MOTION = True
 VISION_TYPE = VisionType.MEDIAPIPE
 RECORDING_DATA = True
-
 
 
 # Create experiment folder if it doesn't exist
@@ -116,6 +106,7 @@ class VirtualObject(BaseModel):
     is_pinched: bool = False
 
     progress: float = 0.0   # Tracks the movement progress (0.0 to 1.0)
+    return_progress: float = 0.0  # Tracks edge-to-center visual progress (0.0 to 1.0)
     cycle_counter: int = 0  # Counts full movement cycles
 
     stiffness_value: int = 0 # Object stiffness value as read from the configuration
@@ -133,6 +124,7 @@ class VirtualObject(BaseModel):
 
         # reset progress/Cycle Counter
         self.progress = 0.0
+        self.return_progress = 0.0
         self.cycle_counter = 0
 
         # Reset the stiffness value/pair index since the previous value is no longer 
@@ -144,6 +136,8 @@ class Experiment:
         config: Configuration,
         path: Path,
         pair_finger: PairFinger,
+        hand_orientation: HandOrientation = HandOrientation.NOT_MIRRORED,
+        target_cycle_count: int = TARGET_CYCLE_COUNT,
         top_width: int = TOP_WIDTH,
         top_height: int = TOP_HEIGHT,
         side_width: int = SIDE_WIDTH,
@@ -178,19 +172,32 @@ class Experiment:
         self._pause_time = 0
         self._pair_counter = 0  # Counter for pair folders
         self._pair_finger: PairFinger = pair_finger
+        self._target_cycle_count = target_cycle_count
+        self._hand_orientation = hand_orientation
 
         # Frame queues for recording
         self._top_frame_queue = Queue(maxsize=30)
         self._side_frame_queue = Queue(maxsize=30)
         
         # Movement tracking thresholds
-        self.CENTER_THRESHOLD = 20  # Pixels from center to start movement
-        self.EDGE_THRESHOLD = 30  # Pixels from edge to count as reached edge
+        self.CENTER_THRESHOLD = CENTER_THRESHOLD  # Pixels from center to start movement
+        self.EDGE_THRESHOLD = EDGE_THRESHOLD  # Pixels from edge to count as reached edge
         self.last_x = self._top_width/2  # Track last x position
         self.last_y = self._top_height/2  # Track last y position
         self.reached_edge = False  # Track if reached edge
         self.in_center = True  # Track if in center
+        self._require_unpinch = False  # Require release before next cycle
         
+        # Motor Controller
+        self._motor_controller = MotorController(
+            movement_strategy=MOVEMENT_STRATEGY,
+            top_width=self._top_width,
+            top_height=self._top_height,
+            edge_threshold=self.EDGE_THRESHOLD,
+            move_factor=MOVE_FACTOR,
+            hand_orientation=self._hand_orientation,
+        )
+
         # UDP server config
         self._server_address = server_address
         self._frontend_port = frontend_port
@@ -215,7 +222,7 @@ class Experiment:
         self._running = True
 
         # Camera indices
-        self.TOP_CAMERA = 1
+        self.TOP_CAMERA = 0
         self.SIDE_CAMERA = 2
         
         # Video writers
@@ -374,7 +381,11 @@ class Experiment:
         )
         
         # Update object pinch state
-        if self._is_pinching and distance_to_object < self._virtual_object.size * 0.5:
+        if self._require_unpinch:
+            self._virtual_object.is_pinched = False
+            if not self._is_pinching:
+                self._require_unpinch = False
+        elif self._is_pinching and distance_to_object < self._virtual_object.size * 0.5:
             self._virtual_object.is_pinched = True
         elif not self._is_pinching:
             self._virtual_object.is_pinched = False
@@ -389,16 +400,18 @@ class Experiment:
             self._virtual_object.x = self._virtual_object.original_x
             self._virtual_object.y = self._virtual_object.original_y
             self._virtual_object.progress = 0.0
+            self._virtual_object.return_progress = 0.0
 
         # Update stiffness and index
         self._virtual_object.stiffness_value = stiffness_value
         self._virtual_object.pair_index = pair_index
 
     def _check_comparison_end(self) -> bool:
-        return self._virtual_object.cycle_counter == TARGET_CYCLE_COUNT
+        return self._virtual_object.cycle_counter == self._target_cycle_count
 
     def _reset_comparison(self):
         self._is_pinching = False
+        self._require_unpinch = False
         self._virtual_object.reset()
 
     def _get_finger_name(self, is_index: bool) -> Literal["index"] | PairFinger:
@@ -497,260 +510,18 @@ class Experiment:
                         (datetime.now() - question_timestamp).total_seconds(),
                         answer.questionInput])
 
-    def _build_message(self, motors: list[MotorMovement]) -> str:
-        message = "Z"
-        for motor in motors:
-            message += f"M{motor.index}P{motor.pos}"
-        message += "F"
-        return message
-        
-    def _get_base_index(self, finger_idx: Literal[0, 1]) -> Literal[0, 3]:
-        """ Get's the base motor index for the given finger """
-        return finger_idx * 3
-
-    def _determine_movement_direction(self, obj_x: float, obj_y: float) -> tuple[str, float]:
-        """Determine movement direction and distance from displacement.
-
-        Uses a 50% ratio threshold to detect diagonal movement when
-        MOVEMENT_STRATEGY is CARDINAL_DIAGONAL.
-
-        Returns:
-            tuple of (direction: str, distance: float)
-        """
-        DIAGONAL_THRESHOLD = 0.5
-
-        if obj_x == 0 and obj_y == 0:
-            return ("none", 0)
-
-        abs_x, abs_y = abs(obj_x), abs(obj_y)
-
-        # Check if movement is diagonal (only when strategy allows)
-        if MOVEMENT_STRATEGY == MovementStrategy.CARDINAL_DIAGONAL:
-            if abs_x > 0 and abs_y > 0:
-                ratio = min(abs_x, abs_y) / max(abs_x, abs_y)
-                if ratio >= DIAGONAL_THRESHOLD:
-                    distance = math.sqrt(obj_x**2 + obj_y**2)
-                    if obj_x < 0:
-                        direction = "up-left" if obj_y < 0 else "down-left"
-                    else:
-                        direction = "up-right" if obj_y < 0 else "down-right"
-                    return (direction, distance)
-
-        # Cardinal movement (always used for CARDINAL strategy, or when diagonal threshold not met)
-        if abs_x > abs_y:
-            return ("left" if obj_x < 0 else "right", abs_x)
-        else:
-            return ("up" if obj_y < 0 else "down", abs_y)
-
-    def _calculate_cardinal_motor_movements(self, finger_id: FingerId, direction: str, distance: float, motor_spacing: float = 1000.0) -> list[MotorMovement]:
-        """
-        Calculate motor movements for cardinal directions only (up, down, left, right).
-
-        Motor layout (top view, coordinate system):
-            0 (top)
-            / \
-            /   \
-        1     2
-        (left) (right)
-
-        Args:
-            finger_id: finger identifier
-            direction: Movement direction ("up", "down", "left", "right")
-            distance: Distance to move the object (in same units as motor_spacing)
-            motor_spacing: Distance between motors (for calculating geometry)
-
-        Returns:
-            List of MotorMovement objects for each motor
-        """
-        direction = direction.lower()
-        base_motor_idx = self._get_base_index(finger_id.value)
-        
-        # Define motor positions in a coordinate system (equilateral triangle)
-        # Center at origin (0, 0)
-        # Motor 0 (top) at (0, h) where h = motor_spacing * sqrt(3) / 3
-        # Motor 1 (left) at (-motor_spacing/2, -h/2)
-        # Motor 2 (right) at (motor_spacing/2, -h/2)
-        
-        h = motor_spacing * math.sqrt(3) / 3  # Height from center to vertex
-        
-        motor_positions = [
-            (0, 2 * h / 3),                    # Motor 0: top
-            (-motor_spacing / 2, -h / 3),      # Motor 1: left
-            (motor_spacing / 2, -h / 3)        # Motor 2: right
-        ]
-        
-        # Object starts at center (0, 0)
-        object_start = (0, 0)
-        
-        # Calculate object's new position based on direction
-        direction_vectors = {
-            "up": (0, distance),
-            "down": (0, -distance),
-            "left": (-distance, 0),
-            "right": (distance, 0)
-        }
-        
-        if direction not in direction_vectors:
-            raise ValueError(f"Invalid direction: {direction}. Must be one of: up, down, left, right")
-        
-        dx, dy = direction_vectors[direction]
-        object_end = (object_start[0] + dx, object_start[1] + dy)
-        
-        # Calculate string length changes for each motor
-        movements = []
-        for i, (mx, my) in enumerate(motor_positions):
-            # Initial string length (distance from motor to start position)
-            initial_length = math.sqrt((mx - object_start[0])**2 + (my - object_start[1])**2)
-            
-            # Final string length (distance from motor to end position)
-            final_length = math.sqrt((mx - object_end[0])**2 + (my - object_end[1])**2)
-            
-            # Change in string length
-            # Positive = extend string (let out more), Negative = retract string (pull in)
-            delta_length = final_length - initial_length
-            
-            movements.append(MotorMovement(pos=int(delta_length), index=i+base_motor_idx))
-
-        return movements
-
-    def _calculate_diagonal_motor_movements(self, finger_id: FingerId, direction: str, distance: float, motor_spacing: float = 1000.0) -> list[MotorMovement]:
-        """
-        Calculate motor movements for all directions including diagonals.
-
-        Motor layout (top view, coordinate system):
-            0 (top)
-            / \
-            /   \
-        1     2
-        (left) (right)
-
-        Args:
-            finger_id: finger identifier
-            direction: Movement direction (cardinal or diagonal)
-            distance: Distance to move the object (in same units as motor_spacing)
-            motor_spacing: Distance between motors (for calculating geometry)
-
-        Returns:
-            List of MotorMovement objects for each motor
-        """
-        direction = direction.lower()
-        base_motor_idx = self._get_base_index(finger_id.value)
-
-        h = motor_spacing * math.sqrt(3) / 3
-        motor_positions = [
-            (0, 2 * h / 3),
-            (-motor_spacing / 2, -h / 3),
-            (motor_spacing / 2, -h / 3)
-        ]
-
-        object_start = (0, 0)
-
-        # Extended direction vectors with diagonals (normalized)
-        direction_vectors = {
-            "up": (0, distance),
-            "down": (0, -distance),
-            "left": (-distance, 0),
-            "right": (distance, 0),
-            "up-left": (-distance / math.sqrt(2), distance / math.sqrt(2)),
-            "up-right": (distance / math.sqrt(2), distance / math.sqrt(2)),
-            "down-left": (-distance / math.sqrt(2), -distance / math.sqrt(2)),
-            "down-right": (distance / math.sqrt(2), -distance / math.sqrt(2)),
-        }
-
-        if direction not in direction_vectors:
-            raise ValueError(f"Invalid direction: {direction}. Must be one of: {', '.join(direction_vectors.keys())}")
-
-        dx, dy = direction_vectors[direction]
-        object_end = (object_start[0] + dx, object_start[1] + dy)
-
-        movements = []
-        for i, (mx, my) in enumerate(motor_positions):
-            initial_length = math.sqrt((mx - object_start[0])**2 + (my - object_start[1])**2)
-            final_length = math.sqrt((mx - object_end[0])**2 + (my - object_end[1])**2)
-            delta_length = final_length - initial_length
-            movements.append(MotorMovement(pos=int(delta_length), index=i + base_motor_idx))
-
-        return movements
-
-    def _calculate_motor_movements(self, finger_id: FingerId, direction: str, distance: float, motor_spacing: float = 1000.0) -> list[MotorMovement]:
-        """
-        Wrapper that selects the appropriate motor movement calculation strategy
-        based on MOVEMENT_STRATEGY.
-
-        Args:
-            finger_id: finger identifier
-            direction: Movement direction (cardinal, or diagonal if strategy allows)
-            distance: Distance to move the object (in same units as motor_spacing)
-            motor_spacing: Distance between motors (for calculating geometry)
-
-        Returns:
-            List of MotorMovement objects for each motor
-        """
-        match MOVEMENT_STRATEGY:
-            case MovementStrategy.CARDINAL:
-                return self._calculate_cardinal_motor_movements(finger_id, direction, distance, motor_spacing)
-            case MovementStrategy.CARDINAL_DIAGONAL:
-                return self._calculate_diagonal_motor_movements(finger_id, direction, distance, motor_spacing)
-            case _:
-                raise NotImplementedError(f"Unknown movement strategy: {MOVEMENT_STRATEGY}")
-
-    def _calculate_freeform_motor_movements(
-        self,
-        finger_id: FingerId,
-        obj_x: float,
-        obj_y: float,
-        motor_spacing: float = 1000.0
-    ) -> list[MotorMovement]:
-        """
-        Calculate motor movements for free-form movement in any direction.
-
-        Args:
-            finger_id: finger identifier
-            obj_x: X displacement from center
-            obj_y: Y displacement from center
-            motor_spacing: Distance between motors
-
-        Returns:
-            List of MotorMovement objects for each motor
-        """
-        base_motor_idx = self._get_base_index(finger_id.value)
-
-        # Clamp to screen-based max radius
-        max_radius = min(self._top_width / 2, self._top_height / 2) - self.EDGE_THRESHOLD
-        distance = math.sqrt(obj_x**2 + obj_y**2)
-        if distance > max_radius:
-            scale = max_radius / distance
-            obj_x *= scale
-            obj_y *= scale
-
-        # Motor geometry (same as other methods)
-        h = motor_spacing * math.sqrt(3) / 3
-        motor_positions = [
-            (0, 2 * h / 3),
-            (-motor_spacing / 2, -h / 3),
-            (motor_spacing / 2, -h / 3)
-        ]
-
-        object_start = (0, 0)
-        object_end = (obj_x, obj_y)
-
-        movements = []
-        for i, (mx, my) in enumerate(motor_positions):
-            initial_length = math.sqrt((mx - object_start[0])**2 + (my - object_start[1])**2)
-            final_length = math.sqrt((mx - object_end[0])**2 + (my - object_end[1])**2)
-            delta_length = final_length - initial_length
-            movements.append(MotorMovement(pos=int(delta_length), index=i + base_motor_idx))
-
-        return movements
-
     def _hardware_control_loop(self):
-        """Thread that controls hardware via UDP based on hand movement"""
-        is_comparison = True
+        """Thread that controls Hardware via UDP based on hand movement"""
+        should_reset = True
+        og_obj_x = 0
+        og_obj_y = 0
+
+        # Position range tracking (zero per-message overhead, summary on shutdown)
+        motor_range_min: dict[int, int] = {}
+        motor_range_max: dict[int, int] = {}
 
         while self._running:
             if self._virtual_object.is_pinched:
-                og_obj_x = 0
-                og_obj_y = 0
                 # original x/y != (0,0) since they are half of screen size
                 obj_x = self._virtual_object.x - self._virtual_object.original_x
                 obj_y = self._virtual_object.y - self._virtual_object.original_y
@@ -759,51 +530,53 @@ class Experiment:
 
                 og_obj_x = obj_x
                 og_obj_y = obj_y
+                tactor_x, tactor_y = map_object_displacement_to_tactor(
+                    obj_x=obj_x,
+                    obj_y=obj_y,
+                    oppose_motion=MOTOR_OPPOSES_OBJECT_MOTION,
+                )
 
                 finger_id = FingerId.INDEX if self._active_finger == "index" else FingerId.OTHER
-                # TODO - Use stiffness calculate motor movement
-                stiffness_value = self._virtual_object.stiffness_value
 
-                motors = []
-
-                if self._state != ExperimentState.COMPARISON:
-                    if is_comparison:
-                        is_comparison = False
-                        motors.extend([
-                            MotorMovement(pos=0, index=self._get_base_index(finger_id.value)),
-                            MotorMovement(pos=0, index=self._get_base_index(finger_id.value)+1),
-                            MotorMovement(pos=0, index=self._get_base_index(finger_id.value)+2),
-                        ])
-                else:
-                    # In comparison state - calculate motor movements based on direction
-                    is_comparison = True
-                    if MOVEMENT_STRATEGY == MovementStrategy.FREE_FORM:
-                        motors.extend(self._calculate_freeform_motor_movements(
-                            finger_id=finger_id,
-                            obj_x=obj_x,
-                            obj_y=obj_y
-                        ))
-                    else:
-                        direction, distance = self._determine_movement_direction(obj_x, obj_y)
-                        if direction != "none":
-                            print(f"Moving {direction} by {distance}")
-                            motors.extend(self._calculate_motor_movements(
-                                finger_id=finger_id,
-                                direction=direction,
-                                distance=distance
-                            ))
+                motors_enabled = self._state == ExperimentState.COMPARISON
+                motors = self._motor_controller.calculate_motor_movements(
+                    finger_id=finger_id,
+                    obj_x=tactor_x,
+                    obj_y=tactor_y,
+                    motors_enabled=motors_enabled,
+                    reset_to_origin=should_reset and not motors_enabled,
+                )
+                should_reset = motors_enabled
 
                 if motors:
-                    for motor in motors:
-                        motor.pos = int(motor.pos * MOVE_FACTOR)
-
                     # Build message
                     if DEBUG_SINGLE_MOTOR:
                         motors = [motors[0]]
-                    message = self._build_message(motors)
+
+                    # Track position ranges (dict lookup only, zero logging overhead)
+                    if DEBUG_LOG_MOTOR_RANGE:
+                        for m in motors:
+                            if m.index not in motor_range_min:
+                                motor_range_min[m.index] = m.pos
+                                motor_range_max[m.index] = m.pos
+                            else:
+                                if m.pos < motor_range_min[m.index]:
+                                    motor_range_min[m.index] = m.pos
+                                if m.pos > motor_range_max[m.index]:
+                                    motor_range_max[m.index] = m.pos
+
+                    message = self._motor_controller.build_message(motors)
 
                     self._hardware_socket.sendto(message.encode("utf-8"), (self._server_address, self._hardware_port))
             self._sleep_motors()
+
+        # Print position range summary on shutdown
+        # Uses original_print intentionally to bypass DEBUG_ALLOW_PRINTS
+        if DEBUG_LOG_MOTOR_RANGE and motor_range_min:
+            original_print("=== Motor Position Range Summary ===")
+            for idx in sorted(motor_range_min.keys()):
+                original_print(f"  Motor {idx}: min={motor_range_min[idx]}, max={motor_range_max[idx]}")
+            original_print("====================================")
 
     def _frontend_network_loop(self):
         """Thread that sends hand position data over UDP"""
@@ -825,7 +598,9 @@ class Experiment:
                         size=self._virtual_object.size,
                         isPinched=self._virtual_object.is_pinched,
                         progress=self._virtual_object.progress,
+                        returnProgress=self._virtual_object.return_progress,
                         cycleCount=self._virtual_object.cycle_counter,
+                        targetCycleCount=self._target_cycle_count,
                         pairIndex=self._virtual_object.pair_index
                     )
                 )
@@ -859,6 +634,7 @@ class Experiment:
         # ! Proposed Solution: Track movement back (half bar-half bar), only successful on reaching center by movement (same as solution above)
         if not self._virtual_object.is_pinched:
             self._virtual_object.progress = 0.0
+            self._virtual_object.return_progress = 0.0
             self.reached_edge = False
             self.in_center = True
             return
@@ -876,7 +652,10 @@ class Experiment:
                 # Completed full movement
                 self._virtual_object.cycle_counter += 1
                 self._virtual_object.progress = 0.0
+                self._virtual_object.return_progress = 0.0
                 self.reached_edge = False
+                self._virtual_object.is_pinched = False
+                self._require_unpinch = True
             self.in_center = True
         else:
             self.in_center = False
@@ -889,6 +668,7 @@ class Experiment:
         # Update progress
         if not self.reached_edge:
             self._virtual_object.progress = min(distance_from_center / max_distance, 1.0)
+            self._virtual_object.return_progress = 0.0
             
             # If moving back to center before reaching edge, progress drops
             last_distance = math.sqrt(
@@ -897,6 +677,15 @@ class Experiment:
             )
             if distance_from_center < last_distance:
                 self._virtual_object.progress = max(0.0, self._virtual_object.progress - 0.1)
+        else:
+            return_distance = max_distance - self.CENTER_THRESHOLD
+            if return_distance <= 0:
+                self._virtual_object.return_progress = 1.0 if distance_from_center < self.CENTER_THRESHOLD else 0.0
+            else:
+                self._virtual_object.return_progress = min(
+                    max((max_distance - distance_from_center) / return_distance, 0.0),
+                    1.0
+                )
                 
         self.last_x = self._virtual_object.x
         self.last_y = self._virtual_object.y
@@ -1090,11 +879,35 @@ class Experiment:
                 ...  # No cleanup needed
             case _: raise NotImplementedError("Unknown motor type")  # Should never happen
 
-def start_experiment(config: Configuration, path: Path, pair_finger: PairFinger):
+def start_experiment(
+    config: Configuration,
+    path: Path,
+    pair_finger: PairFinger,
+    hand_orientation: HandOrientation,
+    target_cycle_count: int,
+):
     """Initialize and start the hand tracking system"""
-    experiment = Experiment(config, path, pair_finger)
+    experiment = Experiment(
+        config,
+        path,
+        pair_finger,
+        hand_orientation=hand_orientation,
+        target_cycle_count=target_cycle_count
+    )
     
     return experiment
+
+def get_target_cycle_count() -> int:
+    while True:
+        user_input = input(f"How many cycles to apply? [{TARGET_CYCLE_COUNT}]: ").strip()
+        if user_input == "":
+            return TARGET_CYCLE_COUNT
+
+        if user_input.isdigit() and int(user_input) > 0:
+            return int(user_input)
+
+        original_print("Invalid input. Please enter a positive whole number.")
+
 
 def get_pair_finger() -> PairFinger:
     # Get user input for M or R
@@ -1102,8 +915,19 @@ def get_pair_finger() -> PairFinger:
         user_input = input("Please enter M or R: ").upper()
         if user_input in ['M', 'R']:
             break
-        print("Invalid input. Please enter either M or R.")
+        original_print("Invalid input. Please enter either M or R.")
     return "middle" if user_input == "M" else "ring"
+
+
+def get_hand_orientation() -> HandOrientation:
+    """Get user input for mirrored hand orientation (default: not mirrored)."""
+    while True:
+        user_input = input("Mirror hand orientation? [y/N]: ").strip().lower()
+        if user_input in ("", "n", "no"):
+            return HandOrientation.NOT_MIRRORED
+        if user_input in ("y", "yes"):
+            return HandOrientation.MIRRORED
+        original_print("Invalid input. Please enter Y or N.")
 
 def create_experiment_folder(config: Configuration, pair_finger: PairFinger):
     # Check if experiment folder exists, create if not
@@ -1134,10 +958,12 @@ def create_experiment_folder(config: Configuration, pair_finger: PairFinger):
 
 def main():
     config = Configuration.read_configuration('configuration.csv')
+    target_cycle_count = get_target_cycle_count()
     pair_finger = get_pair_finger()
+    hand_orientation = get_hand_orientation()
     path = create_experiment_folder(config, pair_finger)
     
-    experiment = start_experiment(config, path, pair_finger)
+    experiment = start_experiment(config, path, pair_finger, hand_orientation, target_cycle_count)
     try:
         while True:
             sleep(0.1)
