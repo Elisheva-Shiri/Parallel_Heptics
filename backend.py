@@ -12,7 +12,7 @@ import numpy as np
 import socket
 from pydantic import BaseModel
 from structures import ExperimentControl, ExperimentState, FingerPosition, StateData, TrackingObject, ExperimentPacket
-from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, FINGER_NAMES, FingerName, CENTER_THRESHOLD, EDGE_THRESHOLD, TAPPING_HEIGHT_RATIO
+from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, FINGER_NAMES, FingerName, CENTER_THRESHOLD, EDGE_THRESHOLD, TAPPING_HEIGHT_RATIO, STIFFNESS_MAX
 import queue
 from queue import Queue
 from enum import StrEnum
@@ -302,8 +302,7 @@ class Experiment:
         # * Initialization only until experiment loop begins
         # * Must run after self._vision is initialized
         if self._run_mode == "single_finger":
-            self._active_finger = self._pair_finger
-            self._vision.set_active_finger(self._active_finger)
+            self._update_active_finger(self._pair_finger)
         else:
             self._update_active_finger(1)  # default to index
 
@@ -441,11 +440,8 @@ class Experiment:
     def _run_pair_object(self, stiffness_value: int, pair_index: int, finger_id: int):
         """Run one object within a pair (shared by both modes)."""
         self._reset_comparison()
-        if self._run_mode == "single_finger":
-            self._active_finger = self._pair_finger
-            self._vision.set_active_finger(self._active_finger)
-        else:
-            self._update_active_finger(finger_id)
+        self._update_active_finger(self._pair_finger if self._run_mode == "single_finger" else finger_id)
+
         while self._running and not self._check_comparison_end():
             self._update_virtual_object(stiffness_value, pair_index)
             self._sleep_virtual_object()
@@ -532,6 +528,13 @@ class Experiment:
 
         while self._running:
             if self._virtual_object.is_pinched:
+                # Collect stiffness value using protection from values greater than STIFFNESS_MAX
+                stiffness_value = self._virtual_object.stiffness_value
+                if stiffness_value > STIFFNESS_MAX:
+                    print(f"Stiffness value {stiffness_value} is greater than STIFFNESS_MAX {STIFFNESS_MAX}, setting to {STIFFNESS_MAX}")
+                    stiffness_value = STIFFNESS_MAX
+                stiffness_value_normalized = stiffness_value / STIFFNESS_MAX
+                
                 # original x/y != (0,0) since they are half of screen size
                 obj_x = self._virtual_object.x - self._virtual_object.original_x
                 obj_y = self._virtual_object.y - self._virtual_object.original_y
@@ -557,6 +560,7 @@ class Experiment:
                 motors_enabled = self._state == ExperimentState.COMPARISON
                 motors = self._motor_controller.calculate_motor_movements(
                     finger_id=finger_id,
+                    stiffness_value=stiffness_value_normalized,
                     obj_x=tactor_x,
                     obj_y=tactor_y,
                     motors_enabled=motors_enabled,
