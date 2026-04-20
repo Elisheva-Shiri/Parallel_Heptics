@@ -102,6 +102,7 @@ class MotorController:
     def calculate_motor_movements(
         self,
         finger_id: FingerId,
+        stiffness_value: float,
         obj_x: float,
         obj_y: float,
         motors_enabled: bool,
@@ -126,6 +127,7 @@ class MotorController:
             return self._zero_motor_positions(finger_id)
 
         obj_x, obj_y = self._apply_hand_orientation(obj_x, obj_y)
+        obj_x, obj_y = self._apply_stiffness_value(obj_x, obj_y, stiffness_value)
 
         match self._movement_strategy:
             case MovementStrategy.FREE_FORM:
@@ -161,6 +163,10 @@ class MotorController:
         if self._hand_orientation == HandOrientation.MIRRORED:
             return (-obj_x, obj_y)
         return (obj_x, obj_y)
+
+    def _apply_stiffness_value(self, obj_x: float, obj_y: float, stiffness_value: float) -> tuple[float, float]:
+        """Apply stiffness value to object displacement."""
+        return (obj_x * stiffness_value, obj_y * stiffness_value)
 
     def _determine_movement_direction(self, obj_x: float, obj_y: float) -> tuple[str, float]:
         """Determine movement direction and distance from displacement.
