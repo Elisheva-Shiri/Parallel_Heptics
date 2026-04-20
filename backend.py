@@ -302,7 +302,7 @@ class Experiment:
         # * Initialization only until experiment loop begins
         # * Must run after self._vision is initialized
         if self._run_mode == "single_finger":
-            self._update_active_finger(self._pair_finger)
+            self._update_active_finger(self._get_finger_id(self._pair_finger))
         else:
             self._update_active_finger(1)  # default to index
 
@@ -432,6 +432,12 @@ class Experiment:
             raise ValueError(f"Invalid finger_id: {finger_id}. Must be 0-4.")
         return FINGER_NAMES[finger_id]  # type: ignore
 
+    def _get_finger_id(self, finger_name: FingerName) -> int:
+        for fid, fname in FINGER_NAMES.items():
+            if fname == finger_name:
+                return fid
+        raise ValueError(f"Invalid finger_name: {finger_name}.")
+
     def _update_active_finger(self, finger_id: int):
         self._active_finger = self._get_finger_name(finger_id)
         self._vision.set_active_finger(self._active_finger)
@@ -440,7 +446,7 @@ class Experiment:
     def _run_pair_object(self, stiffness_value: int, pair_index: int, finger_id: int):
         """Run one object within a pair (shared by both modes)."""
         self._reset_comparison()
-        self._update_active_finger(self._pair_finger if self._run_mode == "single_finger" else finger_id)
+        self._update_active_finger(self._get_finger_id(self._pair_finger) if self._run_mode == "single_finger" else finger_id)
 
         while self._running and not self._check_comparison_end():
             self._update_virtual_object(stiffness_value, pair_index)
