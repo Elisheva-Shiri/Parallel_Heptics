@@ -1,8 +1,10 @@
 using System.Collections.Generic;
+using Unity.XR.CoreUtils;
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
 #if ENABLE_INPUT_SYSTEM
 using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.XR;
 #endif
 
 namespace ParallelHeptics.FrontendUnity
@@ -83,8 +85,19 @@ namespace ParallelHeptics.FrontendUnity
         private ARSession _arSession;
         private ARCameraManager _arCameraManager;
         private GameObject _arSessionObject;
+        private GameObject _xrOriginObject;
+        private GameObject _cameraOffsetObject;
+        private XROrigin _xrOrigin;
+#if ENABLE_INPUT_SYSTEM
+        private TrackedPoseDriver _trackedPoseDriver;
+        private InputAction _hmdPositionAction;
+        private InputAction _hmdRotationAction;
+        private InputAction _hmdTrackingStateAction;
+#endif
         private Color _cameraBackgroundColor;
         private CameraClearFlags _cameraClearFlags;
+        private bool _ownsArSession;
+        private bool _ownsXrOrigin;
         private ExperimentState _lastState = (ExperimentState)999;
         private float _lastPacketTime = -1000f;
         private long _lastMalformedLogFrame = -9999;
@@ -128,6 +141,7 @@ namespace ParallelHeptics.FrontendUnity
 
             _holdSelector = new HoldButtonSelector(holdSeconds);
             LoadCalibrationIfAvailable();
+            EnsureXrCameraRig();
             BuildSceneGraph();
             ConfigurePassthroughSupport();
             ApplyCalibrationVisibility();
@@ -140,11 +154,33 @@ namespace ParallelHeptics.FrontendUnity
             {
                 DestroyRuntimeObject(_panelRoot.gameObject);
             }
-            if (_arSessionObject != null)
+            if (_ownsArSession && _arSessionObject != null)
             {
                 DestroyRuntimeObject(_arSessionObject);
             }
+            if (_ownsXrOrigin && _xrOriginObject != null)
+            {
+                DestroyRuntimeObject(_xrOriginObject);
+            }
+#if ENABLE_INPUT_SYSTEM
+            DisposeAction(ref _hmdPositionAction);
+            DisposeAction(ref _hmdRotationAction);
+            DisposeAction(ref _hmdTrackingStateAction);
+#endif
         }
+
+#if ENABLE_INPUT_SYSTEM
+        private static void DisposeAction(ref InputAction action)
+        {
+            if (action == null)
+            {
+                return;
+            }
+            action.Disable();
+            action.Dispose();
+            action = null;
+        }
+#endif
 
         private void Update()
         {
@@ -399,6 +435,12 @@ namespace ParallelHeptics.FrontendUnity
             go.transform.SetParent(parent, false);
             go.transform.localPosition = localPosition;
             go.transform.localRotation = Quaternion.identity;
+            // The panel is laid down as a horizontal tabletop (-90 deg X), which leaves
+            // the TextMesh's "up" axis pointing toward the viewer instead of away.
+            // No pure rotation can fix this without also reversing the reading direction
+            // (the chirality flips), so flip the local Y scale. Unity's default font
+            // material is Cull Off, so the negated winding still renders both sides.
+            go.transform.localScale = new Vector3(1f, -1f, 1f);
             TextMesh text = go.AddComponent<TextMesh>();
             text.anchor = anchor;
             text.alignment = TextAlignment.Center;
@@ -658,9 +700,116 @@ namespace ParallelHeptics.FrontendUnity
             Debug.Log($"Saved tabletop calibration: position={panelWorldPosition}, rotation={panelEulerAngles}, scale={panelUniformScale:0.###}");
         }
 
+        private void EnsureXrCameraRig()
+        {
+            Camera mainCamera = Camera.main;
+            if (mainCamera == null)
+            {
+                return;
+            }
+
+            _xrOrigin = FindFirstObjectInSceneOfType<XROrigin>();
+            if (_xrOrigin == null)
+            {
+                _xrOriginObject = new GameObject("XR Origin (Bootstrap)");
+                _xrOriginObject.transform.SetParent(null, false);
+                _xrOriginObject.transform.position = Vector3.zero;
+                _xrOriginObject.transform.rotation = Quaternion.identity;
+
+                _cameraOffsetObject = new GameObject("Camera Offset");
+                _cameraOffsetObject.transform.SetParent(_xrOriginObject.transform, false);
+
+                // Preserve the camera's authored standing height so the editor preview is
+                // still readable even when no headset pose is overriding the transform.
+                mainCamera.transform.SetParent(_cameraOffsetObject.transform, true);
+
+                _xrOrigin = _xrOriginObject.AddComponent<XROrigin>();
+                _xrOrigin.Camera = mainCamera;
+                _xrOrigin.CameraFloorOffsetObject = _cameraOffsetObject;
+                _xrOrigin.RequestedTrackingOriginMode = XROrigin.TrackingOriginMode.Floor;
+                _ownsXrOrigin = true;
+            }
+            else
+            {
+                _xrOriginObject = _xrOrigin.gameObject;
+                _cameraOffsetObject = _xrOrigin.CameraFloorOffsetObject != null
+                    ? _xrOrigin.CameraFloorOffsetObject
+                    : _xrOriginObject;
+                if (_xrOrigin.Camera == null)
+                {
+                    _xrOrigin.Camera = mainCamera;
+                }
+
+                if (mainCamera.transform.parent != _cameraOffsetObject.transform &&
+                    !mainCamera.transform.IsChildOf(_xrOriginObject.transform))
+                {
+                    mainCamera.transform.SetParent(_cameraOffsetObject.transform, true);
+                }
+            }
+
+            EnsureTrackedPoseDriver(mainCamera);
+        }
+
+        private void EnsureTrackedPoseDriver(Camera mainCamera)
+        {
+#if ENABLE_INPUT_SYSTEM
+            _trackedPoseDriver = mainCamera.GetComponent<TrackedPoseDriver>();
+            if (_trackedPoseDriver == null)
+            {
+                _trackedPoseDriver = mainCamera.gameObject.AddComponent<TrackedPoseDriver>();
+                _trackedPoseDriver.trackingType = TrackedPoseDriver.TrackingType.RotationAndPosition;
+                _trackedPoseDriver.updateType = TrackedPoseDriver.UpdateType.UpdateAndBeforeRender;
+                _trackedPoseDriver.ignoreTrackingState = false;
+            }
+
+            if (NeedsBindings(_trackedPoseDriver.positionInput))
+            {
+                _hmdPositionAction = new InputAction("HMD Center Eye Position", InputActionType.Value, expectedControlType: "Vector3");
+                _hmdPositionAction.AddBinding("<XRHMD>/centerEyePosition");
+                _hmdPositionAction.AddBinding("<XRHMD>/devicePosition");
+                _hmdPositionAction.Enable();
+                _trackedPoseDriver.positionInput = new InputActionProperty(_hmdPositionAction);
+            }
+
+            if (NeedsBindings(_trackedPoseDriver.rotationInput))
+            {
+                _hmdRotationAction = new InputAction("HMD Center Eye Rotation", InputActionType.Value, expectedControlType: "Quaternion");
+                _hmdRotationAction.AddBinding("<XRHMD>/centerEyeRotation");
+                _hmdRotationAction.AddBinding("<XRHMD>/deviceRotation");
+                _hmdRotationAction.Enable();
+                _trackedPoseDriver.rotationInput = new InputActionProperty(_hmdRotationAction);
+            }
+
+            if (NeedsBindings(_trackedPoseDriver.trackingStateInput))
+            {
+                _hmdTrackingStateAction = new InputAction("HMD Tracking State", InputActionType.Value, expectedControlType: "Integer");
+                _hmdTrackingStateAction.AddBinding("<XRHMD>/trackingState");
+                _hmdTrackingStateAction.Enable();
+                _trackedPoseDriver.trackingStateInput = new InputActionProperty(_hmdTrackingStateAction);
+            }
+#endif
+        }
+
+#if ENABLE_INPUT_SYSTEM
+        private static bool NeedsBindings(InputActionProperty property)
+        {
+            InputAction action = property.action;
+            return action == null || action.bindings.Count == 0;
+        }
+#endif
+
+        private static T FindFirstObjectInSceneOfType<T>() where T : Object
+        {
+#if UNITY_2023_1_OR_NEWER
+            return Object.FindAnyObjectByType<T>(FindObjectsInactive.Include);
+#else
+            return Object.FindObjectOfType<T>(true);
+#endif
+        }
+
         private void ConfigurePassthroughSupport()
         {
-            _mainCamera = Camera.main;
+            _mainCamera = _xrOrigin != null && _xrOrigin.Camera != null ? _xrOrigin.Camera : Camera.main;
             if (_mainCamera == null)
             {
                 return;
@@ -669,9 +818,20 @@ namespace ParallelHeptics.FrontendUnity
             _cameraClearFlags = _mainCamera.clearFlags;
             _cameraBackgroundColor = _mainCamera.backgroundColor;
 
-            _arSessionObject = new GameObject("AR Session (Passthrough Calibration)");
-            _arSession = _arSessionObject.AddComponent<ARSession>();
+            _arSession = FindFirstObjectInSceneOfType<ARSession>();
+            if (_arSession == null)
+            {
+                _arSessionObject = new GameObject("AR Session (Passthrough Calibration)");
+                _arSession = _arSessionObject.AddComponent<ARSession>();
+                _ownsArSession = true;
+            }
+            else
+            {
+                _arSessionObject = _arSession.gameObject;
+                _ownsArSession = false;
+            }
             _arSession.enabled = false;
+            _arSession.attemptUpdate = true;
 
             _arCameraManager = _mainCamera.GetComponent<ARCameraManager>() ?? _mainCamera.gameObject.AddComponent<ARCameraManager>();
             _arCameraManager.enabled = false;
