@@ -187,16 +187,25 @@ MonoBehaviour:
   tcpBackendPort: 12344
   bindUdpLoopbackOnly: 0
   mapper:
-    panelWidth: 6.4
-    panelHeight: 4.8
+    panelWidth: 2
+    panelHeight: 2
     backendWidthPixels: 640
     backendHeightPixels: 480
-  panelWorldPosition: {x: 0, y: 1.45, z: 5.2}
-  panelEulerAngles: {x: 0, y: 0, z: 0}
+  panelWorldPosition: {x: 0, y: 0.75, z: 0.55}
+  panelEulerAngles: {x: -90, y: 0, z: 0}
+  panelUniformScale: 1
   maxFingerObjects: 10
-  fingerDiameter: 0.08
+  fingerDiameter: 0.1
   holdSeconds: 1
   showDebugStatus: 0
+  enableKeyboardCalibration: 1
+  calibrationActive: 1
+  loadSavedCalibration: 1
+  calibrationPrefsKey: ParallelHeptics.FrontendUnity.TabletopCalibration
+  calibrationMoveMetersPerSecond: 0.05
+  calibrationYawDegreesPerSecond: 30
+  calibrationScalePerSecond: 0.5
+  calibrationScaleStep: 0.025
 --- !u!4 &492520770
 Transform:
   m_ObjectHideFlags: 0

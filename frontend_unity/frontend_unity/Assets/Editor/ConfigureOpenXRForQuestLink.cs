@@ -2,8 +2,11 @@ using System.IO;
 using UnityEditor;
 using UnityEditor.XR.Management;
 using UnityEditor.XR.Management.Metadata;
+using UnityEditor.XR.OpenXR.Features;
 using UnityEngine;
 using UnityEngine.XR.Management;
+using UnityEngine.XR.OpenXR;
+using UnityEngine.XR.OpenXR.Features;
 
 namespace ParallelHeptics.FrontendUnity.Editor
 {
@@ -12,6 +15,13 @@ namespace ParallelHeptics.FrontendUnity.Editor
         private const string XrFolder = "Assets/XR";
         private const string GeneralSettingsPath = XrFolder + "/XRGeneralSettingsPerBuildTarget.asset";
         private const string OpenXrLoaderTypeName = "UnityEngine.XR.OpenXR.OpenXRLoader";
+        private const string MetaOpenXrLifeCycleFeatureId = "MetaOpenXR-OpenXRLifeCycle";
+        private static readonly string[] QuestLinkPassthroughFeatureIds =
+        {
+            "com.unity.openxr.feature.arfoundation-meta-session",
+            "com.unity.openxr.feature.arfoundation-meta-camera",
+            "com.unity.openxr.feature.meta-display-utilities"
+        };
 
         [MenuItem("Parallel Heptics/Configure OpenXR for Quest Link")]
         public static void Configure()
@@ -47,14 +57,68 @@ namespace ParallelHeptics.FrontendUnity.Editor
             generalSettings.AssignedSettings.automaticRunning = true;
 
             bool assigned = XRPackageMetadataStore.AssignLoader(generalSettings.AssignedSettings, OpenXrLoaderTypeName, buildTargetGroup);
+            int enabledFeatureCount = EnableQuestLinkPassthroughFeatures(buildTargetGroup);
             EditorUtility.SetDirty(perBuildTargetSettings);
             EditorUtility.SetDirty(generalSettings);
             EditorUtility.SetDirty(generalSettings.AssignedSettings);
             AssetDatabase.SaveAssets();
 
             Debug.Log(assigned
-                ? "Configured OpenXR for PC/Standalone Quest Link. Restart Play Mode if it was already running."
-                : "OpenXR loader was already configured or could not be reassigned. Check Project Settings > XR Plug-in Management > PC, Mac & Linux Standalone.");
+                ? $"Configured OpenXR for PC/Standalone Quest Link and enabled {enabledFeatureCount} Meta passthrough feature(s). Restart Play Mode if it was already running."
+                : $"OpenXR loader was already configured or could not be reassigned; enabled {enabledFeatureCount} Meta passthrough feature(s). Check Project Settings > XR Plug-in Management > PC, Mac & Linux Standalone.");
+        }
+
+        private static int EnableQuestLinkPassthroughFeatures(BuildTargetGroup buildTargetGroup)
+        {
+            OpenXRSettings settings = OpenXRSettings.GetSettingsForBuildTargetGroup(buildTargetGroup);
+            if (settings == null)
+            {
+                Debug.LogWarning("OpenXR settings were not available; Meta Quest Link passthrough features could not be enabled.");
+                return 0;
+            }
+
+            FeatureHelpers.RefreshFeatures(buildTargetGroup);
+            int enabledCount = 0;
+            OpenXRFeature[] features = FeatureHelpers.GetFeaturesWithIdsForBuildTarget(buildTargetGroup, QuestLinkPassthroughFeatureIds);
+            foreach (OpenXRFeature feature in features)
+            {
+                enabledCount += SetFeatureEnabledForStandalone(feature) ? 1 : 0;
+            }
+
+            SetFeatureEnabledForStandalone(FeatureHelpers.GetFeatureWithIdForBuildTarget(buildTargetGroup, MetaOpenXrLifeCycleFeatureId));
+
+            if (enabledCount < QuestLinkPassthroughFeatureIds.Length)
+            {
+                Debug.LogWarning($"Enabled {enabledCount}/{QuestLinkPassthroughFeatureIds.Length} Meta Quest Link passthrough features. If passthrough is unavailable, confirm com.unity.xr.meta-openxr is installed and Meta Quest Link developer passthrough is enabled.");
+            }
+
+            EditorUtility.SetDirty(settings);
+            return enabledCount;
+        }
+
+        private static bool SetFeatureEnabledForStandalone(OpenXRFeature feature)
+        {
+            if (feature == null)
+            {
+                return false;
+            }
+
+            // Meta OpenXR 2.1 calls its Android lifecycle refresh even when only
+            // configuring Standalone/Quest Link. Machines without the Android
+            // build module can then throw during OpenXRFeature.enabled's setter.
+            // Setting the serialized field directly keeps the Standalone setting
+            // deterministic without forcing an unrelated Android install.
+            SerializedObject serializedFeature = new SerializedObject(feature);
+            SerializedProperty enabledProperty = serializedFeature.FindProperty("m_enabled");
+            if (enabledProperty == null)
+            {
+                return false;
+            }
+
+            enabledProperty.boolValue = true;
+            serializedFeature.ApplyModifiedPropertiesWithoutUndo();
+            EditorUtility.SetDirty(feature);
+            return true;
         }
 
         private static void EnsureFolder(string assetFolder)

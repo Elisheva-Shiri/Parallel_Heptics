@@ -1,5 +1,9 @@
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.XR.ARFoundation;
+#if ENABLE_INPUT_SYSTEM
+using UnityEngine.InputSystem;
+#endif
 
 namespace ParallelHeptics.FrontendUnity
 {
@@ -15,9 +19,17 @@ namespace ParallelHeptics.FrontendUnity
         private static readonly Color GrayColor = new Color32(128, 128, 128, 255);
         private static readonly Color FingerColor = new Color32(211, 211, 211, 255);
         private static readonly Color PanelColor = Color.black;
+        private static readonly Color CalibrationPanelColor = new Color(0f, 0f, 0f, 0.08f);
         private static readonly Color DarkBarColor = new Color32(64, 64, 64, 255);
         private static readonly Color LightGreenColor = new Color32(144, 238, 144, 255);
         private static readonly Color GreenColor = new Color32(0, 200, 0, 255);
+        private static readonly Vector3 DefaultTabletopPosition = new Vector3(0f, 0.75f, 0.55f);
+        private static readonly Vector3 DefaultTabletopEulerAngles = new Vector3(-90f, 0f, 0f);
+
+        private const float DefaultTabletopScale = 1f;
+        private const float SurfaceOffset = 0.002f;
+        private const float ForegroundOffset = 0.004f;
+        private const float TextOffset = 0.006f;
 
         [Header("Backend protocol")]
         [SerializeField] private string backendHost = "localhost";
@@ -27,12 +39,23 @@ namespace ParallelHeptics.FrontendUnity
 
         [Header("Panel")]
         [SerializeField] private FlatPanelMapper mapper = new FlatPanelMapper();
-        [SerializeField] private Vector3 panelWorldPosition = new Vector3(0f, 1.45f, 5.2f);
-        [SerializeField] private Vector3 panelEulerAngles = Vector3.zero;
+        [SerializeField] private Vector3 panelWorldPosition = DefaultTabletopPosition;
+        [SerializeField] private Vector3 panelEulerAngles = DefaultTabletopEulerAngles;
+        [SerializeField] private float panelUniformScale = DefaultTabletopScale;
         [SerializeField] private int maxFingerObjects = 10;
-        [SerializeField] private float fingerDiameter = 0.08f;
+        [SerializeField] private float fingerDiameter = 0.1f;
         [SerializeField] private float holdSeconds = 1.0f;
         [SerializeField] private bool showDebugStatus;
+
+        [Header("Tabletop calibration")]
+        [SerializeField] private bool enableKeyboardCalibration = true;
+        [SerializeField] private bool calibrationActive = true;
+        [SerializeField] private bool loadSavedCalibration = true;
+        [SerializeField] private string calibrationPrefsKey = "ParallelHeptics.FrontendUnity.TabletopCalibration";
+        [SerializeField] private float calibrationMoveMetersPerSecond = 0.05f;
+        [SerializeField] private float calibrationYawDegreesPerSecond = 30f;
+        [SerializeField] private float calibrationScalePerSecond = 0.5f;
+        [SerializeField] private float calibrationScaleStep = 0.025f;
 
         private readonly List<GameObject> _fingerObjects = new List<GameObject>();
         private readonly Dictionary<Color, Material> _materials = new Dictionary<Color, Material>();
@@ -41,6 +64,7 @@ namespace ParallelHeptics.FrontendUnity
         private HoldButtonSelector _holdSelector;
         private Transform _panelRoot;
         private Transform _dynamicRoot;
+        private GameObject _panelBackground;
         private GameObject _trackingObject;
         private GameObject _progressBackground;
         private GameObject _outboundProgress;
@@ -55,9 +79,40 @@ namespace ParallelHeptics.FrontendUnity
         private TextMesh _subtitleText;
         private TextMesh _counterText;
         private TextMesh _statusText;
+        private Camera _mainCamera;
+        private ARSession _arSession;
+        private ARCameraManager _arCameraManager;
+        private GameObject _arSessionObject;
+        private Color _cameraBackgroundColor;
+        private CameraClearFlags _cameraClearFlags;
         private ExperimentState _lastState = (ExperimentState)999;
         private float _lastPacketTime = -1000f;
         private long _lastMalformedLogFrame = -9999;
+
+        private enum CalibrationKey
+        {
+            Left,
+            Right,
+            Down,
+            Up,
+            PageDown,
+            PageUp,
+            Q,
+            E,
+            LeftBracket,
+            RightBracket,
+            R,
+            Enter,
+            Shift
+        }
+
+        [System.Serializable]
+        private sealed class TabletopCalibrationData
+        {
+            public Vector3 position;
+            public Vector3 eulerAngles;
+            public float scale = DefaultTabletopScale;
+        }
 
         private void Awake()
         {
@@ -72,12 +127,29 @@ namespace ParallelHeptics.FrontendUnity
             _controlClient.Configure(backendHost, tcpBackendPort);
 
             _holdSelector = new HoldButtonSelector(holdSeconds);
+            LoadCalibrationIfAvailable();
             BuildSceneGraph();
+            ConfigurePassthroughSupport();
+            ApplyCalibrationVisibility();
             SetStateVisibility(ExperimentState.Start);
+        }
+
+        private void OnDestroy()
+        {
+            if (_panelRoot != null)
+            {
+                DestroyRuntimeObject(_panelRoot.gameObject);
+            }
+            if (_arSessionObject != null)
+            {
+                DestroyRuntimeObject(_arSessionObject);
+            }
         }
 
         private void Update()
         {
+            HandleCalibrationInput();
+
             if (_receiver.TryGetLatestJson(out string json))
             {
                 try
@@ -147,14 +219,14 @@ namespace ParallelHeptics.FrontendUnity
                 return;
             }
 
-            _trackingObject.transform.localPosition = mapper.NormalizedToLocal(trackingObject.x, trackingObject.z, -0.05f);
+            _trackingObject.transform.localPosition = mapper.NormalizedToLocal(trackingObject.x, trackingObject.z, ForegroundOffset);
             Vector2 objectSize = mapper.PixelsToPanelSize(trackingObject.size, trackingObject.size);
-            _trackingObject.transform.localScale = new Vector3(objectSize.x, objectSize.y, 0.035f);
+            _trackingObject.transform.localScale = new Vector3(objectSize.x, objectSize.y, 0.006f);
             Color color = trackingObject.isPinched ? (trackingObject.pairIndex == 0 ? FirstColor : SecondColor) : GrayColor;
             SetMaterial(_trackingObject, color);
 
-            const float barWidth = 2.0f;
-            const float barHeight = 0.16f;
+            float barWidth = mapper.PanelWidth * 0.72f;
+            float barHeight = mapper.PanelHeight * 0.04f;
             float halfWidth = barWidth * 0.5f;
             _progressBackground.transform.localScale = new Vector3(barWidth, barHeight, 1f);
             SetProgressBarHalf(_outboundProgress, Mathf.Clamp01(trackingObject.progress), leftHalf: true, halfWidth, barHeight);
@@ -202,7 +274,7 @@ namespace ParallelHeptics.FrontendUnity
                 if (active)
                 {
                     FingerPosition landmark = landmarks[i];
-                    _fingerObjects[i].transform.localPosition = mapper.NormalizedToLocal(landmark.x, landmark.z, -0.08f);
+                    _fingerObjects[i].transform.localPosition = mapper.NormalizedToLocal(landmark.x, landmark.z, TextOffset);
                 }
             }
         }
@@ -238,34 +310,35 @@ namespace ParallelHeptics.FrontendUnity
         private void BuildSceneGraph()
         {
             _panelRoot = new GameObject("Flat VR Frontend Panel").transform;
-            _panelRoot.SetParent(transform, false);
-            _panelRoot.position = panelWorldPosition;
-            _panelRoot.eulerAngles = panelEulerAngles;
+            _panelRoot.SetParent(null, false);
+            ApplyPanelTransform();
 
             _dynamicRoot = new GameObject("Dynamic Experiment Elements").transform;
             _dynamicRoot.SetParent(_panelRoot, false);
 
-            CreateQuad("Black Panel", _panelRoot, new Vector3(0f, 0f, 0.02f), new Vector3(mapper.PanelWidth, mapper.PanelHeight, 1f), PanelColor);
+            _panelBackground = CreateQuad("Black Panel", _panelRoot, Vector3.zero, new Vector3(mapper.PanelWidth, mapper.PanelHeight, 1f), PanelColor);
             _trackingObject = CreateCube("Tracking Object", _dynamicRoot, Vector3.zero, Vector3.one, GrayColor);
 
-            float progressY = mapper.PanelHeight * 0.5f - 0.25f;
-            _progressBackground = CreateQuad("Progress Background", _dynamicRoot, new Vector3(0f, progressY, -0.06f), Vector3.one, DarkBarColor);
-            _outboundProgress = CreateQuad("Outbound Progress", _dynamicRoot, new Vector3(-0.5f, progressY, -0.07f), Vector3.one, LightGreenColor);
-            _returnProgress = CreateQuad("Return Progress", _dynamicRoot, new Vector3(0.5f, progressY, -0.07f), Vector3.one, GreenColor);
-            _counterText = CreateText("Cycle Counter", _dynamicRoot, new Vector3(mapper.PanelWidth * 0.5f - 0.5f, -mapper.PanelHeight * 0.5f + 0.38f, -0.09f), 0.033f, TextAnchor.MiddleCenter);
+            float progressY = -mapper.PanelHeight * 0.41f;
+            _progressBackground = CreateQuad("Progress Background", _dynamicRoot, new Vector3(0f, progressY, SurfaceOffset), Vector3.one, DarkBarColor);
+            _outboundProgress = CreateQuad("Outbound Progress", _dynamicRoot, new Vector3(-mapper.PanelWidth * 0.18f, progressY, ForegroundOffset), Vector3.one, LightGreenColor);
+            _returnProgress = CreateQuad("Return Progress", _dynamicRoot, new Vector3(mapper.PanelWidth * 0.18f, progressY, ForegroundOffset), Vector3.one, GreenColor);
+            _counterText = CreateText("Cycle Counter", _dynamicRoot, new Vector3(mapper.PanelWidth * 0.34f, mapper.PanelHeight * 0.42f, TextOffset), mapper.PanelHeight * 0.0125f, TextAnchor.MiddleCenter);
 
-            Vector2 buttonSize = mapper.PixelsToPanelSize(100f, 100f);
-            float buttonInset = mapper.PixelsToPanelSize(140f, 0f).x;
-            _leftButton = CreateQuad("Question Left Button", _dynamicRoot, new Vector3(-mapper.PanelWidth * 0.5f + buttonInset, 0f, -0.06f), new Vector3(buttonSize.x, buttonSize.y, 1f), FirstColor);
-            _rightButton = CreateQuad("Question Right Button", _dynamicRoot, new Vector3(mapper.PanelWidth * 0.5f - buttonInset, 0f, -0.06f), new Vector3(buttonSize.x, buttonSize.y, 1f), SecondColor);
-            _leftHoldBackground = CreateQuad("Left Hold Background", _dynamicRoot, _leftButton.transform.localPosition + new Vector3(0f, -buttonSize.y * 0.65f, -0.01f), new Vector3(buttonSize.x, 0.08f, 1f), DarkBarColor);
-            _rightHoldBackground = CreateQuad("Right Hold Background", _dynamicRoot, _rightButton.transform.localPosition + new Vector3(0f, -buttonSize.y * 0.65f, -0.01f), new Vector3(buttonSize.x, 0.08f, 1f), DarkBarColor);
-            _leftHoldFill = CreateQuad("Left Hold Fill", _leftHoldBackground.transform, Vector3.zero, new Vector3(0f, 0.08f, 1f), GreenColor);
-            _rightHoldFill = CreateQuad("Right Hold Fill", _rightHoldBackground.transform, Vector3.zero, new Vector3(0f, 0.08f, 1f), GreenColor);
+            float buttonDiameter = Mathf.Min(mapper.PanelWidth, mapper.PanelHeight) * 0.22f;
+            Vector2 buttonSize = new Vector2(buttonDiameter, buttonDiameter);
+            float buttonX = mapper.PanelWidth * 0.28f;
+            float holdBarHeight = mapper.PanelHeight * 0.025f;
+            _leftButton = CreateQuad("Question Left Button", _dynamicRoot, new Vector3(-buttonX, 0f, SurfaceOffset), new Vector3(buttonSize.x, buttonSize.y, 1f), FirstColor);
+            _rightButton = CreateQuad("Question Right Button", _dynamicRoot, new Vector3(buttonX, 0f, SurfaceOffset), new Vector3(buttonSize.x, buttonSize.y, 1f), SecondColor);
+            _leftHoldBackground = CreateQuad("Left Hold Background", _dynamicRoot, _leftButton.transform.localPosition + new Vector3(0f, buttonSize.y * 0.65f, SurfaceOffset), new Vector3(buttonSize.x, holdBarHeight, 1f), DarkBarColor);
+            _rightHoldBackground = CreateQuad("Right Hold Background", _dynamicRoot, _rightButton.transform.localPosition + new Vector3(0f, buttonSize.y * 0.65f, SurfaceOffset), new Vector3(buttonSize.x, holdBarHeight, 1f), DarkBarColor);
+            _leftHoldFill = CreateQuad("Left Hold Fill", _leftHoldBackground.transform, Vector3.zero, new Vector3(0f, 1f, 1f), GreenColor);
+            _rightHoldFill = CreateQuad("Right Hold Fill", _rightHoldBackground.transform, Vector3.zero, new Vector3(0f, 1f, 1f), GreenColor);
 
-            _titleText = CreateText("Title Text", _dynamicRoot, new Vector3(0f, mapper.PanelHeight * 0.5f - 0.5f, -0.09f), 0.039f, TextAnchor.MiddleCenter);
-            _subtitleText = CreateText("Subtitle Text", _dynamicRoot, new Vector3(0f, -0.2f, -0.09f), 0.027f, TextAnchor.MiddleCenter);
-            _statusText = CreateText("Status Text", _panelRoot, new Vector3(0f, -mapper.PanelHeight * 0.5f + 0.18f, -0.09f), 0.0135f, TextAnchor.MiddleCenter);
+            _titleText = CreateText("Title Text", _dynamicRoot, new Vector3(0f, -mapper.PanelHeight * 0.34f, TextOffset), mapper.PanelHeight * 0.03f, TextAnchor.MiddleCenter);
+            _subtitleText = CreateText("Subtitle Text", _dynamicRoot, new Vector3(0f, mapper.PanelHeight * 0.1f, TextOffset), mapper.PanelHeight * 0.0225f, TextAnchor.MiddleCenter);
+            _statusText = CreateText("Status Text", _panelRoot, new Vector3(0f, mapper.PanelHeight * 0.47f, TextOffset), mapper.PanelHeight * 0.0175f, TextAnchor.MiddleCenter);
             _statusText.gameObject.SetActive(showDebugStatus);
 
             for (int i = 0; i < maxFingerObjects; i++)
@@ -298,9 +371,26 @@ namespace ParallelHeptics.FrontendUnity
             go.transform.SetParent(parent, false);
             go.transform.localPosition = localPosition;
             go.transform.localScale = localScale;
-            Destroy(go.GetComponent<Collider>());
+            DestroyRuntimeObject(go.GetComponent<Collider>());
             SetMaterial(go, color);
             return go;
+        }
+
+        private static void DestroyRuntimeObject(Object objectToDestroy)
+        {
+            if (objectToDestroy == null)
+            {
+                return;
+            }
+
+            if (Application.isPlaying)
+            {
+                Destroy(objectToDestroy);
+            }
+            else
+            {
+                DestroyImmediate(objectToDestroy);
+            }
         }
 
         private TextMesh CreateText(string objectName, Transform parent, Vector3 localPosition, float characterSize, TextAnchor anchor)
@@ -325,6 +415,301 @@ namespace ParallelHeptics.FrontendUnity
             return new Rect(center.x - scale.x * 0.5f, center.y - scale.y * 0.5f, scale.x, scale.y);
         }
 
+        private void ApplyPanelTransform()
+        {
+            if (_panelRoot == null)
+            {
+                return;
+            }
+
+            _panelRoot.position = panelWorldPosition;
+            _panelRoot.eulerAngles = panelEulerAngles;
+            _panelRoot.localScale = Vector3.one * Mathf.Max(0.1f, panelUniformScale);
+        }
+
+        private void HandleCalibrationInput()
+        {
+            if (!enableKeyboardCalibration || _panelRoot == null)
+            {
+                return;
+            }
+
+            if (!calibrationActive)
+            {
+                if (WasKeyPressedThisFrame(CalibrationKey.R))
+                {
+                    calibrationActive = true;
+                    ApplyCalibrationVisibility();
+                    Debug.Log("Tabletop calibration restarted. Press Enter to save and lock it again.");
+                }
+
+                return;
+            }
+
+            bool changed = false;
+            float speedMultiplier = IsKeyPressed(CalibrationKey.Shift) ? 5f : 1f;
+            float moveStep = calibrationMoveMetersPerSecond * speedMultiplier * Time.unscaledDeltaTime;
+            float yawStep = calibrationYawDegreesPerSecond * speedMultiplier * Time.unscaledDeltaTime;
+            float scaleStep = calibrationScalePerSecond * speedMultiplier * Time.unscaledDeltaTime;
+
+            if (IsKeyPressed(CalibrationKey.Left))
+            {
+                panelWorldPosition -= _panelRoot.right * moveStep;
+                changed = true;
+            }
+            if (IsKeyPressed(CalibrationKey.Right))
+            {
+                panelWorldPosition += _panelRoot.right * moveStep;
+                changed = true;
+            }
+            if (IsKeyPressed(CalibrationKey.Down))
+            {
+                panelWorldPosition += _panelRoot.up * moveStep;
+                changed = true;
+            }
+            if (IsKeyPressed(CalibrationKey.Up))
+            {
+                panelWorldPosition -= _panelRoot.up * moveStep;
+                changed = true;
+            }
+            if (IsKeyPressed(CalibrationKey.PageDown))
+            {
+                panelWorldPosition -= _panelRoot.forward * moveStep;
+                changed = true;
+            }
+            if (IsKeyPressed(CalibrationKey.PageUp))
+            {
+                panelWorldPosition += _panelRoot.forward * moveStep;
+                changed = true;
+            }
+            if (IsKeyPressed(CalibrationKey.Q))
+            {
+                RotateTabletopYaw(-yawStep);
+                changed = true;
+            }
+            if (IsKeyPressed(CalibrationKey.E))
+            {
+                RotateTabletopYaw(yawStep);
+                changed = true;
+            }
+            if (WasKeyPressedThisFrame(CalibrationKey.LeftBracket))
+            {
+                panelUniformScale = Mathf.Max(0.01f, panelUniformScale - calibrationScaleStep);
+                changed = true;
+            }
+            if (WasKeyPressedThisFrame(CalibrationKey.RightBracket))
+            {
+                panelUniformScale += calibrationScaleStep;
+                changed = true;
+            }
+            if (IsKeyPressed(CalibrationKey.LeftBracket))
+            {
+                panelUniformScale = Mathf.Max(0.01f, panelUniformScale - scaleStep);
+                changed = true;
+            }
+            if (IsKeyPressed(CalibrationKey.RightBracket))
+            {
+                panelUniformScale += scaleStep;
+                changed = true;
+            }
+            if (WasKeyPressedThisFrame(CalibrationKey.R))
+            {
+                calibrationActive = true;
+                changed = true;
+            }
+            if (WasKeyPressedThisFrame(CalibrationKey.Enter))
+            {
+                SaveCalibration();
+            }
+
+            if (changed)
+            {
+                ApplyPanelTransform();
+            }
+        }
+
+        private static bool IsKeyPressed(CalibrationKey key)
+        {
+#if ENABLE_INPUT_SYSTEM
+            Keyboard keyboard = Keyboard.current;
+            if (keyboard != null)
+            {
+                return key switch
+                {
+                    CalibrationKey.Left => keyboard.leftArrowKey.isPressed,
+                    CalibrationKey.Right => keyboard.rightArrowKey.isPressed,
+                    CalibrationKey.Down => keyboard.downArrowKey.isPressed,
+                    CalibrationKey.Up => keyboard.upArrowKey.isPressed,
+                    CalibrationKey.PageDown => keyboard.pageDownKey.isPressed,
+                    CalibrationKey.PageUp => keyboard.pageUpKey.isPressed,
+                    CalibrationKey.Q => keyboard.qKey.isPressed,
+                    CalibrationKey.E => keyboard.eKey.isPressed,
+                    CalibrationKey.LeftBracket => keyboard.leftBracketKey.isPressed,
+                    CalibrationKey.RightBracket => keyboard.rightBracketKey.isPressed,
+                    CalibrationKey.R => keyboard.rKey.isPressed,
+                    CalibrationKey.Enter => keyboard.enterKey.isPressed || keyboard.numpadEnterKey.isPressed,
+                    CalibrationKey.Shift => keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed,
+                    _ => false
+                };
+            }
+#endif
+
+#if ENABLE_LEGACY_INPUT_MANAGER
+            return key switch
+            {
+                CalibrationKey.Left => Input.GetKey(KeyCode.LeftArrow),
+                CalibrationKey.Right => Input.GetKey(KeyCode.RightArrow),
+                CalibrationKey.Down => Input.GetKey(KeyCode.DownArrow),
+                CalibrationKey.Up => Input.GetKey(KeyCode.UpArrow),
+                CalibrationKey.PageDown => Input.GetKey(KeyCode.PageDown),
+                CalibrationKey.PageUp => Input.GetKey(KeyCode.PageUp),
+                CalibrationKey.Q => Input.GetKey(KeyCode.Q),
+                CalibrationKey.E => Input.GetKey(KeyCode.E),
+                CalibrationKey.LeftBracket => Input.GetKey(KeyCode.LeftBracket),
+                CalibrationKey.RightBracket => Input.GetKey(KeyCode.RightBracket),
+                CalibrationKey.R => Input.GetKey(KeyCode.R),
+                CalibrationKey.Enter => Input.GetKey(KeyCode.Return) || Input.GetKey(KeyCode.KeypadEnter),
+                CalibrationKey.Shift => Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift),
+                _ => false
+            };
+#else
+            return false;
+#endif
+        }
+
+        private static bool WasKeyPressedThisFrame(CalibrationKey key)
+        {
+#if ENABLE_INPUT_SYSTEM
+            Keyboard keyboard = Keyboard.current;
+            if (keyboard != null)
+            {
+                return key switch
+                {
+                    CalibrationKey.LeftBracket => keyboard.leftBracketKey.wasPressedThisFrame,
+                    CalibrationKey.RightBracket => keyboard.rightBracketKey.wasPressedThisFrame,
+                    CalibrationKey.R => keyboard.rKey.wasPressedThisFrame,
+                    CalibrationKey.Enter => keyboard.enterKey.wasPressedThisFrame || keyboard.numpadEnterKey.wasPressedThisFrame,
+                    _ => false
+                };
+            }
+#endif
+
+#if ENABLE_LEGACY_INPUT_MANAGER
+            return key switch
+            {
+                CalibrationKey.LeftBracket => Input.GetKeyDown(KeyCode.LeftBracket),
+                CalibrationKey.RightBracket => Input.GetKeyDown(KeyCode.RightBracket),
+                CalibrationKey.R => Input.GetKeyDown(KeyCode.R),
+                CalibrationKey.Enter => Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.KeypadEnter),
+                _ => false
+            };
+#else
+            return false;
+#endif
+        }
+
+        private void RotateTabletopYaw(float degrees)
+        {
+            Quaternion current = Quaternion.Euler(panelEulerAngles);
+            panelEulerAngles = (Quaternion.AngleAxis(degrees, Vector3.up) * current).eulerAngles;
+        }
+
+        private void LoadCalibrationIfAvailable()
+        {
+            if (!loadSavedCalibration || string.IsNullOrWhiteSpace(calibrationPrefsKey) || !PlayerPrefs.HasKey(calibrationPrefsKey))
+            {
+                return;
+            }
+
+            try
+            {
+                TabletopCalibrationData data = JsonUtility.FromJson<TabletopCalibrationData>(PlayerPrefs.GetString(calibrationPrefsKey));
+                if (data != null)
+                {
+                    panelWorldPosition = data.position;
+                    panelEulerAngles = data.eulerAngles;
+                    panelUniformScale = Mathf.Max(0.1f, data.scale);
+                    calibrationActive = false;
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogWarning($"Failed to load tabletop calibration; using defaults. {ex.Message}");
+            }
+        }
+
+        private void SaveCalibration()
+        {
+            if (string.IsNullOrWhiteSpace(calibrationPrefsKey))
+            {
+                return;
+            }
+
+            var data = new TabletopCalibrationData
+            {
+                position = panelWorldPosition,
+                eulerAngles = panelEulerAngles,
+                scale = panelUniformScale
+            };
+            PlayerPrefs.SetString(calibrationPrefsKey, JsonUtility.ToJson(data));
+            PlayerPrefs.Save();
+            calibrationActive = false;
+            ApplyCalibrationVisibility();
+            Debug.Log($"Saved tabletop calibration: position={panelWorldPosition}, rotation={panelEulerAngles}, scale={panelUniformScale:0.###}");
+        }
+
+        private void ConfigurePassthroughSupport()
+        {
+            _mainCamera = Camera.main;
+            if (_mainCamera == null)
+            {
+                return;
+            }
+
+            _cameraClearFlags = _mainCamera.clearFlags;
+            _cameraBackgroundColor = _mainCamera.backgroundColor;
+
+            _arSessionObject = new GameObject("AR Session (Passthrough Calibration)");
+            _arSession = _arSessionObject.AddComponent<ARSession>();
+            _arSession.enabled = false;
+
+            _arCameraManager = _mainCamera.GetComponent<ARCameraManager>() ?? _mainCamera.gameObject.AddComponent<ARCameraManager>();
+            _arCameraManager.enabled = false;
+        }
+
+        private void ApplyCalibrationVisibility()
+        {
+            if (_panelBackground != null)
+            {
+                SetMaterial(_panelBackground, calibrationActive ? CalibrationPanelColor : PanelColor);
+            }
+
+            if (_mainCamera == null)
+            {
+                return;
+            }
+
+            if (calibrationActive)
+            {
+                _mainCamera.clearFlags = CameraClearFlags.SolidColor;
+                _mainCamera.backgroundColor = new Color(0f, 0f, 0f, 0f);
+            }
+            else
+            {
+                _mainCamera.clearFlags = _cameraClearFlags;
+                _mainCamera.backgroundColor = _cameraBackgroundColor;
+            }
+
+            if (_arSession != null)
+            {
+                _arSession.enabled = calibrationActive;
+            }
+            if (_arCameraManager != null)
+            {
+                _arCameraManager.enabled = calibrationActive;
+            }
+        }
+
         private void SetBar(GameObject bar, float width, float height, float centerX)
         {
             width = Mathf.Max(0f, width);
@@ -345,7 +730,7 @@ namespace ParallelHeptics.FrontendUnity
         {
             float width = Mathf.Clamp01(progress);
             bar.transform.localScale = new Vector3(width, 1f, 1f);
-            bar.transform.localPosition = new Vector3(-0.5f + width * 0.5f, 0f, -0.01f);
+            bar.transform.localPosition = new Vector3(-0.5f + width * 0.5f, 0f, SurfaceOffset);
             bar.SetActive(width > 0.0001f);
         }
 
@@ -369,11 +754,53 @@ namespace ParallelHeptics.FrontendUnity
                 {
                     material.SetColor("_Color", color);
                 }
+                if (material.HasProperty("_Cull"))
+                {
+                    material.SetFloat("_Cull", 0f);
+                }
+                ConfigureMaterialSurface(material, color.a);
 
                 _materials.Add(color, material);
             }
 
             renderer.sharedMaterial = material;
+        }
+
+        private static void ConfigureMaterialSurface(Material material, float alpha)
+        {
+            if (alpha >= 0.999f)
+            {
+                material.renderQueue = -1;
+                if (material.HasProperty("_Surface"))
+                {
+                    material.SetFloat("_Surface", 0f);
+                }
+                if (material.HasProperty("_ZWrite"))
+                {
+                    material.SetFloat("_ZWrite", 1f);
+                }
+
+                return;
+            }
+
+            material.renderQueue = (int)UnityEngine.Rendering.RenderQueue.Transparent;
+            if (material.HasProperty("_Surface"))
+            {
+                material.SetFloat("_Surface", 1f);
+            }
+            if (material.HasProperty("_SrcBlend"))
+            {
+                material.SetFloat("_SrcBlend", (float)UnityEngine.Rendering.BlendMode.SrcAlpha);
+            }
+            if (material.HasProperty("_DstBlend"))
+            {
+                material.SetFloat("_DstBlend", (float)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+            }
+            if (material.HasProperty("_ZWrite"))
+            {
+                material.SetFloat("_ZWrite", 0f);
+            }
+            material.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
         }
     }
 }

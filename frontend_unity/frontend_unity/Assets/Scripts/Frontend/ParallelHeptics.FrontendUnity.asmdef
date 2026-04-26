@@ -1,7 +1,10 @@
 {
     "name": "ParallelHeptics.FrontendUnity",
     "rootNamespace": "ParallelHeptics.FrontendUnity",
-    "references": [],
+    "references": [
+        "GUID:75469ad4d38634e559750d17036d5f7c",
+        "GUID:a9420e37d7990b54abdef6688edbe313"
+    ],
     "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": false,
