@@ -1,0 +1,21 @@
+{
+    "name": "ParallelHeptics.FrontendUnity.Tests",
+    "rootNamespace": "ParallelHeptics.FrontendUnity.Tests",
+    "references": [
+        "ParallelHeptics.FrontendUnity"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "optionalUnityReferences": [
+        "TestAssemblies"
+    ],
+    "noEngineReferences": false
+}

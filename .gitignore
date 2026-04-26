@@ -208,3 +208,17 @@ basic_logic.txt
 debug_experiments/
 live_experiments/
 todo.md
+
+### Unity
+**/[Ll]ibrary/
+**/[Tt]emp/
+**/[Oo]bj/
+**/[Bb]uild/
+**/[Bb]uilds/
+**/[Ll]ogs/
+**/[Uu]ser[Ss]ettings/
+*.csproj
+*.sln
+
+### Codex
+.omx/
