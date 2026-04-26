@@ -157,8 +157,8 @@ namespace ParallelHeptics.FrontendUnity
             const float barHeight = 0.16f;
             float halfWidth = barWidth * 0.5f;
             _progressBackground.transform.localScale = new Vector3(barWidth, barHeight, 1f);
-            SetBar(_outboundProgress, Mathf.Clamp01(trackingObject.progress) * halfWidth, barHeight, -barWidth * 0.25f);
-            SetBar(_returnProgress, Mathf.Clamp01(trackingObject.returnProgress) * halfWidth, barHeight, barWidth * 0.25f);
+            SetProgressBarHalf(_outboundProgress, Mathf.Clamp01(trackingObject.progress), leftHalf: true, halfWidth, barHeight);
+            SetProgressBarHalf(_returnProgress, Mathf.Clamp01(trackingObject.returnProgress), leftHalf: false, halfWidth, barHeight);
             _counterText.text = $"{trackingObject.cycleCount}/{trackingObject.targetCycleCount}";
         }
 
@@ -188,9 +188,8 @@ namespace ParallelHeptics.FrontendUnity
                 _controlClient.SendQuestionInput(answer.Value);
             }
 
-            const float holdBarHeight = 0.08f;
-            SetBar(_leftHoldFill, _leftButton.transform.localScale.x * _holdSelector.LeftProgress, holdBarHeight, 0f, true, _leftHoldBackground.transform);
-            SetBar(_rightHoldFill, _rightButton.transform.localScale.x * _holdSelector.RightProgress, holdBarHeight, 0f, true, _rightHoldBackground.transform);
+            SetChildFillBar(_leftHoldFill, _holdSelector.LeftProgress);
+            SetChildFillBar(_rightHoldFill, _holdSelector.RightProgress);
         }
 
         private void RenderFingers(List<FingerPosition> landmarks)
@@ -253,7 +252,7 @@ namespace ParallelHeptics.FrontendUnity
             _progressBackground = CreateQuad("Progress Background", _dynamicRoot, new Vector3(0f, progressY, -0.06f), Vector3.one, DarkBarColor);
             _outboundProgress = CreateQuad("Outbound Progress", _dynamicRoot, new Vector3(-0.5f, progressY, -0.07f), Vector3.one, LightGreenColor);
             _returnProgress = CreateQuad("Return Progress", _dynamicRoot, new Vector3(0.5f, progressY, -0.07f), Vector3.one, GreenColor);
-            _counterText = CreateText("Cycle Counter", _dynamicRoot, new Vector3(mapper.PanelWidth * 0.5f - 0.5f, progressY, -0.09f), 0.033f, TextAnchor.MiddleCenter);
+            _counterText = CreateText("Cycle Counter", _dynamicRoot, new Vector3(mapper.PanelWidth * 0.5f - 0.5f, -mapper.PanelHeight * 0.5f + 0.38f, -0.09f), 0.033f, TextAnchor.MiddleCenter);
 
             Vector2 buttonSize = mapper.PixelsToPanelSize(100f, 100f);
             float buttonInset = mapper.PixelsToPanelSize(140f, 0f).x;
@@ -326,12 +325,27 @@ namespace ParallelHeptics.FrontendUnity
             return new Rect(center.x - scale.x * 0.5f, center.y - scale.y * 0.5f, scale.x, scale.y);
         }
 
-        private void SetBar(GameObject bar, float width, float height, float centerX, bool alignLeft = false, Transform parent = null)
+        private void SetBar(GameObject bar, float width, float height, float centerX)
         {
             width = Mathf.Max(0f, width);
             bar.transform.localScale = new Vector3(width, height, 1f);
-            float x = alignLeft && parent != null ? -parent.localScale.x * 0.5f + width * 0.5f : centerX;
-            bar.transform.localPosition = new Vector3(x, 0f, -0.01f);
+            bar.transform.localPosition = new Vector3(centerX, bar.transform.localPosition.y, bar.transform.localPosition.z);
+            bar.SetActive(width > 0.0001f);
+        }
+
+        private void SetProgressBarHalf(GameObject bar, float progress, bool leftHalf, float halfWidth, float height)
+        {
+            float width = Mathf.Clamp01(progress) * halfWidth;
+            float halfLeftEdge = leftHalf ? -halfWidth : 0f;
+            float x = halfLeftEdge + width * 0.5f;
+            SetBar(bar, width, height, x);
+        }
+
+        private void SetChildFillBar(GameObject bar, float progress)
+        {
+            float width = Mathf.Clamp01(progress);
+            bar.transform.localScale = new Vector3(width, 1f, 1f);
+            bar.transform.localPosition = new Vector3(-0.5f + width * 0.5f, 0f, -0.01f);
             bar.SetActive(width > 0.0001f);
         }
 
