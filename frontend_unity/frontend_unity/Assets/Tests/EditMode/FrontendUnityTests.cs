@@ -1,9 +1,13 @@
 using NUnit.Framework;
 using ParallelHeptics.FrontendUnity;
 using System.Reflection;
+using Unity.XR.CoreUtils;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
+#if ENABLE_INPUT_SYSTEM
+using UnityEngine.InputSystem.XR;
+#endif
 
 namespace ParallelHeptics.FrontendUnity.Tests
 {
@@ -125,7 +129,8 @@ namespace ParallelHeptics.FrontendUnity.Tests
 
                 var counter = GameObject.Find("Cycle Counter").GetComponent<TextMesh>();
                 Assert.NotNull(counter);
-                Assert.AreEqual(0f, counter.transform.localEulerAngles.z, 0.0001f, "Counter text should not be mirrored by a 180-degree local rotation.");
+                Assert.AreEqual(0f, counter.transform.localEulerAngles.z, 0.0001f, "Counter text orientation must come from a Y-scale flip, not an in-plane rotation that would reverse reading order.");
+                Assert.AreEqual(-1f, counter.transform.localScale.y, 0.0001f, "Counter text needs Y-scale -1 so the horizontal tabletop reads right-side up without mirroring the reading direction.");
                 Assert.AreEqual(0.025f, counter.characterSize, 0.0001f, "Counter should be half of the previous 0.05 m tabletop text size.");
             }
             finally
@@ -135,6 +140,46 @@ namespace ParallelHeptics.FrontendUnity.Tests
                     Object.DestroyImmediate(panelRoot);
                 }
 
+                Object.DestroyImmediate(controllerObject);
+            }
+        }
+
+        [Test]
+        public void RuntimeBootstrapCreatesXrOriginWithTrackedHeadset()
+        {
+            EditorSceneManager.OpenScene("Assets/Scenes/FrontendUnity.unity");
+            Assert.NotNull(Camera.main, "FrontendUnity.unity must contain a MainCamera for the XR rig bootstrap to attach to.");
+
+            GameObject controllerObject = new GameObject("Runtime Xr Rig Test Controller");
+            XROrigin createdOrigin = null;
+
+            try
+            {
+                var controller = controllerObject.AddComponent<FrontendUnityController>();
+                MethodInfo ensureXrCameraRig = typeof(FrontendUnityController).GetMethod("EnsureXrCameraRig", BindingFlags.Instance | BindingFlags.NonPublic);
+                Assert.NotNull(ensureXrCameraRig, "EnsureXrCameraRig must exist so passthrough+head tracking are wired up before the scene graph is built.");
+                ensureXrCameraRig.Invoke(controller, null);
+
+                createdOrigin = Object.FindAnyObjectByType<XROrigin>();
+                Assert.NotNull(createdOrigin, "Bootstrap must add an XR Origin so the headset moves the camera through a stable world rather than dragging the world along.");
+
+                Camera rigCamera = createdOrigin.Camera;
+                Assert.NotNull(rigCamera, "XR Origin must point at the camera it is supposed to drive.");
+                Assert.AreEqual("MainCamera", rigCamera.tag, "The XR Origin must claim the scene's MainCamera-tagged camera so head pose drives the user's view, not a stray camera.");
+                Assert.IsTrue(rigCamera.transform.IsChildOf(createdOrigin.transform), "The driven camera must be reparented under the XR Origin hierarchy so HMD pose moves it.");
+#if ENABLE_INPUT_SYSTEM
+                var driver = rigCamera.GetComponent<TrackedPoseDriver>();
+                Assert.NotNull(driver, "The driven camera must have a TrackedPoseDriver so HMD pose updates the camera transform every frame.");
+                Assert.IsTrue(driver.positionInput.action != null && driver.positionInput.action.bindings.Count > 0, "TrackedPoseDriver position input must be bound to an XR HMD control.");
+                Assert.IsTrue(driver.rotationInput.action != null && driver.rotationInput.action.bindings.Count > 0, "TrackedPoseDriver rotation input must be bound to an XR HMD control.");
+#endif
+            }
+            finally
+            {
+                if (createdOrigin != null)
+                {
+                    Object.DestroyImmediate(createdOrigin.gameObject);
+                }
                 Object.DestroyImmediate(controllerObject);
             }
         }
