@@ -6,6 +6,7 @@ class ExperimentState(Enum):
     COMPARISON = 1
     QUESTION = 2
     PAUSE = 3
+    BREAK = 4
     END = -1
 
 class QuestionInput(Enum):

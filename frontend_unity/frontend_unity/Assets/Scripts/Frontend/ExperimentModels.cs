@@ -9,6 +9,7 @@ namespace ParallelHeptics.FrontendUnity
         Comparison = 1,
         Question = 2,
         Pause = 3,
+        Break = 4,
         End = -1
     }
 
