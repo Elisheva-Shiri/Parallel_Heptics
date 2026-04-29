@@ -222,3 +222,6 @@ todo.md
 
 ### Codex
 .omx/
+
+# Motor response experiment: video + frames (default output next to package code)
+analysis/motor_response_experiment/responses/
