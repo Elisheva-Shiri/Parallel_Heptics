@@ -22,7 +22,7 @@ from haptic_mapping import map_object_displacement_to_tactor
 
 DEBUG_POSITION = 1000
 DEBUG_SINGLE_MOTOR = False
-DEBUG_FLIP_Y = False
+DEBUG_FLIP_Y = True
 DEBUG_SIDE_CAMERA_OFF = True  # overridden at runtime by user prompt
 DEBUG_ALLOW_PRINTS = False
 DEBUG_LOG_MOTOR_RANGE = True  # Log min/max motor positions on shutdown (no per-message overhead)
@@ -179,6 +179,7 @@ class Experiment:
         # and adjust to ExperimentState.START
         self._state = ExperimentState.COMPARISON
         self._pause_time = 0
+        self._break_started_at: Optional[datetime] = None
         self._pair_counter = 0  # Counter for pair folders
         self._pair_finger: FingerName = pair_finger
         self._target_cycle_count = target_cycle_count
@@ -231,8 +232,8 @@ class Experiment:
         self._running = True
 
         # Camera indices
-        self.TOP_CAMERA = 0
-        self.SIDE_CAMERA = 2
+        self.TOP_CAMERA = 1
+        self.SIDE_CAMERA = 0
         
         # Video writers
         self._top_writer = None
@@ -467,6 +468,34 @@ class Experiment:
                 self._state = ExperimentState.END
                 break
 
+            elif pair.first.value == -2:
+                if (
+                    pair.second.value != -2
+                    or pair.first.finger_id != -2
+                    or pair.second.finger_id != -2
+                ):
+                    raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
+
+                print("Break — press Enter to continue (duration is logged when you continue)")
+                self._state = ExperimentState.BREAK
+                break_started_at = datetime.now()
+                self._break_started_at = break_started_at
+                self._pause_time = 0
+                keyboard.wait("enter")
+                break_duration = (datetime.now() - break_started_at).total_seconds()
+                self._break_started_at = None
+                self._pause_time = 0
+                self._state = ExperimentState.COMPARISON
+
+                breaks_file = self._path / "breaks.csv"
+                if not breaks_file.exists():
+                    with open(breaks_file, "w", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(["timestamp_start", "break_duration_seconds"])
+                with open(breaks_file, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([break_started_at.isoformat(), f"{break_duration:.3f}"])
+
             elif pair.first.value == 0:
                 if pair.second.value != 0:
                     raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
@@ -619,8 +648,14 @@ class Experiment:
                         FingerPosition(x=current_pos.active_finger_x / self._top_width, z=current_pos.active_finger_y / self._top_height)
                     ]
 
+                pause_for_packet = self._pause_time
+                if self._state == ExperimentState.BREAK and self._break_started_at is not None:
+                    pause_for_packet = int(
+                        (datetime.now() - self._break_started_at).total_seconds()
+                    )
+
                 packet = ExperimentPacket(
-                    stateData=StateData(state=self._state.value, pauseTime=self._pause_time),
+                    stateData=StateData(state=self._state.value, pauseTime=pause_for_packet),
                     landmarks=finger_positions,
                     trackingObject=TrackingObject(
                         x=self._virtual_object.x / self._top_width,

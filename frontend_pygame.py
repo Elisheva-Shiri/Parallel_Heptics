@@ -88,6 +88,10 @@ class PygameFrontEnd:
         counter_text = self._font.render(f"{tracking_obj.cycleCount}/{tracking_obj.targetCycleCount}", True, (255, 255, 255))
         self.screen.blit(counter_text, (self._width - 50, 40))
 
+        hint = self._font.render("Switch fingers on the screen", True, (255, 255, 255))
+        hint_rect = hint.get_rect(center=(self._width / 2, self._height - 36))
+        self.screen.blit(hint, hint_rect)
+
     def _draw_question(self, landmarks: list[FingerPosition]) -> None:
         # Draw title
         title = self._title_font.render("Which object is stiffer?", True, (255, 255, 255))
@@ -159,8 +163,25 @@ class PygameFrontEnd:
 
         # Draw pause screen subtitle
         subtitle = self._font.render(f"{pause_time} seconds left before moving to the next test...", True, (255, 255, 255))
-        subtitle_rect = subtitle.get_rect(center=(self._width/2, self._height/2 + 30))
+        subtitle_rect = subtitle.get_rect(center=(self._width/2, self._height/2 + 10))
         self.screen.blit(subtitle, subtitle_rect)
+
+        instr = self._font.render("Switch fingers on the screen", True, (255, 255, 255))
+        instr_rect = instr.get_rect(center=(self._width/2, self._height/2 + 50))
+        self.screen.blit(instr, instr_rect)
+
+    def _draw_break(self, elapsed_seconds: int):
+        title = self._title_font.render("Break — press Enter on the keyboard", True, (255, 255, 255))
+        title_rect = title.get_rect(center=(self._width/2, self._height/2 - 50))
+        self.screen.blit(title, title_rect)
+
+        subtitle = self._font.render(f"Break so far: {elapsed_seconds} s", True, (255, 255, 255))
+        subtitle_rect = subtitle.get_rect(center=(self._width/2, self._height/2 + 10))
+        self.screen.blit(subtitle, subtitle_rect)
+
+        instr = self._font.render("Switch fingers on the screen", True, (255, 255, 255))
+        instr_rect = instr.get_rect(center=(self._width/2, self._height/2 + 50))
+        self.screen.blit(instr, instr_rect)
 
     def _draw_end(self):
         # Draw end screen title
@@ -195,6 +216,9 @@ class PygameFrontEnd:
 
             case ExperimentState.PAUSE.value:
                 self._draw_pause(packet.stateData.pauseTime)
+
+            case ExperimentState.BREAK.value:
+                self._draw_break(packet.stateData.pauseTime)
 
             case ExperimentState.END.value:
                 self._draw_end()
