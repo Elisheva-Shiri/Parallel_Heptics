@@ -157,7 +157,8 @@ class Experiment:
         server_address: str = "localhost",
         frontend_port: int = PYGAME_PORT,
         backend_port: int = BACKEND_PORT,
-        hardware_port: int = HARDWARE_PORT
+        hardware_port: int = HARDWARE_PORT,
+        play_white_noise: bool = False,
     ):
         
         # SETUP
@@ -190,6 +191,7 @@ class Experiment:
         self._pair_finger: FingerName = pair_finger
         self._target_cycle_count = target_cycle_count
         self._hand_orientation = hand_orientation
+        self._play_white_noise = play_white_noise
 
         # Frame queues for recording
         self._top_frame_queue = Queue(maxsize=30)
@@ -304,7 +306,8 @@ class Experiment:
                     base_pinch_threshold=self.BASE_PINCH_THRESHOLD,
                     use_gpu=True
                 )
-            case _: raise NotImplementedError("Unknown CV type")  # Should never happen
+            case _:
+                raise NotImplementedError("Unknown CV type")  # Should never happen
 
         # * Initialization only until experiment loop begins
         # * Must run after self._vision is initialized
@@ -335,7 +338,8 @@ class Experiment:
                 self._hardware_thread.start()
             case MotorType.NONE:
                 ...  # No motor control needed
-            case _: raise NotImplementedError("Unknown motor type")  # Should never happen
+            case _:
+                raise NotImplementedError("Unknown motor type")  # Should never happen
 
         self._top_thread = threading.Thread(target=self.start_top_camera, daemon=True)
         self._top_thread.start()
@@ -713,6 +717,7 @@ class Experiment:
                 packet = ExperimentPacket(
                     stateData=StateData(state=self._state.value, pauseTime=pause_for_packet),
                     landmarks=finger_positions,
+                    playWhiteNoise=self._play_white_noise,
                     trackingObject=TrackingObject(
                         x=self._virtual_object.x / self._top_width,
                         z=self._virtual_object.y / self._top_height,
@@ -857,7 +862,7 @@ class Experiment:
                 try:
                     frame = self._side_frame_queue.get(timeout=1)
                     self._side_writer.write(frame)
-                except:
+                except Exception:
                     pass
 
     def start_top_camera(self):
@@ -883,7 +888,7 @@ class Experiment:
             if self._top_writer:
                 try:
                     self._top_frame_queue.put_nowait((frame, detected))
-                except:
+                except Exception:
                     pass
                 
             cv2.imshow("Top Camera", cv2.flip(frame, 1))
@@ -929,7 +934,7 @@ class Experiment:
             if self._side_writer:
                 try:
                     self._side_frame_queue.put_nowait(frame)
-                except:
+                except Exception:
                     pass
                 
             cv2.imshow("Side Camera", cv2.flip(frame, 1))
@@ -1007,7 +1012,8 @@ class Experiment:
                 self._hardware_socket.close()
             case MotorType.NONE:
                 ...  # No cleanup needed
-            case _: raise NotImplementedError("Unknown motor type")  # Should never happen
+            case _:
+                raise NotImplementedError("Unknown motor type")  # Should never happen
 
 def start_experiment(
     config: Configuration,
@@ -1020,6 +1026,7 @@ def start_experiment(
     tapping_enabled: bool,
     finger_colors: dict[str, str],
     side_camera_off: bool = False,
+    play_white_noise: bool = False,
 ):
     """Initialize and start the hand tracking system"""
     experiment = Experiment(
@@ -1033,6 +1040,7 @@ def start_experiment(
         tapping_enabled=tapping_enabled,
         finger_colors=finger_colors,
         side_camera_off=side_camera_off,
+        play_white_noise=play_white_noise,
     )
     
     return experiment
@@ -1066,7 +1074,7 @@ def get_vision_type() -> VisionType:
         default_marker = " (default)" if vt == VisionType.MEDIAPIPE else ""
         original_print(f"  {i + 1}. {vt.value}{default_marker}")
     while True:
-        user_input = input(f"Select vision type [1]: ").strip()
+        user_input = input("Select vision type [1]: ").strip()
         if user_input == "":
             return VisionType.MEDIAPIPE
         if user_input.isdigit() and 1 <= int(user_input) <= len(options):
@@ -1095,6 +1103,17 @@ def get_side_camera_off() -> bool:
         if user_input in ("", "y", "yes"):
             return False
         if user_input in ("n", "no"):
+            return True
+        original_print("Invalid input. Please enter Y or N.")
+
+
+def get_play_white_noise() -> bool:
+    """Ask whether the frontend should play white-noise masking. Default is no."""
+    while True:
+        user_input = input("Apply white noise? [y/N]: ").strip().lower()
+        if user_input in ("", "n", "no"):
+            return False
+        if user_input in ("y", "yes"):
             return True
         original_print("Invalid input. Please enter Y or N.")
 
@@ -1180,6 +1199,7 @@ def main():
         finger_colors = get_finger_colors(fingers_needed)
 
     side_camera_off = get_side_camera_off()
+    play_white_noise = get_play_white_noise()
     tapping_enabled = run_mode == "single_finger"
     hand_orientation = get_hand_orientation()
     target_cycle_count = get_target_cycle_count()
@@ -1188,7 +1208,7 @@ def main():
     experiment = start_experiment(
         config, path, run_mode, pair_finger, hand_orientation,
         target_cycle_count, vision_type, tapping_enabled, finger_colors,
-        side_camera_off,
+        side_camera_off, play_white_noise,
     )
     try:
         while True:
