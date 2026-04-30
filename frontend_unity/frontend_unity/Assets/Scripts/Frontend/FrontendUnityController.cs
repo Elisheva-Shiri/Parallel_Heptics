@@ -49,6 +49,10 @@ namespace ParallelHeptics.FrontendUnity
         [SerializeField] private float holdSeconds = 1.0f;
         [SerializeField] private bool showDebugStatus;
 
+        [Header("Audio masking")]
+        [SerializeField, Range(0f, 1f)] private float whiteNoiseVolume = 0.15f;
+        [SerializeField] private int whiteNoiseSampleRate = 44100;
+
         [Header("Tabletop calibration")]
         [SerializeField] private bool enableKeyboardCalibration = true;
         [SerializeField] private bool calibrationActive = true;
@@ -88,6 +92,10 @@ namespace ParallelHeptics.FrontendUnity
         private GameObject _xrOriginObject;
         private GameObject _cameraOffsetObject;
         private XROrigin _xrOrigin;
+        private AudioSource _whiteNoiseSource;
+        private AudioClip _whiteNoiseClip;
+        private uint _whiteNoiseState = 0x1234ABCDu;
+        private bool _whiteNoiseEnabled;
 #if ENABLE_INPUT_SYSTEM
         private TrackedPoseDriver _trackedPoseDriver;
         private InputAction _hmdPositionAction;
@@ -162,6 +170,15 @@ namespace ParallelHeptics.FrontendUnity
             {
                 DestroyRuntimeObject(_xrOriginObject);
             }
+            if (_whiteNoiseSource != null)
+            {
+                _whiteNoiseSource.Stop();
+            }
+            if (_whiteNoiseClip != null)
+            {
+                DestroyRuntimeObject(_whiteNoiseClip);
+                _whiteNoiseClip = null;
+            }
 #if ENABLE_INPUT_SYSTEM
             DisposeAction(ref _hmdPositionAction);
             DisposeAction(ref _hmdRotationAction);
@@ -181,6 +198,72 @@ namespace ParallelHeptics.FrontendUnity
             action = null;
         }
 #endif
+
+        private void SetWhiteNoiseEnabled(bool enabled)
+        {
+            if (enabled == _whiteNoiseEnabled)
+            {
+                return;
+            }
+
+            _whiteNoiseEnabled = enabled;
+            if (enabled)
+            {
+                EnsureWhiteNoiseAudio();
+                _whiteNoiseSource.Play();
+            }
+            else if (_whiteNoiseSource != null)
+            {
+                _whiteNoiseSource.Stop();
+            }
+        }
+
+        private void EnsureWhiteNoiseAudio()
+        {
+            if (_whiteNoiseClip == null)
+            {
+                int sampleRate = Mathf.Clamp(whiteNoiseSampleRate, 8000, 96000);
+                whiteNoiseVolume = Mathf.Clamp01(whiteNoiseVolume);
+                _whiteNoiseState = 0x1234ABCDu;
+                _whiteNoiseClip = AudioClip.Create(
+                    "Procedural White Noise",
+                    sampleRate,
+                    1,
+                    sampleRate,
+                    true,
+                    OnWhiteNoiseRead);
+            }
+
+            _whiteNoiseSource = GetComponent<AudioSource>() ?? gameObject.AddComponent<AudioSource>();
+            _whiteNoiseSource.playOnAwake = false;
+            _whiteNoiseSource.loop = true;
+            _whiteNoiseSource.spatialBlend = 0f;
+            _whiteNoiseSource.volume = 1f;
+            _whiteNoiseSource.clip = _whiteNoiseClip;
+        }
+
+        private void OnWhiteNoiseRead(float[] data)
+        {
+            float volume = whiteNoiseVolume;
+            if (volume < 0f)
+            {
+                volume = 0f;
+            }
+            else if (volume > 1f)
+            {
+                volume = 1f;
+            }
+
+            for (int i = 0; i < data.Length; i++)
+            {
+                unchecked
+                {
+                    _whiteNoiseState = (_whiteNoiseState * 1664525u) + 1013904223u;
+                }
+
+                data[i] = (((_whiteNoiseState >> 8) / 8388607.5f) - 1f) * volume;
+            }
+        }
 
         private void Update()
         {
@@ -217,6 +300,7 @@ namespace ParallelHeptics.FrontendUnity
 
         private void RenderPacket(ExperimentPacket packet)
         {
+            SetWhiteNoiseEnabled(packet.playWhiteNoise);
             ExperimentState state = (ExperimentState)packet.stateData.state;
             SetStateVisibility(state);
             RenderFingers(packet.landmarks);

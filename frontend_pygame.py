@@ -1,13 +1,91 @@
 import pygame
+import random
 import socket
+import sys
+from array import array
 from consts import BACKEND_PORT, TOP_HEIGHT, PYGAME_PORT, FRONTEND_FPS, TOP_WIDTH
 from structures import ExperimentControl, ExperimentPacket, ExperimentState, FingerPosition, QuestionInput, TrackingObject
 
 FIRST_COLOR = (255, 165, 0)  # Orange
 SECOND_COLOR = (0, 0, 255)  # Blue
+WHITE_NOISE_SAMPLE_RATE = 44_100
+WHITE_NOISE_SECONDS = 2.0
+WHITE_NOISE_VOLUME = 0.15
+
+
+def _make_white_noise_buffer(
+    sample_rate: int = WHITE_NOISE_SAMPLE_RATE,
+    seconds: float = WHITE_NOISE_SECONDS,
+    amplitude: float = WHITE_NOISE_VOLUME,
+    seed: int | None = None,
+) -> bytes:
+    """Generate little-endian signed 16-bit mono white-noise PCM."""
+    sample_count = max(1, int(sample_rate * seconds))
+    peak = max(0, min(32767, int(32767 * amplitude)))
+    rng = random.Random(seed)
+    samples = array("h", (rng.randint(-peak, peak) for _ in range(sample_count)))
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples.tobytes()
+
+
+class _WhiteNoiseLoop:
+    """Best-effort looping white noise for the pygame/computer frontend."""
+
+    def __init__(self, enabled: bool = False, volume: float = WHITE_NOISE_VOLUME):
+        self._enabled = enabled
+        self._volume = max(0.0, min(1.0, volume))
+        self._sound: pygame.mixer.Sound | None = None
+        self._channel: pygame.mixer.Channel | None = None
+
+    def pre_init_mixer(self) -> None:
+        pygame.mixer.pre_init(WHITE_NOISE_SAMPLE_RATE, -16, 1, 2048)
+
+    def start(self) -> None:
+        if not self._enabled or self._channel is not None:
+            return
+        try:
+            if pygame.mixer.get_init() is None:
+                pygame.mixer.init(WHITE_NOISE_SAMPLE_RATE, -16, 1, 2048)
+            self._sound = pygame.mixer.Sound(
+                buffer=_make_white_noise_buffer(amplitude=0.8, seed=0)
+            )
+            self._sound.set_volume(self._volume)
+            self._channel = self._sound.play(loops=-1)
+        except pygame.error as ex:
+            # Keep the experiment usable on machines without an audio device.
+            print(f"White noise disabled: {ex}")
+            self._enabled = False
+            self._sound = None
+            self._channel = None
+
+    def set_enabled(self, enabled: bool) -> None:
+        if enabled == self._enabled:
+            return
+        self._enabled = enabled
+        if enabled:
+            self.pre_init_mixer()
+            self.start()
+        else:
+            self.stop()
+
+    def stop(self) -> None:
+        if self._channel is not None:
+            self._channel.stop()
+            self._channel = None
+        self._sound = None
+
 
 class PygameFrontEnd:
-    def __init__(self, width: int = TOP_WIDTH, height: int = TOP_HEIGHT, server_address: str ="localhost", frontend_port: int = PYGAME_PORT, backend_port: int = BACKEND_PORT):
+    def __init__(
+        self,
+        width: int = TOP_WIDTH,
+        height: int = TOP_HEIGHT,
+        server_address: str = "localhost",
+        frontend_port: int = PYGAME_PORT,
+        backend_port: int = BACKEND_PORT,
+        white_noise_volume: float = WHITE_NOISE_VOLUME,
+    ):
         self._width = width
         self._height = height
         self._server_address=server_address
@@ -21,6 +99,7 @@ class PygameFrontEnd:
         self._right_button_timer = 0
         self._right_button_sent: bool = False
         self._button_hold_time = FRONTEND_FPS  # 1 second worth of frames (2x faster fill)
+        self._white_noise = _WhiteNoiseLoop(enabled=False, volume=white_noise_volume)
 
         # Initialize socket to receive backend information
         self._data_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -31,12 +110,14 @@ class PygameFrontEnd:
         self._input_socket.connect((server_address, backend_port))
         
         # Initialize pygame for visualization and keyboard input
+        self._white_noise.pre_init_mixer()
         pygame.init()
         pygame.font.init()
         self._font = pygame.font.SysFont('Arial', 30)
         self._title_font = pygame.font.SysFont('Arial', 40)
         self.screen = pygame.display.set_mode((self._width, self._height))
         pygame.display.set_caption("Hand Tracking Visualization")
+        self._white_noise.start()
 
     
     def start(self):
@@ -193,6 +274,7 @@ class PygameFrontEnd:
         data, _ = self._data_socket.recvfrom(4096) # ? Is this enough for all the data?
         # Parse the network data into ExperimentPacket structure
         packet = ExperimentPacket.model_validate_json(data)
+        self._white_noise.set_enabled(packet.playWhiteNoise)
         
         # Draw all fingers as circles
         for finger_position in packet.landmarks:
@@ -228,10 +310,12 @@ class PygameFrontEnd:
             #         self.toggle_pinch()
             case pygame.QUIT:
                 self._running = False
+                self._white_noise.stop()
                 pygame.quit()
                 return False
         return True
-    
+
+
 if __name__ == "__main__":
     frontend = PygameFrontEnd()
     frontend.start()    

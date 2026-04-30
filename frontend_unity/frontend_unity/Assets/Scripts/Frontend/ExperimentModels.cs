@@ -53,6 +53,7 @@ namespace ParallelHeptics.FrontendUnity
         public StateData stateData;
         public List<FingerPosition> landmarks;
         public TrackingObject trackingObject;
+        public bool playWhiteNoise;
     }
 
     [Serializable]

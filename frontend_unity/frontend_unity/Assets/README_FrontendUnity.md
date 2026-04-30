@@ -4,7 +4,7 @@ Efficient Unity PCVR frontend for the Parallel Heptics backend.
 
 ## Switching between pygame and Unity
 
-The Python backend is unchanged. Both pygame and Unity use the same protocol:
+Both pygame and Unity use the same backend protocol:
 
 - UDP `ExperimentPacket` from backend to frontend on port `12346`
 - TCP `ExperimentControl` from frontend to backend on port `12344`
@@ -15,6 +15,13 @@ Run exactly one frontend at a time:
 2. Unity: open this project, open `Assets/Scenes/FrontendUnity.unity`, press Play, and use Quest Link for PCVR.
 
 Unity listens on the pygame port (`12346`) by default so it can replace pygame without a backend architecture change.
+
+Both frontends can play a low-volume looping white-noise mask, but the baseline/default is no white noise:
+
+- When starting `backend.py`, answer `y` to `Apply white noise? [y/N]:` to enable it for the active frontend.
+- Press Enter or answer `n` to keep the default no-noise baseline.
+- Pygame plays the mask through the computer audio device.
+- Unity generates the mask procedurally in the Unity scene, so PCVR/headset audio follows Unity's output device.
 
 ## Unity frontend design
 

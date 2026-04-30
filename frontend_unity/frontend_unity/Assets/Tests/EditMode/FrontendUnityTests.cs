@@ -16,7 +16,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
         [Test]
         public void ExperimentPacketJsonMatchesBackendShape()
         {
-            const string json = "{\"stateData\":{\"state\":1,\"pauseTime\":0},\"landmarks\":[{\"x\":0.25,\"z\":0.75}],\"trackingObject\":{\"x\":0.5,\"z\":0.4,\"size\":40.0,\"isPinched\":true,\"progress\":0.25,\"returnProgress\":0.5,\"cycleCount\":1,\"targetCycleCount\":2,\"pairIndex\":0}}";
+            const string json = "{\"stateData\":{\"state\":1,\"pauseTime\":0},\"landmarks\":[{\"x\":0.25,\"z\":0.75}],\"trackingObject\":{\"x\":0.5,\"z\":0.4,\"size\":40.0,\"isPinched\":true,\"progress\":0.25,\"returnProgress\":0.5,\"cycleCount\":1,\"targetCycleCount\":2,\"pairIndex\":0},\"playWhiteNoise\":true}";
 
             ExperimentPacket packet = JsonUtility.FromJson<ExperimentPacket>(json);
 
@@ -26,6 +26,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
             Assert.AreEqual(0.25f, packet.landmarks[0].x, 0.0001f);
             Assert.IsTrue(packet.trackingObject.isPinched);
             Assert.AreEqual(0.5f, packet.trackingObject.returnProgress, 0.0001f);
+            Assert.IsTrue(packet.playWhiteNoise);
         }
 
         [Test]
@@ -103,6 +104,9 @@ namespace ParallelHeptics.FrontendUnity.Tests
             Assert.AreEqual(0.1f, serialized.FindProperty("fingerDiameter").floatValue, 0.0001f);
             Assert.IsTrue(serialized.FindProperty("enableKeyboardCalibration").boolValue);
             Assert.IsTrue(serialized.FindProperty("calibrationActive").boolValue);
+            Assert.IsNull(serialized.FindProperty("playWhiteNoise"));
+            Assert.AreEqual(0.15f, serialized.FindProperty("whiteNoiseVolume").floatValue, 0.0001f);
+            Assert.AreEqual(44100, serialized.FindProperty("whiteNoiseSampleRate").intValue);
         }
 
         [Test]
