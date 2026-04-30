@@ -88,10 +88,6 @@ class PygameFrontEnd:
         counter_text = self._font.render(f"{tracking_obj.cycleCount}/{tracking_obj.targetCycleCount}", True, (255, 255, 255))
         self.screen.blit(counter_text, (self._width - 50, 40))
 
-        hint = self._font.render("Switch fingers on the screen", True, (255, 255, 255))
-        hint_rect = hint.get_rect(center=(self._width / 2, self._height - 36))
-        self.screen.blit(hint, hint_rect)
-
     def _draw_question(self, landmarks: list[FingerPosition]) -> None:
         # Draw title
         title = self._title_font.render("Which object is stiffer?", True, (255, 255, 255))
@@ -165,10 +161,6 @@ class PygameFrontEnd:
         subtitle = self._font.render(f"{pause_time} seconds left before moving to the next test...", True, (255, 255, 255))
         subtitle_rect = subtitle.get_rect(center=(self._width/2, self._height/2 + 10))
         self.screen.blit(subtitle, subtitle_rect)
-
-        instr = self._font.render("Switch fingers on the screen", True, (255, 255, 255))
-        instr_rect = instr.get_rect(center=(self._width/2, self._height/2 + 50))
-        self.screen.blit(instr, instr_rect)
 
     def _draw_break(self, elapsed_seconds: int):
         title = self._title_font.render("Break — press Enter on the keyboard", True, (255, 255, 255))
