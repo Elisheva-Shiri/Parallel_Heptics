@@ -6,12 +6,13 @@ import math
 from time import sleep
 import cv2
 import threading
+import sys
 from typing import Literal, Optional
 from threading import Lock
 import numpy as np
 import socket
 from pydantic import BaseModel
-from structures import ExperimentControl, ExperimentState, FingerPosition, StateData, TrackingObject, ExperimentPacket
+from structures import ExperimentControl, ExperimentState, FingerPosition, QuestionInput, StateData, TrackingObject, ExperimentPacket
 from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, FINGER_NAMES, FingerName, CENTER_THRESHOLD, EDGE_THRESHOLD, TAPPING_HEIGHT_RATIO, STIFFNESS_MAX
 import queue
 from queue import Queue
@@ -19,6 +20,11 @@ from enum import StrEnum
 from vision import ColorVision, HandPosition, MediapipeVision, YoloVision
 from motor_controller import FingerId, HandOrientation, MovementStrategy, MotorController
 from haptic_mapping import map_object_displacement_to_tactor
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 DEBUG_POSITION = 1000
 DEBUG_SINGLE_MOTOR = False
@@ -232,8 +238,8 @@ class Experiment:
         self._running = True
 
         # Camera indices
-        self.TOP_CAMERA = 1
-        self.SIDE_CAMERA = 0
+        self.TOP_CAMERA = 0
+        self.SIDE_CAMERA = 1
         
         # Video writers
         self._top_writer = None
@@ -453,6 +459,57 @@ class Experiment:
             self._update_virtual_object(stiffness_value, pair_index)
             self._sleep_virtual_object()
 
+    def _is_backend_terminal_enter_pressed(self) -> bool:
+        """Return True when Enter is pressed in the backend terminal."""
+        if msvcrt is None or sys.stdin is None or not sys.stdin.isatty():
+            return False
+
+        try:
+            if not msvcrt.kbhit():
+                return False
+
+            key = msvcrt.getwch()
+            if key in ("\x00", "\xe0"):
+                # Extended-key prefix (arrows, function keys). Consume the
+                # following scan-code char so it is not seen as another key.
+                if msvcrt.kbhit():
+                    msvcrt.getwch()
+                return False
+
+            return key in ("\r", "\n")
+        except Exception:
+            return False
+
+    def _is_enter_pressed(self) -> bool:
+        """Best-effort fallback for continuing a break without frontend support."""
+        if self._is_backend_terminal_enter_pressed():
+            return True
+
+        try:
+            return keyboard.is_pressed("enter")
+        except Exception:
+            return False
+
+    def _wait_for_break_continue(self) -> bool:
+        """Wait for Enter in the backend terminal or local keyboard hook."""
+        while self._running:
+            if self._is_enter_pressed():
+                return True
+            sleep(0.05)
+        return False
+
+    def _wait_for_question_answer(self) -> ExperimentControl:
+        """Wait until the frontend sends a valid left/right question answer."""
+        valid_answers = {QuestionInput.LEFT.value, QuestionInput.RIGHT.value}
+        while self._running:
+            answer_data = self._control_socket.recv(1024)
+            answer = ExperimentControl.model_validate_json(answer_data)
+            if answer.questionInput in valid_answers:
+                return answer
+            print(f"Ignoring non-answer control message during question: {answer}")
+
+        raise RuntimeError("Experiment stopped before question answer was received")
+
     def _experiment_loop(self):
 
         for pair in self._config.pairs:
@@ -481,7 +538,7 @@ class Experiment:
                 break_started_at = datetime.now()
                 self._break_started_at = break_started_at
                 self._pause_time = 0
-                keyboard.wait("enter")
+                self._wait_for_break_continue()
                 break_duration = (datetime.now() - break_started_at).total_seconds()
                 self._break_started_at = None
                 self._pause_time = 0
@@ -529,8 +586,7 @@ class Experiment:
                 print("Question")
                 question_timestamp = datetime.now()
                 self._state = ExperimentState.QUESTION
-                answer_data = self._control_socket.recv(1024)
-                answer = ExperimentControl.model_validate_json(answer_data)
+                answer = self._wait_for_question_answer()
 
                 answers_file = self._path / 'answers.csv'
 
