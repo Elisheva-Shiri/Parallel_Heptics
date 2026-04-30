@@ -224,8 +224,6 @@ namespace ParallelHeptics.FrontendUnity
             switch (state)
             {
                 case ExperimentState.Comparison:
-                    _titleText.text = "Switch fingers on the screen";
-                    _subtitleText.text = string.Empty;
                     RenderComparison(packet.trackingObject);
                     _holdSelector.Reset();
                     break;
@@ -235,7 +233,7 @@ namespace ParallelHeptics.FrontendUnity
                 case ExperimentState.Pause:
                     _holdSelector.Reset();
                     _titleText.text = "Take a break!";
-                    _subtitleText.text = $"{packet.stateData.pauseTime} seconds left before moving to the next test...\nSwitch fingers on the screen";
+                    _subtitleText.text = $"{packet.stateData.pauseTime} seconds left before moving to the next test...";
                     break;
                 case ExperimentState.Break:
                     _holdSelector.Reset();
