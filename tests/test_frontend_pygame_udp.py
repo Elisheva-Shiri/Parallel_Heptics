@@ -1,4 +1,4 @@
-from frontend_pygame import _recv_latest_datagram
+from frontend_pygame import _recv_latest_datagram, _should_show_cycle_counter
 
 
 class FakeUdpSocket:
@@ -38,3 +38,11 @@ def test_recv_latest_datagram_preserves_existing_timeout():
 
     assert _recv_latest_datagram(fake_socket, 4096) == b"only"
     assert fake_socket.timeout_values == [0.25]
+
+
+def test_cycle_counter_hidden_for_single_iteration():
+    assert not _should_show_cycle_counter(1)
+
+
+def test_cycle_counter_shown_for_multiple_iterations():
+    assert _should_show_cycle_counter(2)

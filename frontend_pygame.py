@@ -16,6 +16,10 @@ AMBIENT_NOISE_RAW_MIX = 0.16
 OUTBOUND_CUE_RADIUS = 215
 
 
+def _should_show_cycle_counter(target_cycle_count: int) -> bool:
+    return target_cycle_count > 1
+
+
 def _recv_latest_datagram(data_socket: socket.socket, max_bytes: int) -> bytes:
     """Receive one datagram, then discard queued stale datagrams.
 
@@ -219,9 +223,10 @@ class PygameFrontEnd:
             else:
                 pygame.draw.circle(self.screen, (144, 238, 144), center, OUTBOUND_CUE_RADIUS, 4)
             
-        # Draw movement counter
-        counter_text = self._font.render(f"{tracking_obj.cycleCount}/{tracking_obj.targetCycleCount}", True, (255, 255, 255))
-        self.screen.blit(counter_text, (self._width - 50, 40))
+        # Draw movement counter only when multiple iterations are possible.
+        if _should_show_cycle_counter(tracking_obj.targetCycleCount):
+            counter_text = self._font.render(f"{tracking_obj.cycleCount}/{tracking_obj.targetCycleCount}", True, (255, 255, 255))
+            self.screen.blit(counter_text, (self._width - 50, 40))
 
     def _draw_question(self, landmarks: list[FingerPosition]) -> None:
         # Draw title

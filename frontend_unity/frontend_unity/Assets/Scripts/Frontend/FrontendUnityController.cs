@@ -448,7 +448,14 @@ namespace ParallelHeptics.FrontendUnity
             _progressBackground.transform.localScale = new Vector3(barWidth, barHeight, 1f);
             SetProgressBarHalf(_outboundProgress, Mathf.Clamp01(trackingObject.progress), leftHalf: true, halfWidth, barHeight);
             SetProgressBarHalf(_returnProgress, Mathf.Clamp01(trackingObject.returnProgress), leftHalf: false, halfWidth, barHeight);
-            _counterText.text = $"{trackingObject.cycleCount}/{trackingObject.targetCycleCount}";
+            bool showCounter = ShouldShowCycleCounter(trackingObject.targetCycleCount);
+            _counterText.gameObject.SetActive(showCounter);
+            _counterText.text = showCounter ? $"{trackingObject.cycleCount}/{trackingObject.targetCycleCount}" : string.Empty;
+        }
+
+        private static bool ShouldShowCycleCounter(int targetCycleCount)
+        {
+            return targetCycleCount > 1;
         }
 
         private void RenderQuestion(List<FingerPosition> landmarks)
