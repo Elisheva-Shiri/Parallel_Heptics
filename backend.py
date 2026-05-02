@@ -1175,51 +1175,63 @@ class Experiment:
     def _record_top_frames(self):
         """Thread for recording frames from top camera"""
         while self._running:
-            if self._top_writer:
-                try:
-                    data: tuple[np.ndarray, HandPosition] = self._top_frame_queue.get(timeout=1)
-                    frame, hand_position = data
-                    self._top_writer.write(frame)
-                    
-                    # Write hand position data to CSV
-                    pair_path = self._get_pair_path()
-                    tracking_file = pair_path / 'tracking.csv'
+            # Idle while not recording (e.g. Question/Pause/Break). Without
+            # this sleep the loop becomes a CPU busy-spin that holds the GIL,
+            # which starves _frontend_network_loop and stutters the frontend.
+            if not self._top_writer:
+                sleep(0.05)
+                continue
+            try:
+                data: tuple[np.ndarray, HandPosition] = self._top_frame_queue.get(timeout=1)
+                frame, hand_position = data
+                self._top_writer.write(frame)
 
-                    position_dict = hand_position.model_dump()
-                    
-                    # Create CSV with headers if it doesn't exist
-                    if not tracking_file.exists():
-                        headers = ['timestamp', 'interacting', 'stiffness', 'object_x', 'object_y', 'finger', *list(position_dict.keys())]
-                        with open(tracking_file, 'w', newline='') as f:
-                            writer = csv.writer(f)
-                            writer.writerow(headers)
-                    
-                    # Append position data
-                    with open(tracking_file, 'a', newline='') as f:
+                # Write hand position data to CSV
+                pair_path = self._get_pair_path()
+                tracking_file = pair_path / 'tracking.csv'
+
+                position_dict = hand_position.model_dump()
+
+                # Create CSV with headers if it doesn't exist
+                if not tracking_file.exists():
+                    headers = ['timestamp', 'interacting', 'stiffness', 'object_x', 'object_y', 'finger', *list(position_dict.keys())]
+                    with open(tracking_file, 'w', newline='') as f:
                         writer = csv.writer(f)
-                        row_data = [
-                            datetime.now().isoformat(),
-                            self._is_interacting,
-                            self._virtual_object.stiffness_value,
-                            self._virtual_object.x,
-                            self._virtual_object.y,
-                            self._active_finger,
-                            *list(position_dict.values())
-                        ]
-                        writer.writerow(row_data)
-                        
-                except Exception as e:
-                    print(e)
+                        writer.writerow(headers)
+
+                # Append position data
+                with open(tracking_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    row_data = [
+                        datetime.now().isoformat(),
+                        self._is_interacting,
+                        self._virtual_object.stiffness_value,
+                        self._virtual_object.x,
+                        self._virtual_object.y,
+                        self._active_finger,
+                        *list(position_dict.values())
+                    ]
+                    writer.writerow(row_data)
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(e)
 
     def _record_side_frames(self):
         """Thread for recording frames from side camera"""
         while self._running:
-            if self._side_writer:
-                try:
-                    frame = self._side_frame_queue.get(timeout=1)
-                    self._side_writer.write(frame)
-                except Exception:
-                    pass
+            # Idle while not recording — see _record_top_frames for rationale.
+            if not self._side_writer:
+                sleep(0.05)
+                continue
+            try:
+                frame = self._side_frame_queue.get(timeout=1)
+                self._side_writer.write(frame)
+            except queue.Empty:
+                continue
+            except Exception:
+                pass
 
     def start_top_camera(self):
         """Process top camera feed to track finger positions"""
