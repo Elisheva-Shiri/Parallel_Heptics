@@ -72,9 +72,7 @@ class ColorVision(BaseVision):
 
     def detect_hand(self, frame: np.ndarray) -> HandPosition:
         tracked_objs, _ = self._top_detector.update(frame)  # 2nd arg is visualization frame, not used
-        if tracked_objs:
-            print(tracked_objs)
-        
+
         # Get positions for all fingers
         thumb = tracked_objs.get(self._thumb_color, None)
         active_finger = tracked_objs.get(self._active_finger_color, None)

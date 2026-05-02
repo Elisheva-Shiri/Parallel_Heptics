@@ -93,8 +93,8 @@ class ColorDetector:
 class FrameTracker:
     """Frame-based tracking using color detection and velocity calculation."""
     
-    def __init__(self, fps: float):
-        self.detector = ColorDetector()
+    def __init__(self, fps: float, min_contour_area: int = 100):
+        self.detector = ColorDetector(min_contour_area=min_contour_area)
         self.fps = fps
         self.dt = 1.0 / fps
         self.tracked_objects: Dict[str, TrackedObject] = {}
@@ -381,7 +381,7 @@ class Detector:
         
         # Initialize the appropriate tracker
         if tracking_method == "frame":
-            self.tracker = FrameTracker(fps)
+            self.tracker = FrameTracker(fps, min_contour_area)
         elif tracking_method == "optical_flow":
             self.tracker = OpticalFlowTracker(fps, use_gpu)
         else:
