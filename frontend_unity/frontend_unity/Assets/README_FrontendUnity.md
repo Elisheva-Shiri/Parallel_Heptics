@@ -23,6 +23,21 @@ Both frontends can play a low-volume looping white-noise mask, but the baseline/
 - Pygame plays the mask through the computer audio device.
 - Unity generates the mask procedurally in the Unity scene, so PCVR/headset audio follows Unity's output device.
 
+## Moderator controls
+
+Unity renders experiment state but does not own moderator keyboard shortcuts.
+Use the Python moderator utility from the repository root:
+
+```bash
+uv run moderator_control.py --toggle-interaction   # or --toggle_interaction / -i; manual interaction mode
+uv run moderator_control.py --toggle-break   # or -b, finishes a configured break
+uv run moderator_control.py --pause          # or -p, run again to resume
+```
+
+The `--pause` command is an unscheduled moderator pause. The backend pauses
+experiment progression, disables active interaction/haptics while paused, and logs
+start/finish/duration to `moderator_pauses.csv`.
+
 ## Unity frontend design
 
 - Receives UDP on a background thread.

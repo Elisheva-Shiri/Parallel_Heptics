@@ -16,7 +16,7 @@ class YoloVision(BaseVision):
         self,
         width: int,
         height: int,
-        base_pinch_threshold: float,
+        base_interaction_threshold: float,
         model_path: Path = Path(__file__).parent / "model" / "best.pt"
     ):
         self._width = width
@@ -24,7 +24,7 @@ class YoloVision(BaseVision):
         self.top_model = YOLO(model_path)
         self.side_model = YOLO(model_path)
         self._active_finger_tip = INDEX_TIP
-        self.base_pinch_threshold = base_pinch_threshold
+        self.base_interaction_threshold = base_interaction_threshold
 
     def set_active_finger(self, finger: str):
         self._active_finger_tip = {
@@ -79,7 +79,7 @@ class YoloVision(BaseVision):
             active_finger_y=keypoints[self._active_finger_tip][1]
         )
 
-    def detect_pinch(
+    def detect_interaction(
         self, 
         frame: np.ndarray,
         top_position: HandPosition,
@@ -88,7 +88,7 @@ class YoloVision(BaseVision):
         max_depth: float = 1.0
     ) -> bool:
         """
-        Process side camera frame to detect pinch gesture with depth-adjusted threshold
+        Process side camera frame to detect interaction gesture with depth-adjusted threshold
         
         Args:
             frame: Input frame from side camera
@@ -139,6 +139,6 @@ class YoloVision(BaseVision):
         # When close (low depth): larger threshold (fingers appear further apart)
         # When far (high depth): smaller threshold (fingers appear closer together)
         depth_scale = (max_depth - normalized_depth + min_depth) / max_depth
-        adjusted_threshold = self.base_pinch_threshold * depth_scale
+        adjusted_threshold = self.base_interaction_threshold * depth_scale
         
         return distance < adjusted_threshold

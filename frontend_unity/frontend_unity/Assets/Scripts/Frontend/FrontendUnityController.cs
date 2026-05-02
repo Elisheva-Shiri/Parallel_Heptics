@@ -373,8 +373,13 @@ namespace ParallelHeptics.FrontendUnity
                     break;
                 case ExperimentState.Break:
                     _holdSelector.Reset();
-                    _titleText.text = "Break — press Enter on the keyboard";
+                    _titleText.text = "Break";
                     _subtitleText.text = $"Break so far: {packet.stateData.pauseTime} s\nSwitch fingers on the screen";
+                    break;
+                case ExperimentState.ModeratorPause:
+                    _holdSelector.Reset();
+                    _titleText.text = "Pause";
+                    _subtitleText.text = $"Paused for: {packet.stateData.pauseTime}";
                     break;
                 case ExperimentState.End:
                     _holdSelector.Reset();
@@ -428,10 +433,10 @@ namespace ParallelHeptics.FrontendUnity
             _trackingObject.transform.localPosition = mapper.NormalizedToLocal(trackingObject.x, trackingObject.z, ForegroundOffset);
             Vector2 objectSize = mapper.PixelsToPanelSize(trackingObject.size, trackingObject.size);
             _trackingObject.transform.localScale = new Vector3(objectSize.x, objectSize.y, 0.006f);
-            Color color = trackingObject.isPinched ? (trackingObject.pairIndex == 0 ? FirstColor : SecondColor) : GrayColor;
+            Color color = trackingObject.isInteracting ? (trackingObject.pairIndex == 0 ? FirstColor : SecondColor) : GrayColor;
             SetMaterial(_trackingObject, color);
 
-            bool showCue = trackingObject.isPinched;
+            bool showCue = trackingObject.isInteracting;
             bool returnCueActive = showCue && ShouldShowReturnCue(trackingObject);
             SetOutboundCueCircle(visible: showCue && !returnCueActive);
             _returnCuePoint.SetActive(returnCueActive);
@@ -501,7 +506,7 @@ namespace ParallelHeptics.FrontendUnity
             _lastState = state;
             bool comparison = state == ExperimentState.Comparison;
             bool question = state == ExperimentState.Question;
-            bool message = state == ExperimentState.Pause || state == ExperimentState.Break || state == ExperimentState.End || question;
+            bool message = state == ExperimentState.Pause || state == ExperimentState.Break || state == ExperimentState.ModeratorPause || state == ExperimentState.End || question;
 
             _trackingObject.SetActive(comparison);
             _outboundCueCircle.SetActive(false);

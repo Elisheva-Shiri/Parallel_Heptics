@@ -10,6 +10,7 @@ namespace ParallelHeptics.FrontendUnity
         Question = 2,
         Pause = 3,
         Break = 4,
+        ModeratorPause = 5,
         End = -1
     }
 
@@ -32,7 +33,7 @@ namespace ParallelHeptics.FrontendUnity
         public float x;
         public float z;
         public float size;
-        public bool isPinched;
+        public bool isInteracting;
         public float progress;
         public float returnProgress;
         public int cycleCount;

@@ -12,7 +12,7 @@ class ColorVision(BaseVision):
         top_height: int,
         side_width: int,
         side_height: int,
-        base_pinch_threshold: float,
+        base_interaction_threshold: float,
         tracking_method: str = "frame",
         fps: float = 30.0,
         use_gpu: bool = False,
@@ -23,16 +23,25 @@ class ColorVision(BaseVision):
         self._top_height = top_height
         self._side_width = side_width
         self._side_height = side_height
-        self.base_pinch_threshold = base_pinch_threshold
+        self.base_interaction_threshold = base_interaction_threshold
 
-        self._thumb_color = self._finger_colors.get("thumb", "")
-        self._active_finger_color = next(
-            (c for f, c in self._finger_colors.items() if f != "thumb"), ""
-        )
+        # Single-finger mode: one color is used regardless of which finger the
+        # protocol marks active. The synthetic "single" key signals this.
+        self._single_color: str | None = self._finger_colors.get("single")
+        if self._single_color is not None:
+            self._thumb_color = ""
+            self._active_finger_color = self._single_color
+        else:
+            self._thumb_color = self._finger_colors.get("thumb", "")
+            self._active_finger_color = next(
+                (c for f, c in self._finger_colors.items() if f != "thumb"), ""
+            )
         self._top_detector = Detector(tracking_method, fps, use_gpu, min_contour_area)
         self._side_detector = Detector(tracking_method, fps, use_gpu, min_contour_area)
-    
+
     def set_active_finger(self, finger: str):
+        if self._single_color is not None:
+            return
         self._active_finger_color = self._finger_colors[finger]
 
     def _get_hand_pos(
@@ -77,7 +86,7 @@ class ColorVision(BaseVision):
         active_finger = tracked_objs.get(self._active_finger_color, None)
         return self._get_hand_pos(thumb, active_finger, "side")
 
-    def detect_pinch(
+    def detect_interaction(
         self, 
         frame: np.ndarray, 
         top_position: HandPosition,
@@ -86,7 +95,7 @@ class ColorVision(BaseVision):
         max_depth: float = 1.0   # Maximum normalized depth (furthest from camera)
     ) -> bool:
         """
-        Process side camera frame to detect pinch gesture with depth-adjusted threshold
+        Process side camera frame to detect interaction gesture with depth-adjusted threshold
         
         Args:
             frame: Input frame from side camera
@@ -138,7 +147,7 @@ class ColorVision(BaseVision):
             # When close (low depth): larger threshold (fingers appear further apart)
             # When far (high depth): smaller threshold (fingers appear closer together)
             depth_scale = (max_depth - normalized_depth + min_depth) / max_depth
-            adjusted_threshold = self.base_pinch_threshold * depth_scale
+            adjusted_threshold = self.base_interaction_threshold * depth_scale
             
             return distance < adjusted_threshold
         else:

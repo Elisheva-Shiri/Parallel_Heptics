@@ -16,7 +16,7 @@ class MediapipeVision(BaseVision):
         max_num_hands: int,
         min_detection_confidence: float,
         min_tracking_confidence: float,
-        base_pinch_threshold: float
+        base_interaction_threshold: float
     ):
         self._top_width = top_width
         self._top_height = top_height
@@ -26,7 +26,7 @@ class MediapipeVision(BaseVision):
         self._max_num_hands = max_num_hands
         self._min_detection_confidence = min_detection_confidence
         self._min_tracking_confidence = min_tracking_confidence
-        self._base_pinch_threshold = base_pinch_threshold
+        self._base_interaction_threshold = base_interaction_threshold
         # Initialize active finger to index
         self._active_finger_landmark = mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP
 
@@ -97,7 +97,7 @@ class MediapipeVision(BaseVision):
 
         return HandPosition(thumb_x=0.0, thumb_y=0.0, active_finger_x=0.0, active_finger_y=0.0)
 
-    def detect_pinch(
+    def detect_interaction(
         self, 
         frame: np.ndarray,
         top_position: HandPosition,
@@ -106,7 +106,7 @@ class MediapipeVision(BaseVision):
         max_depth: float = 1.0
     ) -> bool:
         """
-        Process side camera frame to detect pinch gesture with depth-adjusted threshold
+        Process side camera frame to detect interaction gesture with depth-adjusted threshold
         
         Args:
             frame: Input frame from side camera
@@ -168,7 +168,7 @@ class MediapipeVision(BaseVision):
             # When close (low depth): larger threshold (fingers appear further apart)
             # When far (high depth): smaller threshold (fingers appear closer together)
             depth_scale = (max_depth - normalized_depth + min_depth) / max_depth
-            adjusted_threshold = self._base_pinch_threshold * depth_scale
+            adjusted_threshold = self._base_interaction_threshold * depth_scale
 
             # print all side_position and distance
             print("=====================================")

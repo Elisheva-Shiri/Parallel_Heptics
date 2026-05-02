@@ -3,18 +3,22 @@ from dataclasses import dataclass
 from enum import Enum, StrEnum
 
 
-class FingerId(Enum):
-    """Finger groups controlled by this module.
+class MotorSetId(Enum):
+    """Physical 3-motor clusters on the 16-channel servo driver."""
 
-    Each value * 3 gives the base motor pin index for that finger's
-    3-motor cluster on the 16-channel servo driver.
-    """
+    MOTORS_0_2 = 0
+    MOTORS_3_5 = 1
+    MOTORS_6_8 = 2
+    MOTORS_9_11 = 3
+    MOTORS_12_14 = 4
 
-    THUMB = 0   # pins 0, 1, 2
-    INDEX = 1   # pins 3, 4, 5
-    MIDDLE = 2  # pins 6, 7, 8
-    RING = 3    # pins 9, 10, 11
-    PINKY = 4   # pins 12, 13, 14
+    @property
+    def base_index(self) -> int:
+        return self.value * 3
+
+    @property
+    def label(self) -> str:
+        return f"{self.base_index}-{self.base_index + 2}"
 
 
 class MovementStrategy(StrEnum):
@@ -46,12 +50,11 @@ class MotorMovement:
 
 
 class MotorController:
-    """Compute and format motor movements for a triangular 3-motor finger cluster.
+    """Compute and format motor movements for a triangular 3-motor cluster.
 
-    The controller groups motors by finger, where each finger maps to 3 motors in
-    a triangular layout (clockwise order: 0 top, 1 bottom-right, 2 bottom-left).
-    Movement deltas are computed from object displacement and
-    converted to string messages expected by the motor firmware.
+    Motor clusters are selected by physical motor set (0-2, 3-5, ...), not by
+    finger identity. The active tracked finger is decided by the experiment
+    configuration; this class only knows which motor indices to command.
     """
 
     def __init__(
@@ -72,7 +75,7 @@ class MotorController:
             top_width: Width of the active movement area.
             top_height: Height of the active movement area.
             edge_threshold: Margin near the boundary where free-form motion is clipped.
-            motor_spacing: Distance between motors in a single finger cluster.
+            motor_spacing: Distance between motors in a single physical motor cluster.
             move_factor: Scalar applied to all output motor deltas.
             diagonal_threshold: Min axis-ratio needed to classify movement as diagonal
                 in `MovementStrategy.CARDINAL_DIAGONAL`.
@@ -101,22 +104,23 @@ class MotorController:
 
     def calculate_motor_movements(
         self,
-        finger_id: FingerId,
-        stiffness_value: float,
-        obj_x: float,
-        obj_y: float,
-        motors_enabled: bool,
+        motor_set_id: MotorSetId,
+        stiffness_value: float = 1.0,
+        obj_x: float = 0.0,
+        obj_y: float = 0.0,
+        motors_enabled: bool = True,
         reset_to_origin: bool = False,
     ) -> list[MotorMovement]:
-        """Compute motor deltas for a finger from object displacement.
+        """Compute motor deltas for a physical motor set from object displacement.
 
         Args:
-            finger_id: Finger group to control.
+            motor_set_id: Physical motor cluster to control, e.g. `MOTORS_0_2`.
+            stiffness_value: Scalar applied to object displacement before kinematics.
             obj_x: X displacement from center.
             obj_y: Y displacement from center.
             motors_enabled: If `False`, movement is suppressed unless reset is requested.
-            reset_to_origin: If `True` and not in comparison state, returns zero
-                commands for the finger's motors.
+            reset_to_origin: If `True` while motors are disabled, returns zero
+                commands for the selected motor set.
 
         Returns:
             A list of per-motor deltas. Returns an empty list if no movement is needed.
@@ -124,34 +128,30 @@ class MotorController:
         if not motors_enabled:
             if not reset_to_origin:
                 return []
-            return self._zero_motor_positions(finger_id)
+            return self.zero_motor_positions(motor_set_id)
 
         obj_x, obj_y = self._apply_hand_orientation(obj_x, obj_y)
         obj_x, obj_y = self._apply_stiffness_value(obj_x, obj_y, stiffness_value)
 
         match self._movement_strategy:
             case MovementStrategy.FREE_FORM:
-                movements = self._calculate_freeform_motor_movements(finger_id, obj_x, obj_y)
+                movements = self._calculate_freeform_motor_movements(motor_set_id, obj_x, obj_y)
             case MovementStrategy.CARDINAL | MovementStrategy.CARDINAL_DIAGONAL:
                 direction, distance = self._determine_movement_direction(obj_x, obj_y)
                 if direction == "none":
                     return []
 
                 if self._movement_strategy == MovementStrategy.CARDINAL:
-                    movements = self._calculate_cardinal_motor_movements(finger_id, direction, distance)
+                    movements = self._calculate_cardinal_motor_movements(motor_set_id, direction, distance)
                 else:
-                    movements = self._calculate_diagonal_motor_movements(finger_id, direction, distance)
+                    movements = self._calculate_diagonal_motor_movements(motor_set_id, direction, distance)
             case _:
                 raise NotImplementedError(f"Unknown movement strategy: {self._movement_strategy}")
         return self._apply_move_factor(movements)
 
-    def _get_base_index(self, finger_id: FingerId) -> int:
-        """Get the first global motor index for a finger."""
-        return finger_id.value * 3
-
-    def _zero_motor_positions(self, finger_id: FingerId) -> list[MotorMovement]:
-        """Return zero-position commands for all 3 motors of a finger."""
-        base_motor_idx = self._get_base_index(finger_id)
+    def zero_motor_positions(self, motor_set_id: MotorSetId) -> list[MotorMovement]:
+        """Return zero-position commands for all 3 motors in a physical motor set."""
+        base_motor_idx = motor_set_id.base_index
         return [
             MotorMovement(pos=0, index=base_motor_idx),
             MotorMovement(pos=0, index=base_motor_idx + 1),
@@ -201,7 +201,7 @@ class MotorController:
 
     def _calculate_cardinal_motor_movements(
         self,
-        finger_id: FingerId,
+        motor_set_id: MotorSetId,
         direction: str,
         distance: float,
     ) -> list[MotorMovement]:
@@ -214,7 +214,7 @@ class MotorController:
           2   1
 
         Args:
-            finger_id: Finger group to control.
+            motor_set_id: Physical motor set to control.
             direction: Movement direction ("up", "down", "left", "right")
             distance: Movement magnitude in the same units as `motor_spacing`.
 
@@ -229,11 +229,11 @@ class MotorController:
         }
         if direction not in direction_vectors:
             raise ValueError(f"Invalid direction: {direction}. Must be one of: up, down, left, right")
-        return self._calculate_movements_to_point(finger_id, direction_vectors[direction])
+        return self._calculate_movements_to_point(motor_set_id, direction_vectors[direction])
 
     def _calculate_diagonal_motor_movements(
         self,
-        finger_id: FingerId,
+        motor_set_id: MotorSetId,
         direction: str,
         distance: float,
     ) -> list[MotorMovement]:
@@ -246,7 +246,7 @@ class MotorController:
           2   1
 
         Args:
-            finger_id: Finger group to control.
+            motor_set_id: Physical motor set to control.
             direction: Movement direction (cardinal or diagonal)
             distance: Movement magnitude in the same units as `motor_spacing`.
 
@@ -266,11 +266,11 @@ class MotorController:
         if direction not in direction_vectors:
             allowed = ", ".join(direction_vectors.keys())
             raise ValueError(f"Invalid direction: {direction}. Must be one of: {allowed}")
-        return self._calculate_movements_to_point(finger_id, direction_vectors[direction])
+        return self._calculate_movements_to_point(motor_set_id, direction_vectors[direction])
 
     def _calculate_freeform_motor_movements(
         self,
-        finger_id: FingerId,
+        motor_set_id: MotorSetId,
         obj_x: float,
         obj_y: float,
     ) -> list[MotorMovement]:
@@ -278,7 +278,7 @@ class MotorController:
         Calculate motor movements for free-form movement in any direction.
 
         Args:
-            finger_id: Finger group to control.
+            motor_set_id: Physical motor set to control.
             obj_x: X displacement from center.
             obj_y: Y displacement from center.
 
@@ -291,28 +291,28 @@ class MotorController:
             scale = max_radius / distance
             obj_x *= scale
             obj_y *= scale
-        return self._calculate_movements_to_point(finger_id, (obj_x, obj_y))
+        return self._calculate_movements_to_point(motor_set_id, (obj_x, obj_y))
 
     def _calculate_movements_to_point(
         self,
-        finger_id: FingerId,
+        motor_set_id: MotorSetId,
         object_end: tuple[float, float],
     ) -> list[MotorMovement]:
         """Compute cable-length deltas from origin to a target point.
 
-        The object is assumed to start at `(0, 0)`. For each motor in the finger's
+        The object is assumed to start at `(0, 0)`. For each motor in the selected
         equilateral-triangle layout, this calculates:
             delta = distance(motor, object_end) - distance(motor, object_start)
 
         Args:
-            finger_id: Finger group to control.
+            motor_set_id: Physical motor set to control.
             object_end: Target displacement `(x, y)` from center.
 
         Returns:
             List of `MotorMovement` values with integer-truncated deltas and global
-            motor indices for the selected finger.
+            motor indices for the selected motor set.
         """
-        base_motor_idx = self._get_base_index(finger_id)
+        base_motor_idx = motor_set_id.base_index
         object_start = (0.0, 0.0)
         end_x, end_y = object_end
 
