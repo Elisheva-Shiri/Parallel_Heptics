@@ -57,6 +57,11 @@ def _write_answers(path: Path, pair_numbers: list[int]) -> None:
             writer.writerow(["2025-05-01T10:00", pn, "thumb", 85, "index", 85, 1.0, 0])
 
 
+def _read_answer_pair_numbers(path: Path) -> list[int]:
+    with open(path, "r", newline="") as f:
+        return [int(row["pair_number"]) for row in csv.DictReader(f)]
+
+
 # --- marker classification -------------------------------------------------
 
 
@@ -284,3 +289,58 @@ def test_resolve_resume_context_raises_when_configuration_missing(tmp_path):
     (tmp_path / "exp").mkdir()
     with pytest.raises(typer.BadParameter):
         backend._resolve_resume_context(tmp_path, None)
+
+
+# --- _prepare_resume_outputs -----------------------------------------------
+
+
+def test_prepare_resume_outputs_archives_resume_pair_and_later(tmp_path):
+    folder = _seed_experiment(tmp_path, "exp", pair_count=4)
+    for pair_number in range(1, 5):
+        pair_folder = folder / f"pair_{pair_number:03d}"
+        pair_folder.mkdir()
+        (pair_folder / "tracking.csv").write_text(f"pair {pair_number}")
+    _write_answers(folder / "answers.csv", [1, 2, 3, 4])
+
+    backend._prepare_resume_outputs(folder, 3)
+
+    assert (folder / "pair_001").is_dir()
+    assert (folder / "pair_002").is_dir()
+    assert not (folder / "pair_003").exists()
+    assert not (folder / "pair_004").exists()
+    assert (folder / "pair_003_old" / "tracking.csv").read_text() == "pair 3"
+    assert (folder / "pair_004_old" / "tracking.csv").read_text() == "pair 4"
+    assert _read_answer_pair_numbers(folder / "answers_old.csv") == [1, 2, 3, 4]
+    assert _read_answer_pair_numbers(folder / "answers.csv") == [1, 2]
+
+
+def test_prepare_resume_outputs_rewrites_answers_even_when_none_exist(tmp_path):
+    folder = _seed_experiment(tmp_path, "exp", pair_count=2)
+    (folder / "pair_001").mkdir()
+
+    backend._prepare_resume_outputs(folder, 1)
+
+    assert (folder / "pair_001_old").is_dir()
+    assert (folder / "answers.csv").exists()
+    with open(folder / "answers.csv", "r", newline="") as f:
+        reader = csv.reader(f)
+        assert list(reader) == [backend.ANSWERS_HEADER]
+
+
+def test_prepare_resume_outputs_uses_numbered_archive_when_old_name_exists(tmp_path):
+    folder = _seed_experiment(tmp_path, "exp", pair_count=2)
+    (folder / "pair_001").mkdir()
+    preexisting_pair_archive = folder / "pair_001_old"
+    preexisting_pair_archive.mkdir()
+    (preexisting_pair_archive / "debug.txt").write_text("previous archive")
+    _write_answers(folder / "answers.csv", [1, 2])
+    preexisting_answers_archive = folder / "answers_old.csv"
+    preexisting_answers_archive.write_text("previous answers archive")
+
+    backend._prepare_resume_outputs(folder, 1)
+
+    assert (preexisting_pair_archive / "debug.txt").read_text() == "previous archive"
+    assert (folder / "pair_001_old_001").is_dir()
+    assert preexisting_answers_archive.read_text() == "previous answers archive"
+    assert _read_answer_pair_numbers(folder / "answers_old_001.csv") == [1, 2]
+    assert _read_answer_pair_numbers(folder / "answers.csv") == []

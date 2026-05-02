@@ -67,6 +67,17 @@ MOVEMENT_STRATEGY = MovementStrategy.FREE_FORM
 MOTOR_OPPOSES_OBJECT_MOTION = True
 RECORDING_DATA = True
 
+ANSWERS_HEADER = [
+    'timestamp',
+    'pair_number',
+    'object_1_finger',
+    'object_1_stiffness',
+    'object_2_finger',
+    'object_2_stiffness',
+    'time_to_answer',
+    'answer',
+]
+
 
 # Create experiment folder if it doesn't exist
 REAL_EXPERIMENTS_FOLDER = Path("live_experiments")
@@ -921,7 +932,7 @@ class Experiment:
                 if not answers_file.exists():
                     with open(answers_file, 'w', newline='') as f:
                         writer = csv.writer(f)
-                        writer.writerow(['timestamp', 'pair_number', 'object_1_finger', 'object_1_stiffness', 'object_2_finger', 'object_2_stiffness', 'time_to_answer', 'answer'])
+                        writer.writerow(ANSWERS_HEADER)
 
                 with open(answers_file, 'a', newline='') as f:
                     writer = csv.writer(f)
@@ -1439,6 +1450,88 @@ def start_experiment(
 PAIR_FOLDER_PATTERN = "pair_"
 
 
+def _parse_pair_folder_number(path: Path) -> int | None:
+    if not path.is_dir() or not path.name.startswith(PAIR_FOLDER_PATTERN):
+        return None
+    suffix = path.name[len(PAIR_FOLDER_PATTERN):]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def _next_available_archive_path(preferred_archive_path: Path) -> Path:
+    """Return ``preferred_archive_path`` or a numbered variant if it already exists."""
+    if not preferred_archive_path.exists():
+        return preferred_archive_path
+
+    parent = preferred_archive_path.parent
+    stem = preferred_archive_path.stem
+    suffix = preferred_archive_path.suffix
+    index = 1
+    while True:
+        candidate = parent / f"{stem}_{index:03d}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def _archive_path(path: Path, preferred_archive_path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    archive_path = _next_available_archive_path(preferred_archive_path)
+    path.rename(archive_path)
+    return archive_path
+
+
+def _archive_resume_pair_folders(experiment_folder: Path, resume_pair_number: int) -> None:
+    pair_folders: list[tuple[int, Path]] = []
+    for entry in experiment_folder.iterdir():
+        pair_number = _parse_pair_folder_number(entry)
+        if pair_number is None or pair_number < resume_pair_number:
+            continue
+        pair_folders.append((pair_number, entry))
+
+    for _, pair_folder in sorted(pair_folders, reverse=True):
+        _archive_path(pair_folder, pair_folder.with_name(f"{pair_folder.name}_old"))
+
+
+def _read_answers_before_pair(answers_csv: Path, resume_pair_number: int) -> tuple[list[str], list[dict[str, str]]]:
+    if not answers_csv.exists():
+        return ANSWERS_HEADER, []
+
+    with open(answers_csv, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or ANSWERS_HEADER
+        rows: list[dict[str, str]] = []
+        for row in reader:
+            try:
+                pair_number = int(row.get("pair_number", ""))
+            except (TypeError, ValueError):
+                continue
+            if pair_number < resume_pair_number:
+                rows.append(row)
+    return fieldnames, rows
+
+
+def _archive_and_rewrite_answers(experiment_folder: Path, resume_pair_number: int) -> None:
+    answers_csv = experiment_folder / "answers.csv"
+    fieldnames, rows_to_keep = _read_answers_before_pair(answers_csv, resume_pair_number)
+
+    if answers_csv.exists():
+        _archive_path(answers_csv, experiment_folder / "answers_old.csv")
+
+    with open(answers_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows_to_keep)
+
+
+def _prepare_resume_outputs(experiment_folder: Path, resume_pair_number: int) -> None:
+    """Archive stale resumed outputs and recreate answers for rows before resume."""
+    _archive_resume_pair_folders(experiment_folder, resume_pair_number)
+    _archive_and_rewrite_answers(experiment_folder, resume_pair_number)
+
+
 def _find_latest_experiment(root: Path) -> Path | None:
     """Return the most recently modified subfolder of ``root``, or None."""
     if not root.exists() or not root.is_dir():
@@ -1456,11 +1549,9 @@ def _find_last_pair_number(experiment_folder: Path) -> int | None:
         return None
     pair_numbers: list[int] = []
     for entry in experiment_folder.iterdir():
-        if not entry.is_dir() or not entry.name.startswith(PAIR_FOLDER_PATTERN):
-            continue
-        suffix = entry.name[len(PAIR_FOLDER_PATTERN):]
-        if suffix.isdigit():
-            pair_numbers.append(int(suffix))
+        pair_number = _parse_pair_folder_number(entry)
+        if pair_number is not None:
+            pair_numbers.append(pair_number)
     if not pair_numbers:
         return None
     return max(pair_numbers)
@@ -1813,6 +1904,9 @@ def main(
 
     if path is None:
         path = create_experiment_folder(config, resolved_run_mode, resolved_motor_set_id)
+
+    if resume_pair_number is not None:
+        _prepare_resume_outputs(path, resume_pair_number)
 
     experiment = start_experiment(
         config, path, resolved_run_mode, resolved_motor_set_id, hand_orientation,
