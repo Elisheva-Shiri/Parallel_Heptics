@@ -25,6 +25,8 @@ namespace ParallelHeptics.FrontendUnity
         private static readonly Color DarkBarColor = new Color32(64, 64, 64, 255);
         private static readonly Color LightGreenColor = new Color32(144, 238, 144, 255);
         private static readonly Color GreenColor = new Color32(0, 200, 0, 255);
+        private static readonly Color OutboundCueColor = LightGreenColor;
+        private static readonly Color CenterCueColor = GreenColor;
         private static readonly Vector3 DefaultTabletopPosition = new Vector3(0f, 0.75f, 0.55f);
         private static readonly Vector3 DefaultTabletopEulerAngles = new Vector3(-90f, 0f, 0f);
 
@@ -32,6 +34,7 @@ namespace ParallelHeptics.FrontendUnity
         private const float SurfaceOffset = 0.002f;
         private const float ForegroundOffset = 0.004f;
         private const float TextOffset = 0.006f;
+        private const int CueCircleSegments = 96;
 
         [Header("Backend protocol")]
         [SerializeField] private string backendHost = "localhost";
@@ -72,6 +75,9 @@ namespace ParallelHeptics.FrontendUnity
         private Transform _dynamicRoot;
         private GameObject _panelBackground;
         private GameObject _trackingObject;
+        private GameObject _outboundCueCircle;
+        private LineRenderer _outboundCueRenderer;
+        private GameObject _returnCuePoint;
         private GameObject _progressBackground;
         private GameObject _outboundProgress;
         private GameObject _returnProgress;
@@ -94,8 +100,8 @@ namespace ParallelHeptics.FrontendUnity
         private XROrigin _xrOrigin;
         private AudioSource _whiteNoiseSource;
         private AudioClip _whiteNoiseClip;
-        private uint _whiteNoiseState = 0x1234ABCDu;
         private bool _whiteNoiseEnabled;
+        private bool _whiteNoiseUnavailable;
 #if ENABLE_INPUT_SYSTEM
         private TrackedPoseDriver _trackedPoseDriver;
         private InputAction _hmdPositionAction;
@@ -109,6 +115,7 @@ namespace ParallelHeptics.FrontendUnity
         private ExperimentState _lastState = (ExperimentState)999;
         private float _lastPacketTime = -1000f;
         private long _lastMalformedLogFrame = -9999;
+        private bool _isDebug = true;
 
         private enum CalibrationKey
         {
@@ -141,10 +148,10 @@ namespace ParallelHeptics.FrontendUnity
             Application.targetFrameRate = -1;
             QualitySettings.vSyncCount = 0;
 
-            _receiver = GetComponent<ExperimentUdpReceiver>() ?? gameObject.AddComponent<ExperimentUdpReceiver>();
+            _receiver = GetOrAddComponent<ExperimentUdpReceiver>(gameObject);
             _receiver.Configure(udpListenPort, bindUdpLoopbackOnly);
 
-            _controlClient = GetComponent<ExperimentControlClient>() ?? gameObject.AddComponent<ExperimentControlClient>();
+            _controlClient = GetOrAddComponent<ExperimentControlClient>(gameObject);
             _controlClient.Configure(backendHost, tcpBackendPort);
 
             _holdSelector = new HoldButtonSelector(holdSeconds);
@@ -201,20 +208,38 @@ namespace ParallelHeptics.FrontendUnity
 
         private void SetWhiteNoiseEnabled(bool enabled)
         {
+            if (_whiteNoiseUnavailable)
+            {
+                return;
+            }
+
             if (enabled == _whiteNoiseEnabled)
             {
                 return;
             }
 
-            _whiteNoiseEnabled = enabled;
-            if (enabled)
+            try
             {
-                EnsureWhiteNoiseAudio();
-                _whiteNoiseSource.Play();
+                _whiteNoiseEnabled = enabled;
+                if (enabled)
+                {
+                    EnsureWhiteNoiseAudio();
+                    _whiteNoiseSource.Play();
+                }
+                else if (_whiteNoiseSource != null)
+                {
+                    _whiteNoiseSource.Stop();
+                }
             }
-            else if (_whiteNoiseSource != null)
+            catch (System.Exception ex)
             {
-                _whiteNoiseSource.Stop();
+                _whiteNoiseEnabled = false;
+                _whiteNoiseUnavailable = true;
+                if (_whiteNoiseSource != null)
+                {
+                    _whiteNoiseSource.Stop();
+                }
+                LogWarningIfDebug($"White noise disabled; Unity audio initialization failed. {ex.Message}");
             }
         }
 
@@ -222,19 +247,24 @@ namespace ParallelHeptics.FrontendUnity
         {
             if (_whiteNoiseClip == null)
             {
-                int sampleRate = Mathf.Clamp(whiteNoiseSampleRate, 8000, 96000);
-                whiteNoiseVolume = Mathf.Clamp01(whiteNoiseVolume);
-                _whiteNoiseState = 0x1234ABCDu;
+                int configuredSampleRate = Mathf.Clamp(whiteNoiseSampleRate, 8000, 96000);
+                int sampleRate = AudioSettings.outputSampleRate > 0
+                    ? AudioSettings.outputSampleRate
+                    : configuredSampleRate;
+                int sampleCount = sampleRate * 2;
+                float[] samples = new float[sampleCount];
+                FillWhiteNoiseSamples(samples, whiteNoiseVolume, 0x1234ABCDu);
+
                 _whiteNoiseClip = AudioClip.Create(
                     "Procedural White Noise",
-                    sampleRate,
+                    sampleCount,
                     1,
                     sampleRate,
-                    true,
-                    OnWhiteNoiseRead);
+                    false);
+                _whiteNoiseClip.SetData(samples, 0);
             }
 
-            _whiteNoiseSource = GetComponent<AudioSource>() ?? gameObject.AddComponent<AudioSource>();
+            _whiteNoiseSource = GetOrAddComponent<AudioSource>(gameObject);
             _whiteNoiseSource.playOnAwake = false;
             _whiteNoiseSource.loop = true;
             _whiteNoiseSource.spatialBlend = 0f;
@@ -242,26 +272,25 @@ namespace ParallelHeptics.FrontendUnity
             _whiteNoiseSource.clip = _whiteNoiseClip;
         }
 
-        private void OnWhiteNoiseRead(float[] data)
+        private static T GetOrAddComponent<T>(GameObject owner) where T : Component
         {
-            float volume = whiteNoiseVolume;
-            if (volume < 0f)
-            {
-                volume = 0f;
-            }
-            else if (volume > 1f)
-            {
-                volume = 1f;
-            }
+            T component = owner.GetComponent<T>();
+            return component != null ? component : owner.AddComponent<T>();
+        }
+
+        private static void FillWhiteNoiseSamples(float[] data, float requestedVolume, uint seed)
+        {
+            float volume = Mathf.Clamp01(requestedVolume);
+            uint state = seed;
 
             for (int i = 0; i < data.Length; i++)
             {
                 unchecked
                 {
-                    _whiteNoiseState = (_whiteNoiseState * 1664525u) + 1013904223u;
+                    state = (state * 1664525u) + 1013904223u;
                 }
 
-                data[i] = (((_whiteNoiseState >> 8) / 8388607.5f) - 1f) * volume;
+                data[i] = (((state >> 8) / 8388607.5f) - 1f) * volume;
             }
         }
 
@@ -271,26 +300,28 @@ namespace ParallelHeptics.FrontendUnity
 
             if (_receiver.TryGetLatestJson(out string json))
             {
+                ExperimentPacket packet = null;
                 try
                 {
-                    ExperimentPacket packet = JsonUtility.FromJson<ExperimentPacket>(json);
-                    if (packet != null && packet.stateData != null)
-                    {
-                        _lastPacketTime = Time.unscaledTime;
-                        RenderPacket(packet);
-                    }
+                    packet = JsonUtility.FromJson<ExperimentPacket>(json);
                 }
                 catch (System.Exception ex)
                 {
                     if (Time.frameCount - _lastMalformedLogFrame > 120)
                     {
                         _lastMalformedLogFrame = Time.frameCount;
-                        Debug.LogWarning($"Malformed ExperimentPacket JSON ignored: {ex.Message}");
+                        LogWarningIfDebug($"Malformed ExperimentPacket JSON ignored: {ex.Message}");
                     }
+                }
+
+                if (packet != null && packet.stateData != null)
+                {
+                    _lastPacketTime = Time.unscaledTime;
+                    RenderPacket(packet);
                 }
             }
 
-            if (showDebugStatus && _statusText != null)
+            if (_isDebug && showDebugStatus && _statusText != null)
             {
                 float age = Time.unscaledTime - _lastPacketTime;
                 string packetStatus = _lastPacketTime < 0f ? "waiting for UDP" : $"last UDP {age:0.00}s ago";
@@ -300,7 +331,20 @@ namespace ParallelHeptics.FrontendUnity
 
         private void RenderPacket(ExperimentPacket packet)
         {
-            SetWhiteNoiseEnabled(packet.playWhiteNoise);
+            EnsureHoldSelector();
+            _isDebug = packet.isDebug;
+            if (_receiver != null)
+            {
+                _receiver.IsDebug = _isDebug;
+            }
+            if (_controlClient != null)
+            {
+                _controlClient.IsDebug = _isDebug;
+            }
+            if (_statusText != null)
+            {
+                _statusText.gameObject.SetActive(_isDebug && showDebugStatus);
+            }
             ExperimentState state = (ExperimentState)packet.stateData.state;
             SetStateVisibility(state);
             RenderFingers(packet.landmarks);
@@ -335,6 +379,35 @@ namespace ParallelHeptics.FrontendUnity
                     _subtitleText.text = string.Empty;
                     break;
             }
+
+            // Audio masking is intentionally best-effort. Rendering the experiment
+            // must continue even on machines/headsets where Unity cannot initialize
+            // an audio output device.
+            SetWhiteNoiseEnabled(packet.playWhiteNoise);
+        }
+
+        private void EnsureHoldSelector()
+        {
+            if (_holdSelector == null)
+            {
+                _holdSelector = new HoldButtonSelector(holdSeconds);
+            }
+        }
+
+        private void LogIfDebug(string message)
+        {
+            if (_isDebug)
+            {
+                Debug.Log(message);
+            }
+        }
+
+        private void LogWarningIfDebug(string message)
+        {
+            if (_isDebug)
+            {
+                Debug.LogWarning(message);
+            }
         }
 
         private void RenderComparison(TrackingObject trackingObject)
@@ -349,6 +422,11 @@ namespace ParallelHeptics.FrontendUnity
             _trackingObject.transform.localScale = new Vector3(objectSize.x, objectSize.y, 0.006f);
             Color color = trackingObject.isPinched ? (trackingObject.pairIndex == 0 ? FirstColor : SecondColor) : GrayColor;
             SetMaterial(_trackingObject, color);
+
+            bool returnCueActive = ShouldShowReturnCue(trackingObject);
+            SetOutboundCueCircle(visible: !returnCueActive);
+            _returnCuePoint.SetActive(returnCueActive);
+            _titleText.text = returnCueActive ? "Return to center" : "Move to the edge";
 
             float barWidth = mapper.PanelWidth * 0.72f;
             float barHeight = mapper.PanelHeight * 0.04f;
@@ -417,6 +495,8 @@ namespace ParallelHeptics.FrontendUnity
             bool message = state == ExperimentState.Pause || state == ExperimentState.Break || state == ExperimentState.End || question;
 
             _trackingObject.SetActive(comparison);
+            _outboundCueCircle.SetActive(false);
+            _returnCuePoint.SetActive(false);
             _progressBackground.SetActive(comparison);
             _outboundProgress.SetActive(comparison);
             _returnProgress.SetActive(comparison);
@@ -443,6 +523,12 @@ namespace ParallelHeptics.FrontendUnity
 
             _panelBackground = CreateQuad("Black Panel", _panelRoot, Vector3.zero, new Vector3(mapper.PanelWidth, mapper.PanelHeight, 1f), PanelColor);
             _trackingObject = CreateCube("Tracking Object", _dynamicRoot, Vector3.zero, Vector3.one, GrayColor);
+
+            _outboundCueCircle = CreateCircleCue("Outbound Edge Cue", _dynamicRoot, OutboundCueColor);
+            float pointDiameter = Mathf.Min(mapper.PanelWidth, mapper.PanelHeight) * 0.07f;
+            _returnCuePoint = CreateSphere("Center Return Point", _dynamicRoot, new Vector3(0f, 0f, ForegroundOffset), new Vector3(pointDiameter, pointDiameter, pointDiameter * 0.18f), CenterCueColor);
+            _outboundCueCircle.SetActive(false);
+            _returnCuePoint.SetActive(false);
 
             float progressY = -mapper.PanelHeight * 0.41f;
             _progressBackground = CreateQuad("Progress Background", _dynamicRoot, new Vector3(0f, progressY, SurfaceOffset), Vector3.one, DarkBarColor);
@@ -487,6 +573,27 @@ namespace ParallelHeptics.FrontendUnity
         private GameObject CreateSphere(string objectName, Transform parent, Vector3 localPosition, Vector3 localScale, Color color)
         {
             return CreatePrimitive(PrimitiveType.Sphere, objectName, parent, localPosition, localScale, color);
+        }
+
+        private GameObject CreateCircleCue(string objectName, Transform parent, Color color)
+        {
+            GameObject go = new GameObject(objectName);
+            go.transform.SetParent(parent, false);
+            go.transform.localPosition = new Vector3(0f, 0f, ForegroundOffset);
+
+            _outboundCueRenderer = go.AddComponent<LineRenderer>();
+            _outboundCueRenderer.useWorldSpace = false;
+            _outboundCueRenderer.loop = true;
+            _outboundCueRenderer.positionCount = CueCircleSegments;
+            _outboundCueRenderer.widthMultiplier = Mathf.Min(mapper.PanelWidth, mapper.PanelHeight) * 0.008f;
+            _outboundCueRenderer.numCapVertices = 5;
+            _outboundCueRenderer.numCornerVertices = 5;
+            _outboundCueRenderer.material = GetMaterial(color);
+            _outboundCueRenderer.startColor = color;
+            _outboundCueRenderer.endColor = color;
+            SetCircleRadius(0f);
+
+            return go;
         }
 
         private GameObject CreatePrimitive(PrimitiveType primitiveType, string objectName, Transform parent, Vector3 localPosition, Vector3 localScale, Color color)
@@ -571,7 +678,7 @@ namespace ParallelHeptics.FrontendUnity
                 {
                     calibrationActive = true;
                     ApplyCalibrationVisibility();
-                    Debug.Log("Tabletop calibration restarted. Press Enter to save and lock it again.");
+                    LogIfDebug("Tabletop calibration restarted. Press Enter to save and lock it again.");
                 }
 
                 return;
@@ -765,7 +872,7 @@ namespace ParallelHeptics.FrontendUnity
             }
             catch (System.Exception ex)
             {
-                Debug.LogWarning($"Failed to load tabletop calibration; using defaults. {ex.Message}");
+                LogWarningIfDebug($"Failed to load tabletop calibration; using defaults. {ex.Message}");
             }
         }
 
@@ -786,7 +893,7 @@ namespace ParallelHeptics.FrontendUnity
             PlayerPrefs.Save();
             calibrationActive = false;
             ApplyCalibrationVisibility();
-            Debug.Log($"Saved tabletop calibration: position={panelWorldPosition}, rotation={panelEulerAngles}, scale={panelUniformScale:0.###}");
+            LogIfDebug($"Saved tabletop calibration: position={panelWorldPosition}, rotation={panelEulerAngles}, scale={panelUniformScale:0.###}");
         }
 
         private void EnsureXrCameraRig()
@@ -959,6 +1066,11 @@ namespace ParallelHeptics.FrontendUnity
             }
         }
 
+        private static bool ShouldShowReturnCue(TrackingObject trackingObject)
+        {
+            return trackingObject.returnProgress > 0.001f || trackingObject.progress >= 0.995f;
+        }
+
         private void SetBar(GameObject bar, float width, float height, float centerX)
         {
             width = Mathf.Max(0f, width);
@@ -973,6 +1085,33 @@ namespace ParallelHeptics.FrontendUnity
             float halfLeftEdge = leftHalf ? -halfWidth : 0f;
             float x = halfLeftEdge + width * 0.5f;
             SetBar(bar, width, height, x);
+        }
+
+        private void SetOutboundCueCircle(bool visible)
+        {
+            _outboundCueCircle.SetActive(visible);
+            if (!visible)
+            {
+                return;
+            }
+
+            float radius = Mathf.Min(mapper.PanelWidth, mapper.PanelHeight) * 0.48f;
+            SetCircleRadius(radius);
+        }
+
+        private void SetCircleRadius(float radius)
+        {
+            if (_outboundCueRenderer == null)
+            {
+                return;
+            }
+
+            radius = Mathf.Max(0f, radius);
+            for (int i = 0; i < CueCircleSegments; i++)
+            {
+                float angle = i * Mathf.PI * 2f / CueCircleSegments;
+                _outboundCueRenderer.SetPosition(i, new Vector3(Mathf.Cos(angle) * radius, Mathf.Sin(angle) * radius, 0f));
+            }
         }
 
         private void SetChildFillBar(GameObject bar, float progress)
@@ -991,6 +1130,11 @@ namespace ParallelHeptics.FrontendUnity
                 return;
             }
 
+            renderer.sharedMaterial = GetMaterial(color);
+        }
+
+        private Material GetMaterial(Color color)
+        {
             if (!_materials.TryGetValue(color, out Material material))
             {
                 Shader shader = Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Unlit/Color") ?? Shader.Find("Standard");
@@ -1012,7 +1156,7 @@ namespace ParallelHeptics.FrontendUnity
                 _materials.Add(color, material);
             }
 
-            renderer.sharedMaterial = material;
+            return material;
         }
 
         private static void ConfigureMaterialSurface(Material material, float alpha)

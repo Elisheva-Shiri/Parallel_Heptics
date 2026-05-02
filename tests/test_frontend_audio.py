@@ -35,18 +35,21 @@ class FrontendAudioTests(unittest.TestCase):
         )
 
         self.assertFalse(packet.playWhiteNoise)
+        self.assertTrue(packet.isDebug)
 
-    def test_experiment_packet_accepts_backend_white_noise_flag(self):
+    def test_experiment_packet_accepts_backend_flags(self):
         packet = ExperimentPacket.model_validate_json(
             '{"stateData":{"state":1,"pauseTime":0},'
             '"landmarks":[{"x":0.25,"z":0.75}],'
             '"trackingObject":{"x":0.5,"z":0.4,"size":40.0,"isPinched":true,'
             '"progress":0.25,"returnProgress":0.5,"cycleCount":1,'
             '"targetCycleCount":2,"pairIndex":0},'
-            '"playWhiteNoise":true}'
+            '"playWhiteNoise":true,'
+            '"isDebug":false}'
         )
 
         self.assertTrue(packet.playWhiteNoise)
+        self.assertFalse(packet.isDebug)
 
 
 if __name__ == "__main__":

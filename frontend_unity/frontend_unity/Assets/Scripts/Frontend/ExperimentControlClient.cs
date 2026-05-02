@@ -36,6 +36,7 @@ namespace ParallelHeptics.FrontendUnity
                 }
             }
         }
+        public bool IsDebug { get; set; } = true;
 
         public void Configure(string host, int port)
         {
@@ -59,7 +60,7 @@ namespace ParallelHeptics.FrontendUnity
             _running = false;
             _sendSignal.Set();
             CloseClient();
-            if (_workerThread != null && _workerThread.IsAlive && !_workerThread.Join(250))
+            if (_workerThread != null && _workerThread.IsAlive && !_workerThread.Join(250) && IsDebug)
             {
                 Debug.LogWarning("TCP worker thread did not stop within timeout; it will exit as a background thread.");
             }
@@ -114,11 +115,17 @@ namespace ParallelHeptics.FrontendUnity
                 NetworkStream stream = client.GetStream();
                 stream.Write(payload, 0, payload.Length);
                 stream.Flush();
-                Debug.Log($"Sent ExperimentControl: {Encoding.UTF8.GetString(payload)}");
+                if (IsDebug)
+                {
+                    Debug.Log($"Sent ExperimentControl: {Encoding.UTF8.GetString(payload)}");
+                }
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"Failed to send ExperimentControl; will reconnect. {ex.Message}");
+                if (IsDebug)
+                {
+                    Debug.LogWarning($"Failed to send ExperimentControl; will reconnect. {ex.Message}");
+                }
                 CloseClient();
             }
         }
@@ -137,7 +144,10 @@ namespace ParallelHeptics.FrontendUnity
                         _client = nextClient;
                     }
 
-                    Debug.Log($"Connected to backend TCP at {backendHost}:{backendPort}");
+                    if (IsDebug)
+                    {
+                        Debug.Log($"Connected to backend TCP at {backendHost}:{backendPort}");
+                    }
                     return true;
                 }
                 catch (Exception)
@@ -159,7 +169,10 @@ namespace ParallelHeptics.FrontendUnity
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogWarning($"TCP close warning: {ex.Message}");
+                    if (IsDebug)
+                    {
+                        Debug.LogWarning($"TCP close warning: {ex.Message}");
+                    }
                 }
                 finally
                 {

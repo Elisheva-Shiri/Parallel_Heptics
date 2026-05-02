@@ -1,4 +1,5 @@
 import csv
+import builtins
 from datetime import datetime
 from pathlib import Path
 import keyboard
@@ -11,6 +12,8 @@ from typing import Literal, Optional
 from threading import Lock
 import numpy as np
 import socket
+from typing import Annotated
+import typer
 from pydantic import BaseModel
 from structures import ExperimentControl, ExperimentState, FingerPosition, QuestionInput, StateData, TrackingObject, ExperimentPacket
 from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, FINGER_NAMES, FingerName, CENTER_THRESHOLD, EDGE_THRESHOLD, TAPPING_HEIGHT_RATIO, STIFFNESS_MAX
@@ -30,13 +33,24 @@ DEBUG_POSITION = 1000
 DEBUG_SINGLE_MOTOR = False
 DEBUG_FLIP_Y = True
 DEBUG_SIDE_CAMERA_OFF = True  # overridden at runtime by user prompt
-DEBUG_ALLOW_PRINTS = False
+IS_DEBUG = True
 DEBUG_LOG_MOTOR_RANGE = True  # Log min/max motor positions on shutdown (no per-message overhead)
 
-original_print = print
-def print(*args, **kwargs):
-    if DEBUG_ALLOW_PRINTS:
+original_print = builtins.print
+
+
+def set_is_debug(enabled: bool) -> None:
+    global IS_DEBUG
+    IS_DEBUG = enabled
+
+
+def debug_print(*args, **kwargs):
+    if IS_DEBUG:
         original_print(*args, **kwargs)
+
+
+builtins.print = debug_print
+print = debug_print
 
 class VisionType(StrEnum):
     MEDIAPIPE = "mediapipe"
@@ -44,6 +58,17 @@ class VisionType(StrEnum):
     FRAME_COLOR = "frame_color"
     OPTICAL_COLOR_NO_GPU = "optical_color_no_gpu"
     OPTICAL_COLOR_GPU = "optical_color_gpu"
+
+class RunMode(StrEnum):
+    COMPARISON = "comparison"
+    SINGLE_FINGER = "single_finger"
+
+class FingerChoice(StrEnum):
+    THUMB = "thumb"
+    INDEX = "index"
+    MIDDLE = "middle"
+    RING = "ring"
+    PINKY = "pinky"
 
 class MotorType(StrEnum):
     HARDWARE = "hardware"
@@ -159,6 +184,7 @@ class Experiment:
         backend_port: int = BACKEND_PORT,
         hardware_port: int = HARDWARE_PORT,
         play_white_noise: bool = False,
+        is_debug: bool = True,
     ):
         
         # SETUP
@@ -192,6 +218,7 @@ class Experiment:
         self._target_cycle_count = target_cycle_count
         self._hand_orientation = hand_orientation
         self._play_white_noise = play_white_noise
+        self._is_debug = is_debug
 
         # Frame queues for recording
         self._top_frame_queue = Queue(maxsize=30)
@@ -686,7 +713,7 @@ class Experiment:
             self._sleep_motors()
 
         # Print position range summary on shutdown
-        # Uses original_print intentionally to bypass DEBUG_ALLOW_PRINTS
+        # Uses original_print intentionally to bypass the debug print gate.
         if DEBUG_LOG_MOTOR_RANGE and motor_range_min:
             original_print("=== Motor Position Range Summary ===")
             for idx in sorted(motor_range_min.keys()):
@@ -718,6 +745,7 @@ class Experiment:
                     stateData=StateData(state=self._state.value, pauseTime=pause_for_packet),
                     landmarks=finger_positions,
                     playWhiteNoise=self._play_white_noise,
+                    isDebug=self._is_debug,
                     trackingObject=TrackingObject(
                         x=self._virtual_object.x / self._top_width,
                         z=self._virtual_object.y / self._top_height,
@@ -1027,6 +1055,7 @@ def start_experiment(
     finger_colors: dict[str, str],
     side_camera_off: bool = False,
     play_white_noise: bool = False,
+    is_debug: bool = True,
 ):
     """Initialize and start the hand tracking system"""
     experiment = Experiment(
@@ -1041,6 +1070,7 @@ def start_experiment(
         finger_colors=finger_colors,
         side_camera_off=side_camera_off,
         play_white_noise=play_white_noise,
+        is_debug=is_debug,
     )
     
     return experiment
@@ -1119,11 +1149,15 @@ def get_play_white_noise() -> bool:
 
 
 AVAILABLE_COLORS = ["red", "green", "blue", "yellow", "magenta"]
+RunModeLiteral = Literal["comparison", "single_finger"]
 
-def get_finger_colors(fingers: list[str]) -> dict[str, str]:
+def get_finger_colors(
+    fingers: list[str],
+    unavailable_colors: set[str] | None = None,
+) -> dict[str, str]:
     """Ask user to assign a unique color to each finger from the available set."""
     finger_colors: dict[str, str] = {}
-    remaining = list(AVAILABLE_COLORS)
+    remaining = [color for color in AVAILABLE_COLORS if color not in (unavailable_colors or set())]
     for finger in fingers:
         original_print(f"Available colors: {', '.join(c.capitalize() for c in remaining)}")
         while True:
@@ -1151,9 +1185,105 @@ def _is_color_vision(vision_type: VisionType) -> bool:
     return vision_type in (VisionType.FRAME_COLOR, VisionType.OPTICAL_COLOR_NO_GPU, VisionType.OPTICAL_COLOR_GPU)
 
 
+def _parse_finger_color_flags(values: list[str] | None) -> dict[str, str]:
+    colors: dict[str, str] = {}
+    for value in values or []:
+        if "=" not in value:
+            raise typer.BadParameter("finger colors must use FINGER=COLOR format", param_hint="--finger-color")
+
+        finger, color = (part.strip().lower() for part in value.split("=", 1))
+        if finger not in FINGER_NAMES.values():
+            raise typer.BadParameter(
+                f"unknown finger '{finger}'. Expected one of: {', '.join(FINGER_NAMES.values())}",
+                param_hint="--finger-color",
+            )
+        if color not in AVAILABLE_COLORS:
+            raise typer.BadParameter(
+                f"unknown color '{color}'. Expected one of: {', '.join(AVAILABLE_COLORS)}",
+                param_hint="--finger-color",
+            )
+        if finger in colors:
+            raise typer.BadParameter(f"duplicate color for finger '{finger}'", param_hint="--finger-color")
+        if color in colors.values():
+            raise typer.BadParameter(f"color '{color}' is assigned more than once", param_hint="--finger-color")
+        colors[finger] = color
+    return colors
+
+
+def _get_fingers_needed(
+    config: Configuration,
+    run_mode: RunModeLiteral,
+    pair_finger: FingerName,
+) -> list[str]:
+    if run_mode == "comparison":
+        finger_ids_in_csv: set[int] = set()
+        for pair in config.pairs:
+            if pair.first.value > 0:
+                finger_ids_in_csv.add(pair.first.finger_id)
+                finger_ids_in_csv.add(pair.second.finger_id)
+        return ["thumb"] + sorted(
+            {FINGER_NAMES[fid] for fid in finger_ids_in_csv if fid in FINGER_NAMES},
+            key=lambda n: list(FINGER_NAMES.values()).index(n)
+        )
+    return [pair_finger]
+
+
+def _resolve_pair_finger(
+    run_mode: RunModeLiteral,
+    pair_finger: FingerChoice | None,
+) -> FingerName:
+    if pair_finger is None:
+        return get_pair_finger(run_mode)
+
+    resolved = pair_finger.value
+    if run_mode == "comparison" and resolved not in ("middle", "ring", "pinky"):
+        raise typer.BadParameter(
+            "comparison mode pair finger must be one of: middle, ring, pinky",
+            param_hint="--pair-finger",
+        )
+    return resolved  # type: ignore[return-value]
+
+
+def _resolve_finger_colors(
+    config: Configuration,
+    run_mode: RunModeLiteral,
+    pair_finger: FingerName,
+    vision_type: VisionType,
+    finger_color_flags: list[str] | None,
+) -> dict[str, str]:
+    provided_colors = _parse_finger_color_flags(finger_color_flags)
+    if not _is_color_vision(vision_type):
+        if provided_colors:
+            raise typer.BadParameter("--finger-color can only be used with a color vision type")
+        return {}
+
+    fingers_needed = _get_fingers_needed(config, run_mode, pair_finger)
+    unexpected = set(provided_colors) - set(fingers_needed)
+    if unexpected:
+        raise typer.BadParameter(
+            f"color provided for unused finger(s): {', '.join(sorted(unexpected))}",
+            param_hint="--finger-color",
+        )
+
+    finger_colors = dict(provided_colors)
+    missing_fingers = [finger for finger in fingers_needed if finger not in finger_colors]
+    if missing_fingers:
+        original_print(f"Assign colors for fingers: {', '.join(missing_fingers)}")
+        selected = get_finger_colors(missing_fingers, set(finger_colors.values()))
+        duplicate_colors = set(finger_colors.values()) & set(selected.values())
+        if duplicate_colors:
+            raise typer.BadParameter(
+                f"color assigned more than once: {', '.join(sorted(duplicate_colors))}",
+                param_hint="--finger-color",
+            )
+        finger_colors.update(selected)
+
+    return finger_colors
+
+
 def create_experiment_folder(
     config: Configuration,
-    run_mode: Literal["comparison", "single_finger"],
+    run_mode: RunModeLiteral,
     pair_finger: FingerName,
 ):
     experiment_path = Path(experiment_folder)
@@ -1175,40 +1305,43 @@ def create_experiment_folder(
     return folder_path
 
 
-def main():
+def main(
+    run_mode: Annotated[RunMode | None, typer.Option("--run-mode", help="Experiment run mode. Asked interactively when omitted.")] = None,
+    pair_finger: Annotated[FingerChoice | None, typer.Option("--pair-finger", help="Finger used for this run. Asked interactively when omitted.")] = None,
+    vision_type: Annotated[VisionType | None, typer.Option("--vision-type", help="Vision backend. Asked interactively when omitted.")] = None,
+    finger_color: Annotated[list[str] | None, typer.Option("--finger-color", help="Color assignment as FINGER=COLOR. Repeat for each required color-tracked finger.")] = None,
+    side_camera_enabled: Annotated[bool | None, typer.Option("--side-camera-enabled/--side-camera-disabled", help="Whether the side camera is enabled. Asked interactively when omitted.")] = None,
+    play_white_noise: Annotated[bool | None, typer.Option("--white-noise/--no-white-noise", help="Whether frontend should play white-noise masking. Asked interactively when omitted.")] = None,
+    mirror_hand: Annotated[bool | None, typer.Option("--mirror-hand/--no-mirror-hand", help="Whether to mirror hand orientation. Asked interactively when omitted.")] = None,
+    target_cycle_count: Annotated[int | None, typer.Option("--target-cycle-count", min=1, help="Number of cycles to apply. Asked interactively when omitted.")] = None,
+    is_debug: Annotated[bool, typer.Option("--debug/--no-debug", help="Enable debug prints/logs and send the debug flag to frontend packets.")] = True,
+):
+    set_is_debug(is_debug)
     config = Configuration.read_configuration('configuration.csv')
-    run_mode = get_run_mode()
-    pair_finger = get_pair_finger(run_mode)
-    vision_type = get_vision_type()
+    resolved_run_mode: RunModeLiteral = (run_mode.value if run_mode is not None else get_run_mode())  # type: ignore[assignment]
+    resolved_pair_finger = _resolve_pair_finger(resolved_run_mode, pair_finger)
+    resolved_vision_type = vision_type if vision_type is not None else get_vision_type()
+    finger_colors = _resolve_finger_colors(
+        config,
+        resolved_run_mode,
+        resolved_pair_finger,
+        resolved_vision_type,
+        finger_color,
+    )
 
-    finger_colors: dict[str, str] = {}
-    if _is_color_vision(vision_type):
-        if run_mode == "comparison":
-            finger_ids_in_csv: set[int] = set()
-            for pair in config.pairs:
-                if pair.first.value > 0:
-                    finger_ids_in_csv.add(pair.first.finger_id)
-                    finger_ids_in_csv.add(pair.second.finger_id)
-            fingers_needed = ["thumb"] + sorted(
-                {FINGER_NAMES[fid] for fid in finger_ids_in_csv if fid in FINGER_NAMES},
-                key=lambda n: list(FINGER_NAMES.values()).index(n)
-            )
-        else:
-            fingers_needed = [pair_finger]
-        original_print(f"Assign colors for fingers: {', '.join(fingers_needed)}")
-        finger_colors = get_finger_colors(fingers_needed)
-
-    side_camera_off = get_side_camera_off()
-    play_white_noise = get_play_white_noise()
-    tapping_enabled = run_mode == "single_finger"
-    hand_orientation = get_hand_orientation()
-    target_cycle_count = get_target_cycle_count()
-    path = create_experiment_folder(config, run_mode, pair_finger)
+    side_camera_off = (not side_camera_enabled) if side_camera_enabled is not None else get_side_camera_off()
+    resolved_play_white_noise = play_white_noise if play_white_noise is not None else get_play_white_noise()
+    tapping_enabled = resolved_run_mode == "single_finger"
+    hand_orientation = (
+        HandOrientation.MIRRORED if mirror_hand else HandOrientation.NOT_MIRRORED
+    ) if mirror_hand is not None else get_hand_orientation()
+    resolved_target_cycle_count = target_cycle_count if target_cycle_count is not None else get_target_cycle_count()
+    path = create_experiment_folder(config, resolved_run_mode, resolved_pair_finger)
     
     experiment = start_experiment(
-        config, path, run_mode, pair_finger, hand_orientation,
-        target_cycle_count, vision_type, tapping_enabled, finger_colors,
-        side_camera_off, play_white_noise,
+        config, path, resolved_run_mode, resolved_pair_finger, hand_orientation,
+        resolved_target_cycle_count, resolved_vision_type, tapping_enabled, finger_colors,
+        side_camera_off, resolved_play_white_noise, is_debug,
     )
     try:
         while True:
@@ -1218,4 +1351,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    typer.run(main)
