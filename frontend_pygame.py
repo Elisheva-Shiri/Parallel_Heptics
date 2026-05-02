@@ -32,11 +32,17 @@ def _make_white_noise_buffer(
 class _WhiteNoiseLoop:
     """Best-effort looping white noise for the pygame/computer frontend."""
 
-    def __init__(self, enabled: bool = False, volume: float = WHITE_NOISE_VOLUME):
+    def __init__(
+        self,
+        enabled: bool = False,
+        volume: float = WHITE_NOISE_VOLUME,
+        is_debug_enabled=lambda: True,
+    ):
         self._enabled = enabled
         self._volume = max(0.0, min(1.0, volume))
         self._sound: pygame.mixer.Sound | None = None
         self._channel: pygame.mixer.Channel | None = None
+        self._is_debug_enabled = is_debug_enabled
 
     def pre_init_mixer(self) -> None:
         pygame.mixer.pre_init(WHITE_NOISE_SAMPLE_RATE, -16, 1, 2048)
@@ -54,7 +60,8 @@ class _WhiteNoiseLoop:
             self._channel = self._sound.play(loops=-1)
         except pygame.error as ex:
             # Keep the experiment usable on machines without an audio device.
-            print(f"White noise disabled: {ex}")
+            if self._is_debug_enabled():
+                print(f"White noise disabled: {ex}")
             self._enabled = False
             self._sound = None
             self._channel = None
@@ -99,7 +106,12 @@ class PygameFrontEnd:
         self._right_button_timer = 0
         self._right_button_sent: bool = False
         self._button_hold_time = FRONTEND_FPS  # 1 second worth of frames (2x faster fill)
-        self._white_noise = _WhiteNoiseLoop(enabled=False, volume=white_noise_volume)
+        self._is_debug = True
+        self._white_noise = _WhiteNoiseLoop(
+            enabled=False,
+            volume=white_noise_volume,
+            is_debug_enabled=lambda: self._is_debug,
+        )
 
         # Initialize socket to receive backend information
         self._data_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -140,30 +152,37 @@ class PygameFrontEnd:
         )
         pygame.draw.rect(self.screen, color, rect)
 
-        # Draw progress bar
+        outbound_progress = max(0.0, min(tracking_obj.progress, 1.0))
+        return_progress = max(0.0, min(tracking_obj.returnProgress, 1.0))
+
+        # Draw progress bar alongside the center/edge cues.
         bar_width = 200
         bar_height = 20
         bar_x = (self._width - bar_width) // 2
         bar_y = 40
         half_width = bar_width // 2
-        outbound_progress = max(0.0, min(tracking_obj.progress, 1.0))
-        return_progress = max(0.0, min(tracking_obj.returnProgress, 1.0))
-        
-        # Background bar
-        pygame.draw.rect(self.screen, (64, 64, 64),
-                        (bar_x, bar_y, bar_width, bar_height))
-        
-        # First half: center -> side (light green)
+
+        pygame.draw.rect(self.screen, (64, 64, 64), (bar_x, bar_y, bar_width, bar_height))
+
         first_fill_width = int(half_width * outbound_progress)
         if first_fill_width > 0:
-            pygame.draw.rect(self.screen, (144, 238, 144),
-                            (bar_x, bar_y, first_fill_width, bar_height))
+            pygame.draw.rect(self.screen, (144, 238, 144), (bar_x, bar_y, first_fill_width, bar_height))
 
-        # Second half: side -> center (green)
         second_fill_width = int(half_width * return_progress)
         if second_fill_width > 0:
-            pygame.draw.rect(self.screen, (0, 200, 0),
-                            (bar_x + half_width, bar_y, second_fill_width, bar_height))
+            pygame.draw.rect(self.screen, (0, 200, 0), (bar_x + half_width, bar_y, second_fill_width, bar_height))
+
+        # Draw the comparison cue:
+        # - outbound: a clean circle expands from center until it reaches the screen edge
+        # - returning: a clear center point marks the target to come back to
+        center = (self._width // 2, self._height // 2)
+        return_cue_active = return_progress > 0.001 or outbound_progress >= 0.995
+        if return_cue_active:
+            pygame.draw.circle(self.screen, (0, 200, 0), center, 16, 3)
+            pygame.draw.circle(self.screen, (0, 200, 0), center, 7)
+        else:
+            max_radius = min(self._width, self._height) // 2 - 8
+            pygame.draw.circle(self.screen, (144, 238, 144), center, max_radius, 4)
             
         # Draw movement counter
         counter_text = self._font.render(f"{tracking_obj.cycleCount}/{tracking_obj.targetCycleCount}", True, (255, 255, 255))
@@ -274,6 +293,7 @@ class PygameFrontEnd:
         data, _ = self._data_socket.recvfrom(4096) # ? Is this enough for all the data?
         # Parse the network data into ExperimentPacket structure
         packet = ExperimentPacket.model_validate_json(data)
+        self._is_debug = packet.isDebug
         self._white_noise.set_enabled(packet.playWhiteNoise)
         
         # Draw all fingers as circles

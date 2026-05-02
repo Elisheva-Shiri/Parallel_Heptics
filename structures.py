@@ -39,6 +39,7 @@ class ExperimentPacket(BaseModel):
     landmarks: list[FingerPosition]
     trackingObject: TrackingObject
     playWhiteNoise: bool = False
+    isDebug: bool = True
 
 class ExperimentControl(BaseModel):
     questionInput: int

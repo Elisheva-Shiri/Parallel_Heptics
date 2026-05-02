@@ -33,10 +33,11 @@ namespace ParallelHeptics.FrontendUnity
         public int ListenPort => listenPort;
         public long ReceivedPackets => Interlocked.Read(ref _receivedPackets);
         public bool IsRunning => _running;
+        public bool IsDebug { get; set; } = true;
 
         public void Configure(int port, bool loopbackOnly)
         {
-            if (_running && port != listenPort)
+            if (IsDebug && _running && port != listenPort)
             {
                 Debug.LogWarning("UDP port changed while receiver is running; restart Play Mode to rebind.");
             }
@@ -57,7 +58,7 @@ namespace ParallelHeptics.FrontendUnity
 
         private void Update()
         {
-            if (!logPacketsPerSecond || Time.unscaledTime - _lastStatsTime < 1f)
+            if (!IsDebug || !logPacketsPerSecond || Time.unscaledTime - _lastStatsTime < 1f)
             {
                 return;
             }
@@ -104,7 +105,10 @@ namespace ParallelHeptics.FrontendUnity
                     Name = "Experiment UDP Receiver"
                 };
                 _receiveThread.Start();
-                Debug.Log($"Experiment UDP receiver listening on {(bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0")}:{listenPort}");
+                if (IsDebug)
+                {
+                    Debug.Log($"Experiment UDP receiver listening on {(bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0")}:{listenPort}");
+                }
             }
             catch (Exception ex)
             {
@@ -122,10 +126,13 @@ namespace ParallelHeptics.FrontendUnity
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"UDP close warning: {ex.Message}");
+                if (IsDebug)
+                {
+                    Debug.LogWarning($"UDP close warning: {ex.Message}");
+                }
             }
 
-            if (_receiveThread != null && _receiveThread.IsAlive && !_receiveThread.Join(250))
+            if (_receiveThread != null && _receiveThread.IsAlive && !_receiveThread.Join(250) && IsDebug)
             {
                 Debug.LogWarning("UDP receiver thread did not stop within timeout; it will exit as a background thread.");
             }
@@ -156,7 +163,7 @@ namespace ParallelHeptics.FrontendUnity
                 }
                 catch (SocketException)
                 {
-                    if (_running)
+                    if (IsDebug && _running)
                     {
                         Debug.LogWarning("UDP receive socket exception; receiver will continue if still running.");
                     }
@@ -167,7 +174,7 @@ namespace ParallelHeptics.FrontendUnity
                 }
                 catch (Exception ex)
                 {
-                    if (_running)
+                    if (IsDebug && _running)
                     {
                         Debug.LogWarning($"UDP receive warning: {ex.Message}");
                     }
