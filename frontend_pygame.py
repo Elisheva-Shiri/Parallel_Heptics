@@ -177,12 +177,13 @@ class PygameFrontEnd:
         # - returning: a clear center point marks the target to come back to
         center = (self._width // 2, self._height // 2)
         return_cue_active = return_progress > 0.001 or outbound_progress >= 0.995
-        if return_cue_active:
-            pygame.draw.circle(self.screen, (0, 200, 0), center, 16, 3)
-            pygame.draw.circle(self.screen, (0, 200, 0), center, 7)
-        else:
-            max_radius = min(self._width, self._height) // 2 - 8
-            pygame.draw.circle(self.screen, (144, 238, 144), center, max_radius, 4)
+        if tracking_obj.isPinched:
+            if return_cue_active:
+                pygame.draw.circle(self.screen, (0, 200, 0), center, 16, 3)
+                pygame.draw.circle(self.screen, (0, 200, 0), center, 7)
+            else:
+                max_radius = min(self._width, self._height) // 2 - 8
+                pygame.draw.circle(self.screen, (144, 238, 144), center, max_radius, 4)
             
         # Draw movement counter
         counter_text = self._font.render(f"{tracking_obj.cycleCount}/{tracking_obj.targetCycleCount}", True, (255, 255, 255))

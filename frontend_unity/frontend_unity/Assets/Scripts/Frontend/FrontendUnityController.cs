@@ -423,8 +423,9 @@ namespace ParallelHeptics.FrontendUnity
             Color color = trackingObject.isPinched ? (trackingObject.pairIndex == 0 ? FirstColor : SecondColor) : GrayColor;
             SetMaterial(_trackingObject, color);
 
-            bool returnCueActive = ShouldShowReturnCue(trackingObject);
-            SetOutboundCueCircle(visible: !returnCueActive);
+            bool showCue = trackingObject.isPinched;
+            bool returnCueActive = showCue && ShouldShowReturnCue(trackingObject);
+            SetOutboundCueCircle(visible: showCue && !returnCueActive);
             _returnCuePoint.SetActive(returnCueActive);
             _titleText.text = returnCueActive ? "Return to center" : "Move to the edge";
 

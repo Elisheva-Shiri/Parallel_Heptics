@@ -278,6 +278,13 @@ namespace ParallelHeptics.FrontendUnity.Tests
                 renderPacket.Invoke(controller, new object[] { outboundPacket });
                 Assert.AreEqual(initialRadius, outboundRenderer.GetPosition(0).x, 0.0001f, "The outbound cue is a fixed max-range target ring; progress changes only the bar.");
 
+                outboundPacket.trackingObject.isPinched = false;
+                renderPacket.Invoke(controller, new object[] { outboundPacket });
+                Assert.IsFalse(FindDynamicChild(panelRoot, "Outbound Edge Cue").activeSelf);
+                Assert.IsFalse(FindDynamicChild(panelRoot, "Center Return Point").activeSelf);
+                Assert.IsTrue(FindDynamicChild(panelRoot, "Progress Background").activeSelf);
+
+                outboundPacket.trackingObject.isPinched = true;
                 var questionPacket = new ExperimentPacket
                 {
                     stateData = new StateData { state = (int)ExperimentState.Question, pauseTime = 0 },
