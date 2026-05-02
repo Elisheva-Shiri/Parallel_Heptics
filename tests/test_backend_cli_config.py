@@ -1,5 +1,7 @@
 import builtins
 import io
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
 import typer
@@ -11,6 +13,32 @@ import backend
 def _restore_debug():
     yield
     backend.set_is_debug(True)
+
+    def test_main_passes_movement_strategy_to_backend_experiment(self):
+        fake_experiment = Mock()
+        config = backend.Configuration(pairs=[])
+
+        with (
+            patch.object(backend.Configuration, "read_configuration", return_value=config),
+            patch.object(backend, "create_experiment_folder", return_value=Path("run")),
+            patch.object(backend, "start_experiment", return_value=fake_experiment) as start_experiment,
+            patch.object(backend, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            backend.main(
+                run_mode=backend.RunMode.SINGLE_FINGER,
+                pair_finger=backend.FingerChoice.INDEX,
+                vision_type=backend.VisionType.MEDIAPIPE,
+                finger_color=None,
+                side_camera_enabled=False,
+                play_white_noise=False,
+                mirror_hand=False,
+                movement_strategy=backend.MovementStrategy.IK,
+                target_cycle_count=1,
+                is_debug=False,
+            )
+
+        fake_experiment.cleanup.assert_called_once_with()
+        self.assertEqual(start_experiment.call_args.args[5], backend.MovementStrategy.IK)
 
 
 def test_debug_print_gate_controls_global_print():
