@@ -34,7 +34,11 @@ namespace ParallelHeptics.FrontendUnity
         private const float SurfaceOffset = 0.002f;
         private const float ForegroundOffset = 0.004f;
         private const float TextOffset = 0.006f;
+        private const float TextScaleFactor = 0.5f;
         private const int CueCircleSegments = 96;
+        private const float OutboundCueRadiusPixels = 190f;
+        private const float AmbientNoiseLowPassAlpha = 0.075f;
+        private const float AmbientNoiseRawMix = 0.16f;
 
         [Header("Backend protocol")]
         [SerializeField] private string backendHost = "localhost";
@@ -282,6 +286,7 @@ namespace ParallelHeptics.FrontendUnity
         {
             float volume = Mathf.Clamp01(requestedVolume);
             uint state = seed;
+            float filtered = 0f;
 
             for (int i = 0; i < data.Length; i++)
             {
@@ -290,7 +295,10 @@ namespace ParallelHeptics.FrontendUnity
                     state = (state * 1664525u) + 1013904223u;
                 }
 
-                data[i] = (((state >> 8) / 8388607.5f) - 1f) * volume;
+                float raw = ((state >> 8) / 8388607.5f) - 1f;
+                filtered += (raw - filtered) * AmbientNoiseLowPassAlpha;
+                float softened = Mathf.Lerp(filtered, raw, AmbientNoiseRawMix);
+                data[i] = softened * volume;
             }
         }
 
@@ -427,7 +435,7 @@ namespace ParallelHeptics.FrontendUnity
             bool returnCueActive = showCue && ShouldShowReturnCue(trackingObject);
             SetOutboundCueCircle(visible: showCue && !returnCueActive);
             _returnCuePoint.SetActive(returnCueActive);
-            _titleText.text = returnCueActive ? "Return to center" : "Move to the edge";
+            _titleText.text = string.Empty;
 
             float barWidth = mapper.PanelWidth * 0.72f;
             float barHeight = mapper.PanelHeight * 0.04f;
@@ -641,7 +649,7 @@ namespace ParallelHeptics.FrontendUnity
             TextMesh text = go.AddComponent<TextMesh>();
             text.anchor = anchor;
             text.alignment = TextAlignment.Center;
-            text.characterSize = characterSize;
+            text.characterSize = characterSize * TextScaleFactor;
             text.fontSize = 80;
             text.color = Color.white;
             return text;
@@ -1096,7 +1104,7 @@ namespace ParallelHeptics.FrontendUnity
                 return;
             }
 
-            float radius = Mathf.Min(mapper.PanelWidth, mapper.PanelHeight) * 0.48f;
+            float radius = mapper.PixelsToPanelSize(0f, OutboundCueRadiusPixels).y;
             SetCircleRadius(radius);
         }
 
