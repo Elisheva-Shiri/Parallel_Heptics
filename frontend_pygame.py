@@ -11,6 +11,9 @@ SECOND_COLOR = (0, 0, 255)  # Blue
 WHITE_NOISE_SAMPLE_RATE = 44_100
 WHITE_NOISE_SECONDS = 2.0
 WHITE_NOISE_VOLUME = 0.15
+AMBIENT_NOISE_LOW_PASS_ALPHA = 0.075
+AMBIENT_NOISE_RAW_MIX = 0.16
+OUTBOUND_CUE_RADIUS = 215
 
 
 def _make_white_noise_buffer(
@@ -19,11 +22,17 @@ def _make_white_noise_buffer(
     amplitude: float = WHITE_NOISE_VOLUME,
     seed: int | None = None,
 ) -> bytes:
-    """Generate little-endian signed 16-bit mono white-noise PCM."""
+    """Generate little-endian signed 16-bit mono softened noise PCM."""
     sample_count = max(1, int(sample_rate * seconds))
     peak = max(0, min(32767, int(32767 * amplitude)))
     rng = random.Random(seed)
-    samples = array("h", (rng.randint(-peak, peak) for _ in range(sample_count)))
+    filtered = 0.0
+    samples = array("h")
+    for _ in range(sample_count):
+        raw = rng.uniform(-1.0, 1.0)
+        filtered += (raw - filtered) * AMBIENT_NOISE_LOW_PASS_ALPHA
+        softened = filtered * (1.0 - AMBIENT_NOISE_RAW_MIX) + raw * AMBIENT_NOISE_RAW_MIX
+        samples.append(int(max(-1.0, min(1.0, softened)) * peak))
     if sys.byteorder != "little":
         samples.byteswap()
     return samples.tobytes()
@@ -182,8 +191,7 @@ class PygameFrontEnd:
                 pygame.draw.circle(self.screen, (0, 200, 0), center, 16, 3)
                 pygame.draw.circle(self.screen, (0, 200, 0), center, 7)
             else:
-                max_radius = min(self._width, self._height) // 2 - 8
-                pygame.draw.circle(self.screen, (144, 238, 144), center, max_radius, 4)
+                pygame.draw.circle(self.screen, (144, 238, 144), center, OUTBOUND_CUE_RADIUS, 4)
             
         # Draw movement counter
         counter_text = self._font.render(f"{tracking_obj.cycleCount}/{tracking_obj.targetCycleCount}", True, (255, 255, 255))

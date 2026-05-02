@@ -45,6 +45,31 @@ namespace ParallelHeptics.FrontendUnity.Tests
         }
 
         [Test]
+        public void ProceduralWhiteNoiseIsSoftenedForAmbientMasking()
+        {
+            MethodInfo fillWhiteNoiseSamples = typeof(FrontendUnityController).GetMethod("FillWhiteNoiseSamples", BindingFlags.Static | BindingFlags.NonPublic);
+            Assert.NotNull(fillWhiteNoiseSamples);
+
+            var samples = new float[1000];
+            fillWhiteNoiseSamples.Invoke(null, new object[] { samples, 1f, 789u });
+
+            float peak = 0f;
+            float adjacentDeltaSum = 0f;
+            for (int i = 0; i < samples.Length; i++)
+            {
+                peak = Mathf.Max(peak, Mathf.Abs(samples[i]));
+                if (i > 0)
+                {
+                    adjacentDeltaSum += Mathf.Abs(samples[i] - samples[i - 1]);
+                }
+            }
+
+            Assert.Greater(peak, 0.01f);
+            Assert.LessOrEqual(peak, 1f);
+            Assert.Less(adjacentDeltaSum / (samples.Length - 1), 0.45f);
+        }
+
+        [Test]
         public void FlatPanelMapperMatchesPygameNormalizedCoordinateConvention()
         {
             var mapper = new FlatPanelMapper();
@@ -147,7 +172,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
                 Assert.NotNull(counter);
                 Assert.AreEqual(0f, counter.transform.localEulerAngles.z, 0.0001f, "Counter text orientation must come from a Y-scale flip, not an in-plane rotation that would reverse reading order.");
                 Assert.AreEqual(-1f, counter.transform.localScale.y, 0.0001f, "Counter text needs Y-scale -1 so the horizontal tabletop reads right-side up without mirroring the reading direction.");
-                Assert.AreEqual(0.025f, counter.characterSize, 0.0001f, "Counter should be half of the previous 0.05 m tabletop text size.");
+                Assert.AreEqual(0.0125f, counter.characterSize, 0.0001f, "Counter should be half of the current Unity tabletop text scale.");
             }
             finally
             {

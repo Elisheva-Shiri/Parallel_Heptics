@@ -25,6 +25,18 @@ class FrontendAudioTests(unittest.TestCase):
         self.assertGreaterEqual(min(samples), -int(32767 * 0.25))
         self.assertGreater(len(set(samples)), 1)
 
+    def test_white_noise_buffer_is_softened_for_ambient_masking(self):
+        buffer = _make_white_noise_buffer(sample_rate=1000, seconds=1.0, amplitude=1.0, seed=789)
+        samples = array("h")
+        samples.frombytes(buffer)
+
+        mean_adjacent_delta = sum(
+            abs(current - previous)
+            for previous, current in zip(samples, samples[1:])
+        ) / (len(samples) - 1)
+
+        self.assertLess(mean_adjacent_delta, 32767 * 0.45)
+
     def test_experiment_packet_white_noise_flag_defaults_to_false(self):
         packet = ExperimentPacket.model_validate_json(
             '{"stateData":{"state":1,"pauseTime":0},'
