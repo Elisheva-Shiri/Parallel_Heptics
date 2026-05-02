@@ -16,6 +16,31 @@ AMBIENT_NOISE_RAW_MIX = 0.16
 OUTBOUND_CUE_RADIUS = 215
 
 
+def _recv_latest_datagram(data_socket: socket.socket, max_bytes: int) -> bytes:
+    """Receive one datagram, then discard queued stale datagrams.
+
+    The backend sends frontend packets at a fixed rate. If rendering ever falls
+    behind, a UDP socket can accumulate older hand positions; drawing those
+    packets one-by-one turns a brief slowdown into visible tracking latency.
+    Block for the first packet to preserve the existing frame pacing, then
+    drain any immediately available packets and return only the newest one.
+    """
+    latest, _ = data_socket.recvfrom(max_bytes)
+
+    previous_timeout = data_socket.gettimeout()
+    data_socket.setblocking(False)
+    try:
+        while True:
+            try:
+                latest, _ = data_socket.recvfrom(max_bytes)
+            except (BlockingIOError, socket.timeout):
+                break
+    finally:
+        data_socket.settimeout(previous_timeout)
+
+    return latest
+
+
 def _make_white_noise_buffer(
     sample_rate: int = WHITE_NOISE_SAMPLE_RATE,
     seconds: float = WHITE_NOISE_SECONDS,
@@ -309,7 +334,7 @@ class PygameFrontEnd:
 
         self.screen.fill((0, 0, 0))
 
-        data, _ = self._data_socket.recvfrom(4096) # ? Is this enough for all the data?
+        data = _recv_latest_datagram(self._data_socket, 4096) # ? Is this enough for all the data?
         # Parse the network data into ExperimentPacket structure
         packet = ExperimentPacket.model_validate_json(data)
         self._is_debug = packet.isDebug
