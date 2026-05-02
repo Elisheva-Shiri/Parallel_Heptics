@@ -344,12 +344,7 @@ class PygameFrontEnd:
         packet = ExperimentPacket.model_validate_json(data)
         self._is_debug = packet.isDebug
         self._white_noise.set_enabled(packet.playWhiteNoise)
-        
-        # Draw all fingers as circles
-        for finger_position in packet.landmarks:
-            pygame.draw.circle(self.screen, (211, 211, 211),
-                            (int(finger_position.x * self._width), int(finger_position.z * self._height)), 5)
-        
+
         match packet.stateData.state:
             case ExperimentState.COMPARISON.value:
                 self._draw_comparison(packet.trackingObject)
@@ -371,6 +366,12 @@ class PygameFrontEnd:
 
             case _:
                 pass
+
+        # Draw fingers last so the cursor stays visible above target objects
+        # (comparison cube, question buttons) instead of being painted under them.
+        for finger_position in packet.landmarks:
+            pygame.draw.circle(self.screen, (211, 211, 211),
+                            (int(finger_position.x * self._width), int(finger_position.z * self._height)), 5)
 
         pygame.display.flip()
 
