@@ -61,9 +61,10 @@ class MotorType(StrEnum):
     HARDWARE = "hardware"
     NONE = "none"
 
-MOVE_FACTOR = 3
+# for free form 3
+MOVE_FACTOR = 7
 MOTOR_TYPE = MotorType.HARDWARE
-MOVEMENT_STRATEGY = MovementStrategy.FREE_FORM
+MOVEMENT_STRATEGY = MovementStrategy.IK
 MOTOR_OPPOSES_OBJECT_MOTION = True
 RECORDING_DATA = True
 
@@ -166,6 +167,7 @@ class Experiment:
         run_mode: Literal["comparison", "single_finger"] = "comparison",
         motor_set_id: MotorSetId = MotorSetId.MOTORS_0_2,
         hand_orientation: HandOrientation = HandOrientation.NOT_MIRRORED,
+        movement_strategy: MovementStrategy = MOVEMENT_STRATEGY,
         target_cycle_count: int = TARGET_CYCLE_COUNT,
         vision_type: VisionType = VisionType.MEDIAPIPE,
         tapping_enabled: bool = False,
@@ -217,6 +219,7 @@ class Experiment:
         self._motor_set_id = motor_set_id
         self._target_cycle_count = target_cycle_count
         self._hand_orientation = hand_orientation
+        self._movement_strategy = movement_strategy
         self._play_white_noise = play_white_noise
         self._is_debug = is_debug
         self._state_lock = Lock()
@@ -245,7 +248,7 @@ class Experiment:
         
         # Motor Controller
         self._motor_controller = MotorController(
-            movement_strategy=MOVEMENT_STRATEGY,
+            movement_strategy=self._movement_strategy,
             top_width=self._top_width,
             top_height=self._top_height,
             edge_threshold=self.EDGE_THRESHOLD,
@@ -1430,6 +1433,7 @@ def start_experiment(
     run_mode: Literal["comparison", "single_finger"],
     motor_set_id: MotorSetId,
     hand_orientation: HandOrientation,
+    movement_strategy: MovementStrategy,
     target_cycle_count: int,
     vision_type: VisionType,
     tapping_enabled: bool,
@@ -1446,6 +1450,7 @@ def start_experiment(
         run_mode=run_mode,
         motor_set_id=motor_set_id,
         hand_orientation=hand_orientation,
+        movement_strategy=movement_strategy,
         target_cycle_count=target_cycle_count,
         vision_type=vision_type,
         tapping_enabled=tapping_enabled,
@@ -1875,6 +1880,7 @@ def main(
     side_camera_enabled: Annotated[bool | None, typer.Option("--side-camera-enabled/--side-camera-disabled", help="Whether the side camera is enabled. Asked interactively when omitted.")] = None,
     play_white_noise: Annotated[bool | None, typer.Option("--white-noise/--no-white-noise", help="Whether frontend should play white-noise masking. Asked interactively when omitted.")] = None,
     mirror_hand: Annotated[bool | None, typer.Option("--mirror-hand/--no-mirror-hand", help="Whether to mirror hand orientation. Asked interactively when omitted.")] = None,
+    movement_strategy: Annotated[MovementStrategy, typer.Option("--movement-strategy", help="Motor movement mapping strategy. Use 'ik' for the IK solver ported into this repository.")] = MOVEMENT_STRATEGY,
     target_cycle_count: Annotated[int | None, typer.Option("--target-cycle-count", min=1, help="Number of cycles to apply. Asked interactively when omitted.")] = None,
     is_debug: Annotated[bool, typer.Option("--debug/--no-debug", help="Enable debug prints/logs and send the debug flag to frontend packets.")] = True,
     continue_last_experiment: Annotated[bool, typer.Option("--continue-last-experiment", "--continue-last", help="Resume the latest experiment folder. Reuses its configuration.csv and starts at the beginning of a pair.")] = False,
@@ -1922,7 +1928,7 @@ def main(
 
     experiment = start_experiment(
         config, path, resolved_run_mode, resolved_motor_set_id, hand_orientation,
-        resolved_target_cycle_count, resolved_vision_type, tapping_enabled, finger_colors,
+        movement_strategy, resolved_target_cycle_count, resolved_vision_type, tapping_enabled, finger_colors,
         side_camera_off, resolved_play_white_noise, is_debug,
         resume_pair_number=resume_pair_number,
     )

@@ -1,6 +1,9 @@
 import math
 from dataclasses import dataclass
 from enum import Enum, StrEnum
+from typing import Any
+
+from kinematics import unified_ik_starter as ik
 
 
 class MotorSetId(Enum):
@@ -27,6 +30,7 @@ class MovementStrategy(StrEnum):
     CARDINAL = "cardinal"
     CARDINAL_DIAGONAL = "cardinal_diagonal"
     FREE_FORM = "free_form"
+    IK = "ik"
 
 
 class HandOrientation(StrEnum):
@@ -89,6 +93,10 @@ class MotorController:
         self._motor_spacing = motor_spacing
         self._move_factor = move_factor
         self._diagonal_threshold = diagonal_threshold
+        self._ik_module: Any | None = None
+        self._ik_model: dict[str, Any] | None = None
+        self._ik_wire_reference: dict[str, float] | None = None
+        self._ik_previous_angles: dict[str, dict[str, float]] | None = None
 
     def build_message(self, motors: list[MotorMovement]) -> str:
         """Build a firmware command string from motor movements.
@@ -136,6 +144,8 @@ class MotorController:
         match self._movement_strategy:
             case MovementStrategy.FREE_FORM:
                 movements = self._calculate_freeform_motor_movements(motor_set_id, obj_x, obj_y)
+            case MovementStrategy.IK:
+                movements = self._calculate_ik_motor_movements(motor_set_id, obj_x, obj_y)
             case MovementStrategy.CARDINAL | MovementStrategy.CARDINAL_DIAGONAL:
                 direction, distance = self._determine_movement_direction(obj_x, obj_y)
                 if direction == "none":
@@ -285,13 +295,131 @@ class MotorController:
         Returns:
             List of per-motor deltas, clipped to the configured workspace radius.
         """
+        obj_x, obj_y = self._clamp_to_workspace(obj_x, obj_y)
+        return self._calculate_movements_to_point(motor_set_id, (obj_x, obj_y))
+
+    def _calculate_ik_motor_movements(
+        self,
+        motor_set_id: MotorSetId,
+        obj_x: float,
+        obj_y: float,
+    ) -> list[MotorMovement]:
+        """Compute motor commands through the unified IK and wire model."""
+        ik = self._get_ik_module()
+        model = self._get_ik_model()
+        self._ensure_ik_wire_reference()
+
+        obj_x, obj_y = self._clamp_to_workspace(obj_x, obj_y)
+        sim_to_ik_scale = self._get_ik_base_span(model) / self._motor_spacing
+        ik_to_sim_scale = 1.0 / sim_to_ik_scale
+        p1 = (obj_x * sim_to_ik_scale, obj_y * sim_to_ik_scale, self._get_ik_tactor_z(model))
+
+        result = ik.solve_all_legs(
+            P1=p1,
+            phi1=math.pi / 2.0,
+            previous_angles=self._ik_previous_angles,
+            model=model,
+        )
+        if not all(result[leg]["valid"] for leg in ("top", "right", "left")):
+            invalid = {
+                leg: result[leg]["fail_reason"]
+                for leg in ("top", "right", "left")
+                if not result[leg]["valid"]
+            }
+            raise ValueError(f"IK solution is invalid for target {p1}: {invalid}")
+
+        self._ik_previous_angles = self._extract_ik_angles(result)
+        base_motor_idx = motor_set_id.base_index
+        movements: list[MotorMovement] = []
+        for i, leg in enumerate(("top", "right", "left")):
+            wire_length = self._calculate_ik_wire_length(leg, result[leg], model)
+            wire_delta = wire_length - self._ik_wire_reference[leg]
+            movements.append(MotorMovement(pos=int(wire_delta * ik_to_sim_scale), index=base_motor_idx + i))
+        return movements
+
+    def _get_ik_module(self) -> Any:
+        if self._ik_module is None:
+            self._ik_module = ik
+        return self._ik_module
+
+    def _get_ik_model(self) -> dict[str, Any]:
+        if self._ik_model is None:
+            self._ik_model = self._get_ik_module().default_model()
+        return self._ik_model
+
+    def _ensure_ik_wire_reference(self) -> None:
+        if self._ik_wire_reference is not None:
+            return
+
+        ik = self._get_ik_module()
+        model = self._get_ik_model()
+        result = ik.solve_all_legs((0.0, 0.0, self._get_ik_tactor_z(model)), math.pi / 2.0, model=model)
+        if not all(result[leg]["valid"] for leg in ("top", "right", "left")):
+            raise ValueError("IK origin reference is invalid.")
+
+        self._ik_wire_reference = {
+            leg: self._calculate_ik_wire_length(leg, result[leg], model)
+            for leg in ("top", "right", "left")
+        }
+        self._ik_previous_angles = self._extract_ik_angles(result)
+
+    def _calculate_ik_wire_length(
+        self,
+        leg: str,
+        leg_result: dict[str, Any],
+        model: dict[str, Any],
+    ) -> float:
+        pb = model["anchors"][leg]
+        p2 = leg_result["P2"]
+        p3 = leg_result["selected_P3"]
+        direction = self._unit3((p2[0] - p3[0], p2[1] - p3[1], p2[2] - p3[2]))
+        attach = (
+            p3[0] + 4.1 * direction[0],
+            p3[1] + 4.1 * direction[1],
+            p3[2] + 4.1 * direction[2],
+        )
+        return math.sqrt(
+            (attach[0] - pb[0]) ** 2
+            + (attach[1] - pb[1]) ** 2
+            + (attach[2] - pb[2]) ** 2
+        )
+
+    def _extract_ik_angles(self, result: dict[str, Any]) -> dict[str, dict[str, float]]:
+        return {
+            leg: {
+                "phi2": result[leg]["phi2"],
+                "phi3": result[leg]["phi3"],
+                "phi4": result[leg]["phi4"],
+                "phi5": result[leg]["phi5"],
+                "phi6": result[leg]["phi6"],
+            }
+            for leg in ("top", "right", "left")
+            if result[leg]["valid"]
+        }
+
+    def _get_ik_base_span(self, model: dict[str, Any]) -> float:
+        right = model["anchors"]["right"]
+        left = model["anchors"]["left"]
+        return math.sqrt((right[0] - left[0]) ** 2 + (right[1] - left[1]) ** 2)
+
+    def _get_ik_tactor_z(self, model: dict[str, Any]) -> float:
+        # Keep the working height inside the current IK model's reachable sphere.
+        # With the default model, z=6.0 validates the clamped controller workspace.
+        return max(0.0, min(6.0, model["lengths"]["d3"] - 0.1))
+
+    def _clamp_to_workspace(self, obj_x: float, obj_y: float) -> tuple[float, float]:
         max_radius = max(0.0, min(self._top_width / 2, self._top_height / 2) - self._edge_threshold)
         distance = math.sqrt(obj_x**2 + obj_y**2)
         if distance > max_radius and distance > 0:
             scale = max_radius / distance
-            obj_x *= scale
-            obj_y *= scale
-        return self._calculate_movements_to_point(motor_set_id, (obj_x, obj_y))
+            return (obj_x * scale, obj_y * scale)
+        return (obj_x, obj_y)
+
+    def _unit3(self, vector: tuple[float, float, float]) -> tuple[float, float, float]:
+        norm = math.sqrt(vector[0] ** 2 + vector[1] ** 2 + vector[2] ** 2)
+        if norm == 0.0:
+            raise ValueError("Cannot normalize zero-length IK wire attachment vector.")
+        return (vector[0] / norm, vector[1] / norm, vector[2] / norm)
 
     def _calculate_movements_to_point(
         self,
