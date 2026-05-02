@@ -253,6 +253,65 @@ namespace ParallelHeptics.FrontendUnity.Tests
         }
 
         [Test]
+        public void ComparisonCycleCounterHidesForSingleIterationOnly()
+        {
+            GameObject controllerObject = new GameObject("Cycle Counter Render Test Controller");
+            GameObject panelRoot = null;
+
+            try
+            {
+                var controller = controllerObject.AddComponent<FrontendUnityController>();
+                MethodInfo buildSceneGraph = typeof(FrontendUnityController).GetMethod("BuildSceneGraph", BindingFlags.Instance | BindingFlags.NonPublic);
+                MethodInfo renderPacket = typeof(FrontendUnityController).GetMethod("RenderPacket", BindingFlags.Instance | BindingFlags.NonPublic);
+                Assert.NotNull(buildSceneGraph);
+                Assert.NotNull(renderPacket);
+                buildSceneGraph.Invoke(controller, null);
+
+                var packet = new ExperimentPacket
+                {
+                    stateData = new StateData { state = (int)ExperimentState.Comparison, pauseTime = 0 },
+                    landmarks = new System.Collections.Generic.List<FingerPosition>(),
+                    trackingObject = new TrackingObject
+                    {
+                        x = 0.5f,
+                        z = 0.5f,
+                        size = 40f,
+                        isInteracting = true,
+                        progress = 0f,
+                        returnProgress = 0f,
+                        cycleCount = 0,
+                        targetCycleCount = 1,
+                        pairIndex = 0
+                    },
+                    playWhiteNoise = false
+                };
+
+                renderPacket.Invoke(controller, new object[] { packet });
+
+                panelRoot = GameObject.Find("Flat VR Frontend Panel");
+                Assert.NotNull(panelRoot);
+                var counter = FindDynamicChild(panelRoot, "Cycle Counter").GetComponent<TextMesh>();
+                Assert.IsFalse(counter.gameObject.activeSelf);
+                Assert.AreEqual(string.Empty, counter.text);
+
+                packet.trackingObject.targetCycleCount = 2;
+                renderPacket.Invoke(controller, new object[] { packet });
+
+                Assert.IsTrue(counter.gameObject.activeSelf);
+                Assert.AreEqual("0/2", counter.text);
+            }
+            finally
+            {
+                if (panelRoot != null)
+                {
+                    Object.DestroyImmediate(panelRoot);
+                }
+
+                Object.DestroyImmediate(controllerObject);
+            }
+        }
+
+        [Test]
         public void ComparisonCuesSwitchDirectionAndHideOutsideComparison()
         {
             GameObject controllerObject = new GameObject("Comparison Cue Test Controller");
