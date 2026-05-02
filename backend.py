@@ -4,6 +4,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import math
+import signal
 from time import sleep
 import cv2
 import threading
@@ -208,10 +209,15 @@ class Experiment:
         self._play_white_noise = play_white_noise
         self._is_debug = is_debug
         self._state_lock = Lock()
+        self._cleanup_lock = Lock()
+        self._cleaned_up = False
         self._control_queue: Queue[ExperimentControl] = Queue()
         self._client_threads: list[threading.Thread] = []
         self._moderator_pause_started_at: Optional[datetime] = None
         self._moderator_pause_state_when_started: Optional[ExperimentState] = None
+        self._camera_lock = Lock()
+        self._top_camera_capture: cv2.VideoCapture | None = None
+        self._side_camera_capture: cv2.VideoCapture | None = None
 
         # Frame queues for recording
         self._top_frame_queue = Queue(maxsize=30)
@@ -445,6 +451,72 @@ class Experiment:
         if self._side_writer:
             self._side_writer.release() 
             self._side_writer = None
+
+    def is_running(self) -> bool:
+        """Return whether the experiment should keep its worker loops alive."""
+        return self._running
+
+    def request_shutdown(self) -> None:
+        """Ask all worker loops to stop and unblock camera reads as soon as possible."""
+        self._running = False
+        self._release_camera_captures()
+
+    def _register_camera_capture(self, camera_name: Literal["top", "side"], cap: cv2.VideoCapture) -> None:
+        with self._camera_lock:
+            if camera_name == "top":
+                self._top_camera_capture = cap
+            elif camera_name == "side":
+                self._side_camera_capture = cap
+
+    def _clear_camera_capture(self, camera_name: Literal["top", "side"], cap: cv2.VideoCapture) -> None:
+        with self._camera_lock:
+            if camera_name == "top" and self._top_camera_capture is cap:
+                self._top_camera_capture = None
+            elif camera_name == "side" and self._side_camera_capture is cap:
+                self._side_camera_capture = None
+
+    def _release_camera_captures(self) -> None:
+        with self._camera_lock:
+            captures = [self._top_camera_capture, self._side_camera_capture]
+            self._top_camera_capture = None
+            self._side_camera_capture = None
+
+        for cap in captures:
+            if cap is None:
+                continue
+            try:
+                cap.release()
+            except Exception as e:
+                print(f"Failed to release camera capture: {e}")
+
+    @staticmethod
+    def _safe_destroy_window(window_name: str) -> None:
+        try:
+            cv2.destroyWindow(window_name)
+        except cv2.error:
+            # The window may already be gone, especially during Ctrl-C cleanup.
+            pass
+
+    @staticmethod
+    def _safe_destroy_all_windows() -> None:
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            # Headless OpenCV builds or already-destroyed windows can raise here.
+            pass
+
+    @staticmethod
+    def _safe_close_socket(sock: socket.socket) -> None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _join_thread(thread: threading.Thread | None, timeout: float = 1.0) -> None:
+        if thread is None or thread is threading.current_thread() or not thread.is_alive():
+            return
+        thread.join(timeout=timeout)
 
     def _sleep_virtual_object(self):
         sleep(1.0 / self._virtual_object_fps)
@@ -1142,35 +1214,43 @@ class Experiment:
         """Process top camera feed to track finger positions"""
         cap = cv2.VideoCapture(self.TOP_CAMERA, cv2.CAP_DSHOW)
         if not cap.isOpened():
+            cap.release()
             raise RuntimeError("Failed to open top camera")
 
-        self._configure_camera(cap)
+        self._register_camera_capture("top", cap)
+        try:
+            self._configure_camera(cap)
 
-        while self._running:
-            ret, frame = cap.read()
-            if not ret:
-                continue
+            while self._running:
+                ret, frame = cap.read()
+                if not ret:
+                    continue
 
-            # Flip frame in y *after* reading (to invert the y axis)
-            if DEBUG_FLIP_Y:
-                frame = cv2.flip(frame, 0)
+                # Flip frame in y *after* reading (to invert the y axis)
+                if DEBUG_FLIP_Y:
+                    frame = cv2.flip(frame, 0)
 
-            detected = self._process_top_view(frame)
-            
-            # Add frame to recording queue if recording
-            if self._top_writer:
-                try:
-                    self._top_frame_queue.put_nowait((frame, detected))
-                except Exception:
-                    pass
+                detected = self._process_top_view(frame)
                 
-            cv2.imshow("Top Camera", cv2.flip(frame, 1))
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            
-            with self._hand_position_lock:
-                self._current_position = detected
+                # Add frame to recording queue if recording
+                if self._top_writer:
+                    try:
+                        self._top_frame_queue.put_nowait((frame, detected))
+                    except Exception:
+                        pass
+                    
+                cv2.imshow("Top Camera", cv2.flip(frame, 1))
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    self.request_shutdown()
+                    break
+                
+                with self._hand_position_lock:
+                    self._current_position = detected
+        finally:
+            self._clear_camera_capture("top", cap)
+            cap.release()
+            self._safe_destroy_window("Top Camera")
 
     def start_side_camera(self):
         """Process side camera feed to detect interaction gestures"""
@@ -1181,37 +1261,46 @@ class Experiment:
             if cap.isOpened():
                 break
 
+            cap.release()
             cap = cv2.VideoCapture(self.SIDE_CAMERA, cv2.CAP_DSHOW)
 
         if not cap.isOpened():
+            cap.release()
             print("Side camera not available - use moderator_control.py --toggle-interaction for manual interaction control")
             self._manual_interaction_enabled = True
             return
         
-        self._configure_camera(cap)
-        # Sleeping 3 seconds to give time for the camera to warm up
-        sleep(3)
+        self._register_camera_capture("side", cap)
+        try:
+            self._configure_camera(cap)
+            # Sleeping 3 seconds to give time for the camera to warm up
+            sleep(3)
 
-        while self._running:
-            ret, frame = cap.read()
-            if not ret:
-                continue
+            while self._running:
+                ret, frame = cap.read()
+                if not ret:
+                    continue
 
-            if self._tapping_enabled:
-                self._detect_tapping(frame)
-            else:
-                self._detect_interaction(frame)
-            
-            # Add frame to recording queue if recording
-            if self._side_writer:
-                try:
-                    self._side_frame_queue.put_nowait(frame)
-                except Exception:
-                    pass
+                if self._tapping_enabled:
+                    self._detect_tapping(frame)
+                else:
+                    self._detect_interaction(frame)
                 
-            cv2.imshow("Side Camera", cv2.flip(frame, 1))
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+                # Add frame to recording queue if recording
+                if self._side_writer:
+                    try:
+                        self._side_frame_queue.put_nowait(frame)
+                    except Exception:
+                        pass
+                    
+                cv2.imshow("Side Camera", cv2.flip(frame, 1))
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    self.request_shutdown()
+                    break
+        finally:
+            self._clear_camera_capture("side", cap)
+            cap.release()
+            self._safe_destroy_window("Side Camera")
 
     def get_hand_position(self, with_lock = True) -> Optional[HandPosition]:
         """Get the current hand position"""
@@ -1275,6 +1364,13 @@ class Experiment:
         
     def cleanup(self):
         """Clean up resources"""
+        with self._cleanup_lock:
+            if self._cleaned_up:
+                return
+            self._cleaned_up = True
+
+        self.request_shutdown()
+
         with self._state_lock:
             active_pause = self._moderator_pause_started_at
             active_pause_state = self._moderator_pause_state_when_started or self._state
@@ -1283,16 +1379,23 @@ class Experiment:
         if active_pause is not None:
             self._log_moderator_pause(active_pause, datetime.now(), active_pause_state)
 
-        self._running = False
-        cv2.destroyAllWindows()
-        self._frontend_socket.close()
-        self._listening_socket.close()
+        self._safe_close_socket(self._frontend_socket)
+        self._safe_close_socket(self._listening_socket)
+        self._join_thread(getattr(self, "_top_thread", None), timeout=2.0)
+        self._join_thread(getattr(self, "_side_thread", None), timeout=2.0)
+        self._join_thread(getattr(self, "_top_recording_thread", None))
+        self._join_thread(getattr(self, "_side_recording_thread", None))
+        self._join_thread(getattr(self, "_control_thread", None))
+        self._join_thread(getattr(self, "_experiment_thread", None))
+        self._join_thread(getattr(self, "_frontend_network_thread", None))
+        self._join_thread(getattr(self, "_hardware_thread", None))
+        self._safe_destroy_all_windows()
         self._cleanup_writers()
         self._vision.cleanup()
 
         match MOTOR_TYPE:
             case MotorType.HARDWARE:
-                self._hardware_socket.close()
+                self._safe_close_socket(self._hardware_socket)
             case MotorType.NONE:
                 ...  # No cleanup needed
             case _:
@@ -1631,14 +1734,32 @@ def _resolve_resume_context(
         )
 
     config = Configuration.read_configuration(str(config_path))
+    last_pair_number = _find_last_pair_number(folder)
 
     if from_pair is not None:
         if from_pair < 1:
             raise typer.BadParameter("--from-pair must be >= 1", param_hint="--from-pair")
+        if last_pair_number is None:
+            if from_pair > 1:
+                raise typer.BadParameter(
+                    (
+                        f"--from-pair {from_pair} cannot be used because no "
+                        "pair_NNN folders exist yet; start at pair 1"
+                    ),
+                    param_hint="--from-pair",
+                )
+        elif from_pair > last_pair_number:
+            raise typer.BadParameter(
+                (
+                    f"--from-pair {from_pair} is higher than the latest started "
+                    f"pair ({last_pair_number}); choose pair {last_pair_number} "
+                    "or earlier so the last started pair is re-done"
+                ),
+                param_hint="--from-pair",
+            )
         resume_pair_number = from_pair
     else:
-        last = _find_last_pair_number(folder)
-        resume_pair_number = last if last is not None else 1
+        resume_pair_number = last_pair_number if last_pair_number is not None else 1
 
     return folder, config, resume_pair_number
 
@@ -1654,7 +1775,7 @@ def main(
     target_cycle_count: Annotated[int | None, typer.Option("--target-cycle-count", min=1, help="Number of cycles to apply. Asked interactively when omitted.")] = None,
     is_debug: Annotated[bool, typer.Option("--debug/--no-debug", help="Enable debug prints/logs and send the debug flag to frontend packets.")] = True,
     continue_last_experiment: Annotated[bool, typer.Option("--continue-last-experiment", "--continue-last", help="Resume the latest experiment folder. Reuses its configuration.csv and starts at the beginning of a pair.")] = False,
-    from_pair: Annotated[int | None, typer.Option("--from-pair", min=1, help="With --continue-last-experiment, resume at this pair number from configuration.csv. Defaults to the last pair_NNN folder present.")] = None,
+    from_pair: Annotated[int | None, typer.Option("--from-pair", min=1, help="With --continue-last-experiment, resume at this pair number from configuration.csv. Must be no higher than the latest pair_NNN folder so the last started pair is re-done. Defaults to the last pair_NNN folder present.")] = None,
 ):
     set_is_debug(is_debug)
 
@@ -1699,10 +1820,21 @@ def main(
         side_camera_off, resolved_play_white_noise, is_debug,
         resume_pair_number=resume_pair_number,
     )
+
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
+
+    def _handle_sigint(signum, frame):
+        original_print("\nCtrl-C received; shutting down cameras and background workers...")
+        experiment.request_shutdown()
+
+    signal.signal(signal.SIGINT, _handle_sigint)
     try:
-        while True:
+        while experiment.is_running():
             sleep(0.1)
     except KeyboardInterrupt:
+        experiment.request_shutdown()
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
         experiment.cleanup()
 
 
