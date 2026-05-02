@@ -22,7 +22,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
         [Test]
         public void ExperimentPacketJsonMatchesBackendShape()
         {
-            const string json = "{\"stateData\":{\"state\":1,\"pauseTime\":0},\"landmarks\":[{\"x\":0.25,\"z\":0.75}],\"trackingObject\":{\"x\":0.5,\"z\":0.4,\"size\":40.0,\"isPinched\":true,\"progress\":0.25,\"returnProgress\":0.5,\"cycleCount\":1,\"targetCycleCount\":2,\"pairIndex\":0},\"playWhiteNoise\":true,\"isDebug\":false}";
+            const string json = "{\"stateData\":{\"state\":1,\"pauseTime\":0},\"landmarks\":[{\"x\":0.25,\"z\":0.75}],\"trackingObject\":{\"x\":0.5,\"z\":0.4,\"size\":40.0,\"isInteracting\":true,\"progress\":0.25,\"returnProgress\":0.5,\"cycleCount\":1,\"targetCycleCount\":2,\"pairIndex\":0},\"playWhiteNoise\":true,\"isDebug\":false}";
 
             ExperimentPacket packet = JsonUtility.FromJson<ExperimentPacket>(json);
 
@@ -30,7 +30,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
             Assert.AreEqual((int)ExperimentState.Comparison, packet.stateData.state);
             Assert.AreEqual(1, packet.landmarks.Count);
             Assert.AreEqual(0.25f, packet.landmarks[0].x, 0.0001f);
-            Assert.IsTrue(packet.trackingObject.isPinched);
+            Assert.IsTrue(packet.trackingObject.isInteracting);
             Assert.AreEqual(0.5f, packet.trackingObject.returnProgress, 0.0001f);
             Assert.IsTrue(packet.playWhiteNoise);
             Assert.IsFalse(packet.isDebug);
@@ -213,7 +213,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
                         x = 0.5f,
                         z = 0.4f,
                         size = 40f,
-                        isPinched = true,
+                        isInteracting = true,
                         progress = 0.25f,
                         returnProgress = 0.5f,
                         cycleCount = 1,
@@ -276,7 +276,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
                         x = 0.55f,
                         z = 0.5f,
                         size = 40f,
-                        isPinched = true,
+                        isInteracting = true,
                         progress = 0.4f,
                         returnProgress = 0f,
                         cycleCount = 0,
@@ -303,13 +303,13 @@ namespace ParallelHeptics.FrontendUnity.Tests
                 renderPacket.Invoke(controller, new object[] { outboundPacket });
                 Assert.AreEqual(initialRadius, outboundRenderer.GetPosition(0).x, 0.0001f, "The outbound cue is a fixed max-range target ring; progress changes only the bar.");
 
-                outboundPacket.trackingObject.isPinched = false;
+                outboundPacket.trackingObject.isInteracting = false;
                 renderPacket.Invoke(controller, new object[] { outboundPacket });
                 Assert.IsFalse(FindDynamicChild(panelRoot, "Outbound Edge Cue").activeSelf);
                 Assert.IsFalse(FindDynamicChild(panelRoot, "Center Return Point").activeSelf);
                 Assert.IsTrue(FindDynamicChild(panelRoot, "Progress Background").activeSelf);
 
-                outboundPacket.trackingObject.isPinched = true;
+                outboundPacket.trackingObject.isInteracting = true;
                 var questionPacket = new ExperimentPacket
                 {
                     stateData = new StateData { state = (int)ExperimentState.Question, pauseTime = 0 },

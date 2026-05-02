@@ -20,12 +20,15 @@ UNITY_PORT = 12345
 PYGAME_PORT = 12346
 HARDWARE_PORT = 12347
 
+# Finger IDs used by experiment configuration/protocol CSVs. The thumb is
+# tracked separately for interaction geometry; configured IDs select the active
+# non-thumb finger unless single-finger mode explicitly selects thumb.
 FINGER_NAMES: dict[int, str] = {
-    0: "thumb",
-    1: "index",
-    2: "middle",
-    3: "ring",
-    4: "pinky",
+    0: "index",
+    1: "middle",
+    2: "ring",
+    3: "pinky",
+    4: "thumb",
 }
 
 FingerName = Literal["thumb", "index", "middle", "ring", "pinky"]

@@ -98,7 +98,7 @@ class VirtualObject(BaseModel):
     size: float = 40.0  # Size of cube sides
     original_x: float = 0.0  # Center of plane
     original_y: float = 0.0  # Center of plane
-    is_pinched: bool = False
+    is_interacting: bool = False
     prev_x: float = 0.0  # Track previous x position for movement detection
     prev_y: float = 0.0  # Track previous y position for movement detection
 
@@ -118,7 +118,7 @@ class VirtualObject(BaseModel):
         self.y = self.original_y
         self.prev_x = self.original_x
         self.prev_y = self.original_y
-        self.is_pinched = False
+        self.is_interacting = False
 
         # reset progress/Cycle Counter
         self.progress = 0.0
@@ -136,7 +136,7 @@ class Experiment:
         self._hand_position_lock = Lock()
         self._visualization_lock = Lock()
         self._current_position: Optional[HandPosition] = None
-        self._is_pinching = False
+        self._is_interacting = False
         self._config = config
         self._path = path
         self._width = width
@@ -197,8 +197,8 @@ class Experiment:
         self._top_writer = None
         self._side_writer = None
         
-        # Threshold for pinch detection (adjust as needed)
-        self.BASE_PINCH_THRESHOLD = 1.5  # pixels
+        # Threshold for interaction detection (adjust as needed)
+        self.BASE_INTERACTION_THRESHOLD = 1.5  # pixels
 
         # Start recording threads
         self._top_recording_thread = threading.Thread(target=self._record_top_frames, daemon=True)
@@ -281,11 +281,11 @@ class Experiment:
         sleep(1.0 / self._motors_communication_rate)
 
     def _update_virtual_object(self, stiffness_value: int, pair_index: int) -> None:
-        """Update virtual object position based on hand position and pinch state"""
+        """Update virtual object position based on hand position and interaction state"""
         if self._current_position is None:
             return
 
-        # Check if fingers are near object for pinching
+        # Check if fingers are near object for interacting
         finger_midpoint_x = (self._current_position.thumb_x + self._current_position.active_finger_x) / 2
         finger_midpoint_y = (self._current_position.thumb_y + self._current_position.active_finger_y) / 2
         
@@ -294,18 +294,18 @@ class Experiment:
             (finger_midpoint_y - self._virtual_object.y)**2
         )
         
-        # Update object pinch state
-        if self._is_pinching and distance_to_object < self._virtual_object.size * 0.5:
-            self._virtual_object.is_pinched = True
-        elif not self._is_pinching:
-            self._virtual_object.is_pinched = False
+        # Update object interaction state
+        if self._is_interacting and distance_to_object < self._virtual_object.size * 0.5:
+            self._virtual_object.is_interacting = True
+        elif not self._is_interacting:
+            self._virtual_object.is_interacting = False
             
         # Store previous positions
         self._virtual_object.prev_x = self._virtual_object.x
         self._virtual_object.prev_y = self._virtual_object.y
             
-        # Move object with fingers if pinched
-        if self._virtual_object.is_pinched:
+        # Move object with fingers if interacting
+        if self._virtual_object.is_interacting:
             self._virtual_object.x = finger_midpoint_x
             self._virtual_object.y = finger_midpoint_y
             self._update_movement_progress()
@@ -323,7 +323,7 @@ class Experiment:
         return self._virtual_object.cycle_counter == TARGET_CYCLE_COUNT
 
     def _reset_comparison(self):
-        self._is_pinching = False
+        self._is_interacting = False
         self._virtual_object.reset()
 
     def _get_finger_name(self, is_index: bool) -> Literal["index"] | PairFinger:
@@ -432,7 +432,7 @@ class Experiment:
         steady_flag = True
         
         while self._running and self._arduino:
-            if self._virtual_object.is_pinched:
+            if self._virtual_object.is_interacting:
                 steady_flag = False
                 x_movement = self._virtual_object.x - self._virtual_object.prev_x
                 y_movement = self._virtual_object.y - self._virtual_object.prev_y
@@ -546,7 +546,7 @@ class Experiment:
         is_comparison = True
         
         while self._running:
-            if self._virtual_object.is_pinched:
+            if self._virtual_object.is_interacting:
                 x_movement = self._virtual_object.x - self._virtual_object.prev_x
                 y_movement = self._virtual_object.y - self._virtual_object.prev_y
                 
@@ -628,7 +628,7 @@ class Experiment:
                         x=self._virtual_object.x / self._width,
                         z=self._virtual_object.y / self._height,
                         size=self._virtual_object.size,
-                        isPinched=self._virtual_object.is_pinched,
+                        isInteracting=self._virtual_object.is_interacting,
                         progress=self._virtual_object.progress,
                         cycleCount=self._virtual_object.cycle_counter,
                         pairIndex=self._virtual_object.pair_index
@@ -643,9 +643,9 @@ class Experiment:
                     
             self._sleep_frontend()
 
-    def _calculate_pinch_threshold(self, depth: float) -> float:
+    def _calculate_interaction_threshold(self, depth: float) -> float:
         """Adjust threshold based on depth (distance from side camera)"""
-        return self.BASE_PINCH_THRESHOLD * (depth)
+        return self.BASE_INTERACTION_THRESHOLD * (depth)
     
     def _configure_camera(self, cap: cv2.VideoCapture):
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
@@ -658,9 +658,9 @@ class Experiment:
         # ! BUG: Bar does not respond on the way back from edge to center
         # ! Proposed Solution: Half bar to edge in color X, Half bar to centery in color Y
 
-        # ! BUG: If we unpinch after reaching edge, it moves object to center which increases the count by one when pinching again
+        # ! BUG: If we release after reaching edge, it moves object to center which increases the count by one when interacting again
         # ! Proposed Solution: Track movement back (half bar-half bar), only successful on reaching center by movement (same as solution above)
-        if not self._virtual_object.is_pinched:
+        if not self._virtual_object.is_interacting:
             self._virtual_object.progress = 0.0
             self.reached_edge = False
             self.in_center = True
@@ -721,7 +721,7 @@ class Experiment:
                     
                     # Create CSV with headers if it doesn't exist
                     if not tracking_file.exists():
-                        headers = ['timestamp', 'pinching', 'stiffness', 'object_x', 'object_y', 'finger', *list(position_dict.keys())]
+                        headers = ['timestamp', 'interacting', 'stiffness', 'object_x', 'object_y', 'finger', *list(position_dict.keys())]
                         with open(tracking_file, 'w', newline='') as f:
                             writer = csv.writer(f)
                             writer.writerow(headers)
@@ -731,7 +731,7 @@ class Experiment:
                         writer = csv.writer(f)
                         row_data = [
                             datetime.now().isoformat(),
-                            self._is_pinching,
+                            self._is_interacting,
                             self._virtual_object.stiffness_value,
                             self._virtual_object.x,
                             self._virtual_object.y,
@@ -787,16 +787,16 @@ class Experiment:
                 if key== ord('q'):
                     break
                 elif key == ord(' '):
-                    self._toggle_pinch()
+                    self._toggle_interaction()
                 
                 with self._hand_position_lock:
                     self._current_position = detected
 
     def start_side_camera(self):
-        """Process side camera feed to detect pinch gestures"""
+        """Process side camera feed to detect interaction gestures"""
         cap = cv2.VideoCapture(self.SIDE_CAMERA)
         if not cap.isOpened():
-            print("Side camera not available - using space key for pinch control")
+            print("Side camera not available - using space key for interaction control")
             return
         
         self._configure_camera(cap)
@@ -812,7 +812,7 @@ class Experiment:
                 if not ret:
                     continue
 
-                self._detect_pinch(frame, hands)
+                self._detect_interaction(frame, hands)
                 
                 # Add frame to recording queue if recording
                 if self._side_writer:
@@ -830,14 +830,14 @@ class Experiment:
         with self._hand_position_lock:
             return self._current_position
 
-    def is_pinching(self) -> bool:
-        """Get current pinch state"""
-        return self._is_pinching
+    def is_interacting(self) -> bool:
+        """Get current interaction state"""
+        return self._is_interacting
 
-    def _toggle_pinch(self):
-        """Toggle pinch state when not using camera"""
-        print(f"toggle pinch from {self._is_pinching} to {not self._is_pinching}")
-        self._is_pinching = not self._is_pinching
+    def _toggle_interaction(self):
+        """Toggle interaction state when not using camera"""
+        print(f"toggle interaction from {self._is_interacting} to {not self._is_interacting}")
+        self._is_interacting = not self._is_interacting
 
     def _process_top_view(self, frame: np.ndarray, hands: Any) -> HandPosition:
         """Process top camera frame to detect finger positions"""
@@ -867,9 +867,9 @@ class Experiment:
             active_finger_y=0.0
         )
 
-    def _detect_pinch(self, frame: np.ndarray, hands: Any):
-        """Process side camera frame to detect pinch gesture"""
-        # ! BUG: Detect pinch logic is shit
+    def _detect_interaction(self, frame: np.ndarray, hands: Any):
+        """Process side camera frame to detect interaction gesture"""
+        # ! BUG: Detect interaction logic is shit
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb_frame)
         
@@ -885,10 +885,10 @@ class Experiment:
             )
             
             depth = abs(finger_tip.z)
-            threshold = self._calculate_pinch_threshold(depth)
-            self._is_pinching = distance < threshold
+            threshold = self._calculate_interaction_threshold(depth)
+            self._is_interacting = distance < threshold
         else:
-            self._is_pinching = False
+            self._is_interacting = False
 
         
     def cleanup(self):

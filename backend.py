@@ -1,13 +1,12 @@
 import csv
 import builtins
 from datetime import datetime
+import json
 from pathlib import Path
-import keyboard
 import math
 from time import sleep
 import cv2
 import threading
-import sys
 from typing import Literal, Optional
 from threading import Lock
 import numpy as np
@@ -15,24 +14,18 @@ import socket
 from typing import Annotated
 import typer
 from pydantic import BaseModel
-from structures import ExperimentControl, ExperimentState, FingerPosition, QuestionInput, StateData, TrackingObject, ExperimentPacket
+from structures import ControlAction, ExperimentControl, ExperimentState, FingerPosition, QuestionInput, StateData, TrackingObject, ExperimentPacket
 from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, FINGER_NAMES, FingerName, CENTER_THRESHOLD, EDGE_THRESHOLD, TAPPING_HEIGHT_RATIO, STIFFNESS_MAX
 import queue
 from queue import Queue
 from enum import StrEnum
 from vision import ColorVision, HandPosition, MediapipeVision, YoloVision
-from motor_controller import FingerId, HandOrientation, MovementStrategy, MotorController
+from motor_controller import HandOrientation, MotorSetId, MovementStrategy, MotorController
 from haptic_mapping import map_object_displacement_to_tactor
 
-try:
-    import msvcrt
-except ImportError:
-    msvcrt = None
 
-DEBUG_POSITION = 1000
 DEBUG_SINGLE_MOTOR = False
 DEBUG_FLIP_Y = True
-DEBUG_SIDE_CAMERA_OFF = True  # overridden at runtime by user prompt
 IS_DEBUG = True
 DEBUG_LOG_MOTOR_RANGE = True  # Log min/max motor positions on shutdown (no per-message overhead)
 
@@ -62,13 +55,6 @@ class VisionType(StrEnum):
 class RunMode(StrEnum):
     COMPARISON = "comparison"
     SINGLE_FINGER = "single_finger"
-
-class FingerChoice(StrEnum):
-    THUMB = "thumb"
-    INDEX = "index"
-    MIDDLE = "middle"
-    RING = "ring"
-    PINKY = "pinky"
 
 class MotorType(StrEnum):
     HARDWARE = "hardware"
@@ -133,7 +119,7 @@ class VirtualObject(BaseModel):
     size: float = 40.0  # Size of cube sides
     original_x: float = 0.0  # Center of plane
     original_y: float = 0.0  # Center of plane
-    is_pinched: bool = False
+    is_interacting: bool = False
 
     progress: float = 0.0   # Tracks the movement progress (0.0 to 1.0)
     return_progress: float = 0.0  # Tracks edge-to-center visual progress (0.0 to 1.0)
@@ -150,7 +136,7 @@ class VirtualObject(BaseModel):
         # Reset object location
         self.x = self.original_x
         self.y = self.original_y
-        self.is_pinched = False
+        self.is_interacting = False
 
         # reset progress/Cycle Counter
         self.progress = 0.0
@@ -166,7 +152,7 @@ class Experiment:
         config: Configuration,
         path: Path,
         run_mode: Literal["comparison", "single_finger"] = "comparison",
-        pair_finger: FingerName = "index",
+        motor_set_id: MotorSetId = MotorSetId.MOTORS_0_2,
         hand_orientation: HandOrientation = HandOrientation.NOT_MIRRORED,
         target_cycle_count: int = TARGET_CYCLE_COUNT,
         vision_type: VisionType = VisionType.MEDIAPIPE,
@@ -185,16 +171,17 @@ class Experiment:
         hardware_port: int = HARDWARE_PORT,
         play_white_noise: bool = False,
         is_debug: bool = True,
+        resume_pair_number: Optional[int] = None,
     ):
-        
+
         # SETUP
         self._hand_position_lock = Lock()
-        self._visualization_lock = Lock()
         self._current_position: Optional[HandPosition] = None
-        self._is_pinching = False
+        self._is_interacting = False
         self._config = config
         self._path = path
         self._run_mode = run_mode
+        self._resume_pair_number = resume_pair_number
         self._top_width = top_width
         self._top_height = top_height
         self._side_width = side_width
@@ -208,17 +195,23 @@ class Experiment:
         self._tapping_enabled = tapping_enabled
         self._finger_colors = finger_colors or {}
         self._side_camera_off = side_camera_off
+        self._manual_interaction_enabled = side_camera_off
         # TODO - add Start screen if needed,
         # and adjust to ExperimentState.START
         self._state = ExperimentState.COMPARISON
         self._pause_time = 0
         self._break_started_at: Optional[datetime] = None
         self._pair_counter = 0  # Counter for pair folders
-        self._pair_finger: FingerName = pair_finger
+        self._motor_set_id = motor_set_id
         self._target_cycle_count = target_cycle_count
         self._hand_orientation = hand_orientation
         self._play_white_noise = play_white_noise
         self._is_debug = is_debug
+        self._state_lock = Lock()
+        self._control_queue: Queue[ExperimentControl] = Queue()
+        self._client_threads: list[threading.Thread] = []
+        self._moderator_pause_started_at: Optional[datetime] = None
+        self._moderator_pause_state_when_started: Optional[ExperimentState] = None
 
         # Frame queues for recording
         self._top_frame_queue = Queue(maxsize=30)
@@ -231,7 +224,7 @@ class Experiment:
         self.last_y = self._top_height/2  # Track last y position
         self.reached_edge = False  # Track if reached edge
         self.in_center = True  # Track if in center
-        self._require_unpinch = False  # Require release before next cycle
+        self._require_release = False  # Require release before next cycle
         
         # Motor Controller
         self._motor_controller = MotorController(
@@ -251,19 +244,18 @@ class Experiment:
         self._frontend_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._hardware_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        # Bind sockets
-        print("Waiting for connection")
-        self._listening_socket.bind((self._server_address, self._backend_port))
-        self._listening_socket.listen()
-        self._control_socket, _ = self._listening_socket.accept()
-        print("Connection accepted")
 
         # Create virtual object at center of screen
         self._virtual_object = VirtualObject(
             original_x=self._top_width/2,
             original_y=self._top_height/2,
         )
+        
+        # Bind sockets. Control clients are accepted in the background so the
+        # moderator utility can connect independently from pygame/Unity.
+        self._listening_socket.bind((self._server_address, self._backend_port))
+        self._listening_socket.listen()
+        self._listening_socket.settimeout(0.5)
         self._running = True
 
         # Camera indices
@@ -274,8 +266,8 @@ class Experiment:
         self._top_writer = None
         self._side_writer = None
         
-        # Threshold for pinch detection (adjust as needed)
-        self.BASE_PINCH_THRESHOLD = 50  # pixels
+        # Threshold for interaction detection (adjust as needed)
+        self.BASE_INTERACTION_THRESHOLD = 50  # pixels
 
         match self._vision_type:
             case VisionType.MEDIAPIPE:
@@ -288,7 +280,7 @@ class Experiment:
                     max_num_hands=1,
                     min_detection_confidence=0.7,
                     min_tracking_confidence=0.5,
-                    base_pinch_threshold=self.BASE_PINCH_THRESHOLD
+                    base_interaction_threshold=self.BASE_INTERACTION_THRESHOLD
                 )
             case VisionType.YOLO:
                 self._vision = YoloVision(
@@ -296,7 +288,7 @@ class Experiment:
                     top_height=self._top_height,
                     side_width=self._side_width,
                     side_height=self._side_height,
-                    base_pinch_threshold=self.BASE_PINCH_THRESHOLD
+                    base_interaction_threshold=self.BASE_INTERACTION_THRESHOLD
                 )
             case VisionType.FRAME_COLOR:
                 self._vision = ColorVision(
@@ -307,7 +299,7 @@ class Experiment:
                     side_height=self._side_height,
                     tracking_method="frame",
                     fps=self._camera_fps,
-                    base_pinch_threshold=self.BASE_PINCH_THRESHOLD
+                    base_interaction_threshold=self.BASE_INTERACTION_THRESHOLD
                 )
             case VisionType.OPTICAL_COLOR_NO_GPU:
                 self._vision = ColorVision(
@@ -318,7 +310,7 @@ class Experiment:
                     side_height=self._side_height,
                     tracking_method="optical_flow",
                     fps=self._camera_fps,
-                    base_pinch_threshold=self.BASE_PINCH_THRESHOLD,
+                    base_interaction_threshold=self.BASE_INTERACTION_THRESHOLD,
                     use_gpu=False
                 )
             case VisionType.OPTICAL_COLOR_GPU:
@@ -330,7 +322,7 @@ class Experiment:
                     side_height=self._side_height,
                     tracking_method="optical_flow",
                     fps=self._camera_fps,
-                    base_pinch_threshold=self.BASE_PINCH_THRESHOLD,
+                    base_interaction_threshold=self.BASE_INTERACTION_THRESHOLD,
                     use_gpu=True
                 )
             case _:
@@ -338,10 +330,7 @@ class Experiment:
 
         # * Initialization only until experiment loop begins
         # * Must run after self._vision is initialized
-        if self._run_mode == "single_finger":
-            self._update_active_finger(self._get_finger_id(self._pair_finger))
-        else:
-            self._update_active_finger(1)  # default to index
+        self._update_active_finger(self._get_first_configured_finger_id())
 
         # Start recording threads
         self._top_recording_thread = threading.Thread(target=self._record_top_frames, daemon=True)
@@ -350,6 +339,10 @@ class Experiment:
         if not self._side_camera_off:
             self._side_recording_thread = threading.Thread(target=self._record_side_frames, daemon=True)
             self._side_recording_thread.start()
+
+        # Start TCP control server for frontend question answers and moderator commands.
+        self._control_thread = threading.Thread(target=self._control_server_loop, daemon=True)
+        self._control_thread.start()
 
         # Start Experiment Management thread
         self._experiment_thread = threading.Thread(target=self._experiment_loop, daemon=True)
@@ -382,21 +375,67 @@ class Experiment:
     def _create_pair_folder(self) -> None:
         """Create a folder for the current pair of stiffness values"""
         pair_path = self._get_pair_path()
-        pair_path.mkdir()
-        
+        pair_path.mkdir(exist_ok=True)
+
+    def _next_video_filenames(self) -> tuple[Path, Path]:
+        """Return (top, side) video paths, picking unique names if files already exist."""
+        pair_path = self._get_pair_path()
+        top = pair_path / "top_camera.mp4"
+        side = pair_path / "side_camera.mp4"
+        if not top.exists() and not side.exists():
+            return top, side
+
+        index = 1
+        while True:
+            candidate_top = pair_path / f"top_camera_resume_{index:03d}.mp4"
+            candidate_side = pair_path / f"side_camera_resume_{index:03d}.mp4"
+            if not candidate_top.exists() and not candidate_side.exists():
+                return candidate_top, candidate_side
+            index += 1
+
     def _initialize_writers(self) -> None:
         # Initialize video writers for this pair
         if RECORDING_DATA:
-            pair_path = self._get_pair_path()
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')    
-            self._top_writer = cv2.VideoWriter(str(pair_path / 'top_camera.mp4'), fourcc, self._camera_fps, (self._top_width, self._top_height))
+            top_path, side_path = self._next_video_filenames()
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self._top_writer = cv2.VideoWriter(str(top_path), fourcc, self._camera_fps, (self._top_width, self._top_height))
             if not self._side_camera_off:
-                self._side_writer = cv2.VideoWriter(str(pair_path / 'side_camera.mp4'), fourcc, self._camera_fps, (self._top_width, self._top_height))
+                self._side_writer = cv2.VideoWriter(str(side_path), fourcc, self._camera_fps, (self._top_width, self._top_height))
 
     def _setup_pair(self) -> None:
         """ Setup everything needed for a new pair """
         self._create_pair_folder()
         self._initialize_writers()
+
+    @staticmethod
+    def _is_end_marker(pair: StiffnessPair) -> bool:
+        return pair.first.value == -1
+
+    @staticmethod
+    def _is_break_marker(pair: StiffnessPair) -> bool:
+        return pair.first.value == -2
+
+    @staticmethod
+    def _is_pause_marker(pair: StiffnessPair) -> bool:
+        return pair.first.value == 0
+
+    @classmethod
+    def _is_comparison_pair(cls, pair: StiffnessPair) -> bool:
+        return not (cls._is_end_marker(pair) or cls._is_break_marker(pair) or cls._is_pause_marker(pair))
+
+    def _config_index_for_pair_number(self, pair_number: int) -> int:
+        """Return the config row index of the Nth comparison pair (1-based)."""
+        if pair_number <= 0:
+            raise ValueError(f"pair_number must be >= 1, got {pair_number}")
+        seen = 0
+        for i, pair in enumerate(self._config.pairs):
+            if self._is_comparison_pair(pair):
+                seen += 1
+                if seen == pair_number:
+                    return i
+        raise ValueError(
+            f"configuration.csv only has {seen} comparison pair(s); cannot resume at pair {pair_number}"
+        )
 
     def _cleanup_writers(self):
         """Clean up video writers after pair is complete"""
@@ -417,7 +456,7 @@ class Experiment:
         sleep(1.0 / self._motors_communication_rate)
 
     def _update_virtual_object(self, stiffness_value: int, pair_index: int) -> None:
-        """Update virtual object position based on hand position and pinch/tap state"""
+        """Update virtual object position based on hand position and interaction/tap state"""
         if self._current_position is None:
             return
 
@@ -433,16 +472,16 @@ class Experiment:
             (contact_y - self._virtual_object.y)**2
         )
         
-        if self._require_unpinch:
-            self._virtual_object.is_pinched = False
-            if not self._is_pinching:
-                self._require_unpinch = False
-        elif self._is_pinching and distance_to_object < self._virtual_object.size * 0.5:
-            self._virtual_object.is_pinched = True
-        elif not self._is_pinching:
-            self._virtual_object.is_pinched = False
+        if self._require_release:
+            self._virtual_object.is_interacting = False
+            if not self._is_interacting:
+                self._require_release = False
+        elif self._is_interacting and distance_to_object < self._virtual_object.size * 0.5:
+            self._virtual_object.is_interacting = True
+        elif not self._is_interacting:
+            self._virtual_object.is_interacting = False
             
-        if self._virtual_object.is_pinched:
+        if self._virtual_object.is_interacting:
             self._virtual_object.x = contact_x
             self._virtual_object.y = contact_y
             self._update_movement_progress()
@@ -461,8 +500,8 @@ class Experiment:
         return self._virtual_object.cycle_counter == self._target_cycle_count
 
     def _reset_comparison(self):
-        self._is_pinching = False
-        self._require_unpinch = False
+        self._is_interacting = False
+        self._require_release = False
         self._virtual_object.reset()
 
     def _get_finger_name(self, finger_id: int) -> FingerName:
@@ -476,6 +515,13 @@ class Experiment:
                 return fid
         raise ValueError(f"Invalid finger_name: {finger_name}.")
 
+    def _get_first_configured_finger_id(self) -> int:
+        for pair in self._config.pairs:
+            for configured in (pair.first, pair.second):
+                if configured.value > 0:
+                    return configured.finger_id
+        return self._get_finger_id("index")
+
     def _update_active_finger(self, finger_id: int):
         self._active_finger = self._get_finger_name(finger_id)
         self._vision.set_active_finger(self._active_finger)
@@ -484,57 +530,225 @@ class Experiment:
     def _run_pair_object(self, stiffness_value: int, pair_index: int, finger_id: int):
         """Run one object within a pair (shared by both modes)."""
         self._reset_comparison()
-        self._update_active_finger(self._get_finger_id(self._pair_finger) if self._run_mode == "single_finger" else finger_id)
+        self._update_active_finger(finger_id)
 
         while self._running and not self._check_comparison_end():
+            self._wait_while_moderator_paused()
             self._update_virtual_object(stiffness_value, pair_index)
             self._sleep_virtual_object()
 
-    def _is_backend_terminal_enter_pressed(self) -> bool:
-        """Return True when Enter is pressed in the backend terminal."""
-        if msvcrt is None or sys.stdin is None or not sys.stdin.isatty():
-            return False
+    def _control_server_loop(self) -> None:
+        """Accept frontend/moderator TCP control clients."""
+        print(f"Listening for control commands on {self._server_address}:{self._backend_port}")
+        while self._running:
+            try:
+                client, address = self._listening_socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
 
-        try:
-            if not msvcrt.kbhit():
-                return False
+            print(f"Control client connected: {address}")
+            thread = threading.Thread(
+                target=self._control_client_loop,
+                args=(client, address),
+                daemon=True,
+            )
+            self._client_threads.append(thread)
+            thread.start()
 
-            key = msvcrt.getwch()
-            if key in ("\x00", "\xe0"):
-                # Extended-key prefix (arrows, function keys). Consume the
-                # following scan-code char so it is not seen as another key.
-                if msvcrt.kbhit():
-                    msvcrt.getwch()
-                return False
+    def _control_client_loop(self, client: socket.socket, address) -> None:
+        """Read ExperimentControl JSON messages from one TCP client."""
+        buffer = b""
+        with client:
+            while self._running:
+                try:
+                    chunk = client.recv(4096)
+                except OSError:
+                    break
 
-            return key in ("\r", "\n")
-        except Exception:
-            return False
+                if not chunk:
+                    break
 
-    def _is_enter_pressed(self) -> bool:
-        """Best-effort fallback for continuing a break without frontend support."""
-        if self._is_backend_terminal_enter_pressed():
-            return True
+                buffer += chunk
+                messages, buffer = self._extract_control_messages(buffer)
+                for message in messages:
+                    response = self._handle_control_message(message)
+                    try:
+                        client.sendall((json.dumps(response) + "\n").encode("utf-8"))
+                    except OSError:
+                        break
 
-        try:
-            return keyboard.is_pressed("enter")
-        except Exception:
-            return False
+        print(f"Control client disconnected: {address}")
+
+    def _extract_control_messages(self, buffer: bytes) -> tuple[list[ExperimentControl], bytes]:
+        """Parse newline-delimited controls, with legacy single-JSON fallback."""
+        messages: list[ExperimentControl] = []
+
+        while b"\n" in buffer:
+            raw, buffer = buffer.split(b"\n", 1)
+            raw = raw.strip()
+            if raw:
+                try:
+                    messages.append(ExperimentControl.model_validate_json(raw))
+                except Exception as ex:
+                    print(f"Ignoring malformed control message: {ex}")
+
+        # Existing pygame/Unity clients send one JSON object without a newline.
+        if buffer.strip():
+            try:
+                messages.append(ExperimentControl.model_validate_json(buffer.strip()))
+                buffer = b""
+            except Exception:
+                # Keep partial data for the next recv.
+                pass
+
+        return messages, buffer
+
+    def _handle_control_message(self, control: ExperimentControl) -> dict[str, object]:
+        """Apply immediate moderator controls or enqueue state-specific answers."""
+        if control.moderatorAction is not None:
+            return self._handle_moderator_action(control.moderatorAction)
+
+        valid_answers = {QuestionInput.LEFT.value, QuestionInput.RIGHT.value}
+        if control.questionInput in valid_answers:
+            if self._is_moderator_paused():
+                return {"ok": False, "message": "Ignored question answer while moderator pause is active"}
+            if self._get_state() != ExperimentState.QUESTION:
+                return {"ok": False, "message": f"Ignored question answer while state is {self._get_state().name}"}
+
+            self._control_queue.put(control)
+            return {"ok": True, "message": f"Queued question answer {control.questionInput}"}
+
+        return {"ok": False, "message": f"Ignored unknown control message: {control.model_dump()}"}
+
+    def _handle_moderator_action(self, action: ControlAction) -> dict[str, object]:
+        if action == ControlAction.TOGGLE_INTERACTION:
+            if self._is_moderator_paused():
+                return {"ok": False, "message": "Ignored toggle_interaction while moderator pause is active"}
+            if self._get_state() != ExperimentState.COMPARISON:
+                return {"ok": False, "message": f"Ignored toggle_interaction while state is {self._get_state().name}"}
+            if not self._manual_interaction_enabled:
+                return {"ok": False, "message": "Ignored toggle_interaction because side-camera/tap detection is active"}
+
+            self._toggle_interaction()
+            return {"ok": True, "message": f"Interaction is now {'ON' if self._is_interacting else 'OFF'}"}
+
+        if action == ControlAction.FINISH_BREAK:
+            if self._is_moderator_paused():
+                return {"ok": False, "message": "Ignored finish_break while moderator pause is active; resume pause first"}
+            if self._get_state() != ExperimentState.BREAK:
+                return {"ok": False, "message": f"Ignored finish_break while state is {self._get_state().name}"}
+
+            self._control_queue.put(ExperimentControl(moderatorAction=action))
+            return {"ok": True, "message": "Queued break finish"}
+
+        if action == ControlAction.TOGGLE_PAUSE:
+            return self._toggle_moderator_pause()
+
+        return {"ok": False, "message": f"Ignored unsupported moderator action: {action}"}
+
+    def _get_state(self) -> ExperimentState:
+        with self._state_lock:
+            return self._state
+
+    def _set_state(self, state: ExperimentState) -> None:
+        with self._state_lock:
+            self._state = state
+
+    def _is_moderator_paused(self) -> bool:
+        with self._state_lock:
+            return self._moderator_pause_started_at is not None
+
+    def _toggle_moderator_pause(self) -> dict[str, object]:
+        ended_pause: tuple[datetime, datetime, ExperimentState] | None = None
+        with self._state_lock:
+            now = datetime.now()
+            if self._state == ExperimentState.END and self._moderator_pause_started_at is None:
+                return {"ok": False, "message": "Ignored pause because experiment has ended"}
+
+            if self._moderator_pause_started_at is None:
+                self._moderator_pause_started_at = now
+                self._moderator_pause_state_when_started = self._state
+                self._is_interacting = False
+                self._virtual_object.is_interacting = False
+                return {"ok": True, "message": f"Moderator pause started from {self._state.name}"}
+
+            started_at = self._moderator_pause_started_at
+            state_when_started = self._moderator_pause_state_when_started or self._state
+            self._moderator_pause_started_at = None
+            self._moderator_pause_state_when_started = None
+            ended_pause = (started_at, now, state_when_started)
+
+        started_at, finished_at, state_when_started = ended_pause
+        self._log_moderator_pause(started_at, finished_at, state_when_started)
+        return {
+            "ok": True,
+            "message": (
+                "Moderator pause finished after "
+                f"{(finished_at - started_at).total_seconds():.3f} seconds"
+            ),
+        }
+
+    def _wait_while_moderator_paused(self) -> None:
+        while self._running and self._is_moderator_paused():
+            self._is_interacting = False
+            self._virtual_object.is_interacting = False
+            sleep(0.05)
+
+    def _log_moderator_pause(
+        self,
+        started_at: datetime,
+        finished_at: datetime,
+        state_when_started: ExperimentState,
+    ) -> None:
+        pauses_file = self._path / "moderator_pauses.csv"
+        if not pauses_file.exists():
+            with open(pauses_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp_start",
+                    "timestamp_finish",
+                    "pause_duration_seconds",
+                    "state_when_started",
+                ])
+
+        with open(pauses_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                started_at.isoformat(),
+                finished_at.isoformat(),
+                f"{(finished_at - started_at).total_seconds():.3f}",
+                state_when_started.name,
+            ])
 
     def _wait_for_break_continue(self) -> bool:
-        """Wait for Enter in the backend terminal or local keyboard hook."""
+        """Wait until the moderator utility sends --toggle-break."""
         while self._running:
-            if self._is_enter_pressed():
+            self._wait_while_moderator_paused()
+            try:
+                control = self._control_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if control.moderatorAction == ControlAction.FINISH_BREAK:
                 return True
-            sleep(0.05)
+
+            if control.questionInput is not None:
+                print(f"Ignoring question answer during break: {control}")
+
         return False
 
     def _wait_for_question_answer(self) -> ExperimentControl:
         """Wait until the frontend sends a valid left/right question answer."""
         valid_answers = {QuestionInput.LEFT.value, QuestionInput.RIGHT.value}
         while self._running:
-            answer_data = self._control_socket.recv(1024)
-            answer = ExperimentControl.model_validate_json(answer_data)
+            self._wait_while_moderator_paused()
+            try:
+                answer = self._control_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
             if answer.questionInput in valid_answers:
                 return answer
             print(f"Ignoring non-answer control message during question: {answer}")
@@ -542,21 +756,28 @@ class Experiment:
         raise RuntimeError("Experiment stopped before question answer was received")
 
     def _experiment_loop(self):
+        start_index = 0
+        if self._resume_pair_number is not None:
+            start_index = self._config_index_for_pair_number(self._resume_pair_number)
+            self._pair_counter = self._resume_pair_number - 1
+            print(f"Continuing experiment: starting from pair {self._resume_pair_number}.")
 
-        for pair in self._config.pairs:
+        for config_index in range(start_index, len(self._config.pairs)):
+            pair = self._config.pairs[config_index]
+            self._wait_while_moderator_paused()
             if not self._running:
                 print("Exit via Ctrl-C")
                 break
 
-            if pair.first.value == -1:
+            if self._is_end_marker(pair):
                 if pair.second.value != -1:
                     raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
-                
+
                 print("Exit via end of experiment")
-                self._state = ExperimentState.END
+                self._set_state(ExperimentState.END)
                 break
 
-            elif pair.first.value == -2:
+            elif self._is_break_marker(pair):
                 if (
                     pair.second.value != -2
                     or pair.first.finger_id != -2
@@ -564,8 +785,8 @@ class Experiment:
                 ):
                     raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
 
-                print("Break — press Enter to continue (duration is logged when you continue)")
-                self._state = ExperimentState.BREAK
+                print("Break — run moderator_control.py --toggle-break to continue (duration is logged when you continue)")
+                self._set_state(ExperimentState.BREAK)
                 break_started_at = datetime.now()
                 self._break_started_at = break_started_at
                 self._pause_time = 0
@@ -573,7 +794,7 @@ class Experiment:
                 break_duration = (datetime.now() - break_started_at).total_seconds()
                 self._break_started_at = None
                 self._pause_time = 0
-                self._state = ExperimentState.COMPARISON
+                self._set_state(ExperimentState.COMPARISON)
 
                 breaks_file = self._path / "breaks.csv"
                 if not breaks_file.exists():
@@ -584,26 +805,27 @@ class Experiment:
                     writer = csv.writer(f)
                     writer.writerow([break_started_at.isoformat(), f"{break_duration:.3f}"])
 
-            elif pair.first.value == 0:
+            elif self._is_pause_marker(pair):
                 if pair.second.value != 0:
                     raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
 
                 print("Pausing")
                 self._pause_time = PAUSE_SLEEP_SECONDS
-                self._state = ExperimentState.PAUSE
+                self._set_state(ExperimentState.PAUSE)
                 for i in range(PAUSE_SLEEP_SECONDS, 0, -1):
+                    self._wait_while_moderator_paused()
                     sleep(1)
                     self._pause_time = i
                     if not self._running:
                         break
-            
+
                 self._pause_time = 0
 
             else:
                 print("Comparing")
                 self._pair_counter += 1
                 self._setup_pair()
-                self._state = ExperimentState.COMPARISON
+                self._set_state(ExperimentState.COMPARISON)
 
                 self._run_pair_object(pair.first.value, 0, pair.first.finger_id)
                 self._run_pair_object(pair.second.value, 1, pair.second.finger_id)
@@ -614,12 +836,15 @@ class Experiment:
                     print("Exit via Ctrl-C")
                     break
 
+                answers_file = self._path / 'answers.csv'
+                if _answer_already_recorded(answers_file, self._pair_counter):
+                    print(f"Skipping question for pair {self._pair_counter}: answer already recorded")
+                    continue
+
                 print("Question")
                 question_timestamp = datetime.now()
-                self._state = ExperimentState.QUESTION
+                self._set_state(ExperimentState.QUESTION)
                 answer = self._wait_for_question_answer()
-
-                answers_file = self._path / 'answers.csv'
 
                 if not answers_file.exists():
                     with open(answers_file, 'w', newline='') as f:
@@ -639,77 +864,93 @@ class Experiment:
                         answer.questionInput])
 
     def _hardware_control_loop(self):
-        """Thread that controls Hardware via UDP based on hand movement"""
+        """Thread that controls Hardware via UDP based on hand movement."""
         should_reset = True
-        og_obj_x = 0
-        og_obj_y = 0
+        og_obj_x: float | None = None
+        og_obj_y: float | None = None
+        motors_are_displaced = False
 
         # Position range tracking (zero per-message overhead, summary on shutdown)
         motor_range_min: dict[int, int] = {}
         motor_range_max: dict[int, int] = {}
 
+        def send_motors(motors: list) -> list:
+            if not motors:
+                return []
+
+            if DEBUG_SINGLE_MOTOR:
+                motors = [motors[0]]
+
+            # Track position ranges (dict lookup only, zero logging overhead)
+            if DEBUG_LOG_MOTOR_RANGE:
+                for motor in motors:
+                    if motor.index not in motor_range_min:
+                        motor_range_min[motor.index] = motor.pos
+                        motor_range_max[motor.index] = motor.pos
+                    else:
+                        if motor.pos < motor_range_min[motor.index]:
+                            motor_range_min[motor.index] = motor.pos
+                        if motor.pos > motor_range_max[motor.index]:
+                            motor_range_max[motor.index] = motor.pos
+
+            message = self._motor_controller.build_message(motors)
+            self._hardware_socket.sendto(message.encode("utf-8"), (self._server_address, self._hardware_port))
+            return motors
+
         while self._running:
-            if self._virtual_object.is_pinched:
-                # Collect stiffness value using protection from values greater than STIFFNESS_MAX
-                stiffness_value = self._virtual_object.stiffness_value
-                if stiffness_value > STIFFNESS_MAX:
-                    print(f"Stiffness value {stiffness_value} is greater than STIFFNESS_MAX {STIFFNESS_MAX}, setting to {STIFFNESS_MAX}")
-                    stiffness_value = STIFFNESS_MAX
-                stiffness_value_normalized = stiffness_value / STIFFNESS_MAX
-                
-                # original x/y != (0,0) since they are half of screen size
-                obj_x = self._virtual_object.x - self._virtual_object.original_x
-                obj_y = self._virtual_object.y - self._virtual_object.original_y
-                if (obj_x == og_obj_x and obj_y == og_obj_y):
-                    continue
+            if not self._virtual_object.is_interacting:
+                if motors_are_displaced:
+                    send_motors(self._motor_controller.zero_motor_positions(self._motor_set_id))
+                    motors_are_displaced = False
+                    should_reset = True
+                    og_obj_x = None
+                    og_obj_y = None
+                self._sleep_motors()
+                continue
 
-                og_obj_x = obj_x
-                og_obj_y = obj_y
-                tactor_x, tactor_y = map_object_displacement_to_tactor(
-                    obj_x=obj_x,
-                    obj_y=obj_y,
-                    oppose_motion=MOTOR_OPPOSES_OBJECT_MOTION,
-                )
+            # Collect stiffness value using protection from values greater than STIFFNESS_MAX
+            stiffness_value = self._virtual_object.stiffness_value
+            if stiffness_value > STIFFNESS_MAX:
+                print(f"Stiffness value {stiffness_value} is greater than STIFFNESS_MAX {STIFFNESS_MAX}, setting to {STIFFNESS_MAX}")
+                stiffness_value = STIFFNESS_MAX
+            stiffness_value_normalized = stiffness_value / STIFFNESS_MAX
 
-                finger_id = {
-                    "thumb": FingerId.THUMB,
-                    "index": FingerId.INDEX,
-                    "middle": FingerId.MIDDLE,
-                    "ring": FingerId.RING,
-                    "pinky": FingerId.PINKY,
-                }[self._active_finger]
+            # original x/y != (0,0) since they are half of screen size
+            obj_x = self._virtual_object.x - self._virtual_object.original_x
+            obj_y = self._virtual_object.y - self._virtual_object.original_y
+            if obj_x == og_obj_x and obj_y == og_obj_y:
+                self._sleep_motors()
+                continue
 
-                motors_enabled = self._state == ExperimentState.COMPARISON
-                motors = self._motor_controller.calculate_motor_movements(
-                    finger_id=finger_id,
-                    stiffness_value=stiffness_value_normalized,
-                    obj_x=tactor_x,
-                    obj_y=tactor_y,
-                    motors_enabled=motors_enabled,
-                    reset_to_origin=should_reset and not motors_enabled,
-                )
-                should_reset = motors_enabled
+            og_obj_x = obj_x
+            og_obj_y = obj_y
+            tactor_x, tactor_y = map_object_displacement_to_tactor(
+                obj_x=obj_x,
+                obj_y=obj_y,
+                oppose_motion=MOTOR_OPPOSES_OBJECT_MOTION,
+            )
 
-                if motors:
-                    # Build message
-                    if DEBUG_SINGLE_MOTOR:
-                        motors = [motors[0]]
+            motors_enabled = (
+                self._get_state() == ExperimentState.COMPARISON
+                and not self._is_moderator_paused()
+            )
+            motors = self._motor_controller.calculate_motor_movements(
+                motor_set_id=self._motor_set_id,
+                stiffness_value=stiffness_value_normalized,
+                obj_x=tactor_x,
+                obj_y=tactor_y,
+                motors_enabled=motors_enabled,
+                reset_to_origin=should_reset and not motors_enabled,
+            )
+            should_reset = motors_enabled
 
-                    # Track position ranges (dict lookup only, zero logging overhead)
-                    if DEBUG_LOG_MOTOR_RANGE:
-                        for m in motors:
-                            if m.index not in motor_range_min:
-                                motor_range_min[m.index] = m.pos
-                                motor_range_max[m.index] = m.pos
-                            else:
-                                if m.pos < motor_range_min[m.index]:
-                                    motor_range_min[m.index] = m.pos
-                                if m.pos > motor_range_max[m.index]:
-                                    motor_range_max[m.index] = m.pos
+            if not motors and motors_are_displaced and motors_enabled and obj_x == 0 and obj_y == 0:
+                motors = self._motor_controller.zero_motor_positions(self._motor_set_id)
 
-                    message = self._motor_controller.build_message(motors)
+            sent_motors = send_motors(motors)
+            if sent_motors:
+                motors_are_displaced = motors_enabled and any(motor.pos != 0 for motor in sent_motors)
 
-                    self._hardware_socket.sendto(message.encode("utf-8"), (self._server_address, self._hardware_port))
             self._sleep_motors()
 
         # Print position range summary on shutdown
@@ -735,14 +976,22 @@ class Experiment:
                         FingerPosition(x=current_pos.active_finger_x / self._top_width, z=current_pos.active_finger_y / self._top_height)
                     ]
 
+                state_for_packet = self._get_state()
                 pause_for_packet = self._pause_time
-                if self._state == ExperimentState.BREAK and self._break_started_at is not None:
+                with self._state_lock:
+                    moderator_pause_started_at = self._moderator_pause_started_at
+                if moderator_pause_started_at is not None:
+                    state_for_packet = ExperimentState.MODERATOR_PAUSE
+                    pause_for_packet = int(
+                        (datetime.now() - moderator_pause_started_at).total_seconds()
+                    )
+                elif state_for_packet == ExperimentState.BREAK and self._break_started_at is not None:
                     pause_for_packet = int(
                         (datetime.now() - self._break_started_at).total_seconds()
                     )
 
                 packet = ExperimentPacket(
-                    stateData=StateData(state=self._state.value, pauseTime=pause_for_packet),
+                    stateData=StateData(state=state_for_packet.value, pauseTime=pause_for_packet),
                     landmarks=finger_positions,
                     playWhiteNoise=self._play_white_noise,
                     isDebug=self._is_debug,
@@ -750,7 +999,7 @@ class Experiment:
                         x=self._virtual_object.x / self._top_width,
                         z=self._virtual_object.y / self._top_height,
                         size=self._virtual_object.size,
-                        isPinched=self._virtual_object.is_pinched,
+                        isInteracting=self._virtual_object.is_interacting,
                         progress=self._virtual_object.progress,
                         returnProgress=self._virtual_object.return_progress,
                         cycleCount=self._virtual_object.cycle_counter,
@@ -769,10 +1018,6 @@ class Experiment:
                     
             self._sleep_frontend()
 
-    def _calculate_pinch_threshold(self, depth: float) -> float:
-        """Adjust threshold based on depth (distance from side camera)"""
-        return self.BASE_PINCH_THRESHOLD * (depth)
-    
     def _configure_camera(self, cap: cv2.VideoCapture):
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
         cap.set(cv2.CAP_PROP_FPS, self._camera_fps)
@@ -784,9 +1029,9 @@ class Experiment:
         # ! BUG: Bar does not respond on the way back from edge to center
         # ! Proposed Solution: Half bar to edge in color X, Half bar to centery in color Y
 
-        # ! BUG: If we unpinch after reaching edge, it moves object to center which increases the count by one when pinching again
+        # ! BUG: If we release after reaching edge, it moves object to center which increases the count by one when interacting again
         # ! Proposed Solution: Track movement back (half bar-half bar), only successful on reaching center by movement (same as solution above)
-        if not self._virtual_object.is_pinched:
+        if not self._virtual_object.is_interacting:
             self._virtual_object.progress = 0.0
             self._virtual_object.return_progress = 0.0
             self.reached_edge = False
@@ -808,8 +1053,8 @@ class Experiment:
                 self._virtual_object.progress = 0.0
                 self._virtual_object.return_progress = 0.0
                 self.reached_edge = False
-                self._virtual_object.is_pinched = False
-                self._require_unpinch = True
+                self._virtual_object.is_interacting = False
+                self._require_release = True
             self.in_center = True
         else:
             self.in_center = False
@@ -861,7 +1106,7 @@ class Experiment:
                     
                     # Create CSV with headers if it doesn't exist
                     if not tracking_file.exists():
-                        headers = ['timestamp', 'pinching', 'stiffness', 'object_x', 'object_y', 'finger', *list(position_dict.keys())]
+                        headers = ['timestamp', 'interacting', 'stiffness', 'object_x', 'object_y', 'finger', *list(position_dict.keys())]
                         with open(tracking_file, 'w', newline='') as f:
                             writer = csv.writer(f)
                             writer.writerow(headers)
@@ -871,7 +1116,7 @@ class Experiment:
                         writer = csv.writer(f)
                         row_data = [
                             datetime.now().isoformat(),
-                            self._is_pinching,
+                            self._is_interacting,
                             self._virtual_object.stiffness_value,
                             self._virtual_object.x,
                             self._virtual_object.y,
@@ -923,14 +1168,12 @@ class Experiment:
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
-            elif key == ord(' '):
-                self._toggle_pinch()
             
             with self._hand_position_lock:
                 self._current_position = detected
 
     def start_side_camera(self):
-        """Process side camera feed to detect pinch gestures"""
+        """Process side camera feed to detect interaction gestures"""
         RETRIES = 10
         
         cap = cv2.VideoCapture(self.SIDE_CAMERA, cv2.CAP_DSHOW)
@@ -941,7 +1184,8 @@ class Experiment:
             cap = cv2.VideoCapture(self.SIDE_CAMERA, cv2.CAP_DSHOW)
 
         if not cap.isOpened():
-            print("Side camera not available - using space key for pinch control")
+            print("Side camera not available - use moderator_control.py --toggle-interaction for manual interaction control")
+            self._manual_interaction_enabled = True
             return
         
         self._configure_camera(cap)
@@ -956,7 +1200,7 @@ class Experiment:
             if self._tapping_enabled:
                 self._detect_tapping(frame)
             else:
-                self._detect_pinch(frame)
+                self._detect_interaction(frame)
             
             # Add frame to recording queue if recording
             if self._side_writer:
@@ -977,22 +1221,23 @@ class Experiment:
         
         return self._current_position
 
-    def is_pinching(self) -> bool:
-        """Get current pinch state"""
-        return self._is_pinching
+    def is_interacting(self) -> bool:
+        """Get current interaction state"""
+        return self._is_interacting
 
-    def _toggle_pinch(self):
-        """Toggle pinch state when not using camera"""
-        print(f"toggle pinch from {self._is_pinching} to {not self._is_pinching}")
-        self._is_pinching = not self._is_pinching
-    
-    def _get_finger_color(self) -> str:
-        return self._finger_colors.get(self._active_finger, "green")
+    def _toggle_interaction(self):
+        """Toggle interaction state when not using camera"""
+        print(f"toggle interaction from {self._is_interacting} to {not self._is_interacting}")
+        self._is_interacting = not self._is_interacting
     
     def _process_top_view(self, frame: np.ndarray) -> HandPosition:
         return self._vision.detect_hand(frame)
 
-    def _detect_pinch(self, frame: np.ndarray):
+    def _detect_interaction(self, frame: np.ndarray):
+        if self._is_moderator_paused():
+            self._is_interacting = False
+            return
+
         current_pos = self.get_hand_position(with_lock=False)
         if current_pos is None or all([
             current_pos.thumb_x == 0,
@@ -1000,38 +1245,48 @@ class Experiment:
             current_pos.active_finger_x == 0,
             current_pos.active_finger_y == 0,
         ]):
-            if self._is_pinching:
-                print("Can't find hand, stopping pinch")
-                self._is_pinching = False
+            if self._is_interacting:
+                print("Can't find hand, stopping interaction")
+                self._is_interacting = False
             return
         
-        prev_pinch = self._is_pinching
-        self._is_pinching = self._vision.detect_pinch(
+        prev_interaction = self._is_interacting
+        self._is_interacting = self._vision.detect_interaction(
             frame,
             current_pos,
             self._side_camera_location
         )
-        if prev_pinch != self._is_pinching:
-            print(f"Pinch changed to {self._is_pinching}")
+        if prev_interaction != self._is_interacting:
+            print(f"Interaction changed to {self._is_interacting}")
 
     def _detect_tapping(self, frame: np.ndarray):
         """Detect tapping using side camera: finger in bottom 70% = tapping."""
+        if self._is_moderator_paused():
+            self._is_interacting = False
+            return
+
         side_pos = self._vision.detect_side_hand(frame)
         finger_y = side_pos.active_finger_y
         threshold_y = self._side_height * TAPPING_HEIGHT_RATIO
-        prev = self._is_pinching
-        self._is_pinching = finger_y > threshold_y and finger_y > 0
-        if prev != self._is_pinching:
-            print(f"Tapping changed to {self._is_pinching}")
+        prev = self._is_interacting
+        self._is_interacting = finger_y > threshold_y and finger_y > 0
+        if prev != self._is_interacting:
+            print(f"Tapping changed to {self._is_interacting}")
         
     def cleanup(self):
         """Clean up resources"""
+        with self._state_lock:
+            active_pause = self._moderator_pause_started_at
+            active_pause_state = self._moderator_pause_state_when_started or self._state
+            self._moderator_pause_started_at = None
+            self._moderator_pause_state_when_started = None
+        if active_pause is not None:
+            self._log_moderator_pause(active_pause, datetime.now(), active_pause_state)
+
         self._running = False
-        keyboard.unhook_all()
         cv2.destroyAllWindows()
         self._frontend_socket.close()
         self._listening_socket.close()
-        self._control_socket.close()
         self._cleanup_writers()
         self._vision.cleanup()
 
@@ -1047,7 +1302,7 @@ def start_experiment(
     config: Configuration,
     path: Path,
     run_mode: Literal["comparison", "single_finger"],
-    pair_finger: FingerName,
+    motor_set_id: MotorSetId,
     hand_orientation: HandOrientation,
     target_cycle_count: int,
     vision_type: VisionType,
@@ -1056,13 +1311,14 @@ def start_experiment(
     side_camera_off: bool = False,
     play_white_noise: bool = False,
     is_debug: bool = True,
+    resume_pair_number: Optional[int] = None,
 ):
     """Initialize and start the hand tracking system"""
     experiment = Experiment(
         config,
         path,
         run_mode=run_mode,
-        pair_finger=pair_finger,
+        motor_set_id=motor_set_id,
         hand_orientation=hand_orientation,
         target_cycle_count=target_cycle_count,
         vision_type=vision_type,
@@ -1071,9 +1327,56 @@ def start_experiment(
         side_camera_off=side_camera_off,
         play_white_noise=play_white_noise,
         is_debug=is_debug,
+        resume_pair_number=resume_pair_number,
     )
-    
+
     return experiment
+
+
+PAIR_FOLDER_PATTERN = "pair_"
+
+
+def _find_latest_experiment(root: Path) -> Path | None:
+    """Return the most recently modified subfolder of ``root``, or None."""
+    if not root.exists() or not root.is_dir():
+        return None
+    folders = [f for f in root.iterdir() if f.is_dir()]
+    if not folders:
+        return None
+    folders.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return folders[0]
+
+
+def _find_last_pair_number(experiment_folder: Path) -> int | None:
+    """Return the highest ``pair_NNN`` index in ``experiment_folder``, or None."""
+    if not experiment_folder.exists():
+        return None
+    pair_numbers: list[int] = []
+    for entry in experiment_folder.iterdir():
+        if not entry.is_dir() or not entry.name.startswith(PAIR_FOLDER_PATTERN):
+            continue
+        suffix = entry.name[len(PAIR_FOLDER_PATTERN):]
+        if suffix.isdigit():
+            pair_numbers.append(int(suffix))
+    if not pair_numbers:
+        return None
+    return max(pair_numbers)
+
+
+def _answer_already_recorded(answers_csv: Path, pair_number: int) -> bool:
+    """Return True if ``answers.csv`` already has a row for ``pair_number``."""
+    if not answers_csv.exists():
+        return False
+
+    with open(answers_csv, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                if int(row.get("pair_number", "")) == pair_number:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
 
 def get_target_cycle_count() -> int:
     while True:
@@ -1112,18 +1415,28 @@ def get_vision_type() -> VisionType:
         original_print(f"Invalid input. Please enter a number between 1 and {len(options)}.")
 
 
-def get_pair_finger(run_mode: Literal["comparison", "single_finger"]) -> FingerName:
-    if run_mode == "comparison":
-        valid = {"M": "middle", "R": "ring", "P": "pinky"}
-        prompt = "Select pair finger - [M]iddle / [R]ing / [P]inky: "
-    else:
-        valid = {"T": "thumb", "I": "index", "M": "middle", "R": "ring", "P": "pinky"}
-        prompt = "Select finger - [T]humb / [I]ndex / [M]iddle / [R]ing / [P]inky: "
+def get_motor_set_id() -> MotorSetId:
+    options = list(MotorSetId)
+    original_print("Select motor set index:")
+    for option in options:
+        original_print(f"  {option.value}. Motors {option.label}")
+
     while True:
-        user_input = input(prompt).strip().upper()
-        if user_input in valid:
-            return valid[user_input]  # type: ignore
-        original_print(f"Invalid input. Please enter one of: {', '.join(valid.keys())}")
+        user_input = input("Motor set index [0]: ").strip()
+        if user_input == "":
+            return MotorSetId.MOTORS_0_2
+        if user_input.isdigit() and 0 <= int(user_input) < len(options):
+            return MotorSetId(int(user_input))
+        original_print("Invalid input. Enter a motor set index from 0 to 4.")
+
+
+def _resolve_motor_set_id(motor_set: int | None) -> MotorSetId:
+    if motor_set is None:
+        return get_motor_set_id()
+    try:
+        return MotorSetId(motor_set)
+    except ValueError as exc:
+        raise typer.BadParameter("motor set must be an index from 0 to 4", param_hint="--motor-set") from exc
 
 
 def get_side_camera_off() -> bool:
@@ -1160,8 +1473,11 @@ def get_finger_colors(
     remaining = [color for color in AVAILABLE_COLORS if color not in (unavailable_colors or set())]
     for finger in fingers:
         original_print(f"Available colors: {', '.join(c.capitalize() for c in remaining)}")
+        # In single_finger mode the synthetic name "single" stands in for "the
+        # one tracked finger, regardless of which finger the protocol marks active".
+        prompt_label = "the single tracked finger" if finger == "single" else finger
         while True:
-            user_input = input(f"  Color for {finger}: ").strip().lower()
+            user_input = input(f"  Color for {prompt_label}: ").strip().lower()
             if user_input in remaining:
                 finger_colors[finger] = user_input
                 remaining.remove(user_input)
@@ -1192,9 +1508,12 @@ def _parse_finger_color_flags(values: list[str] | None) -> dict[str, str]:
             raise typer.BadParameter("finger colors must use FINGER=COLOR format", param_hint="--finger-color")
 
         finger, color = (part.strip().lower() for part in value.split("=", 1))
-        if finger not in FINGER_NAMES.values():
+        # "single" is the synthetic key used by single-finger mode for the one
+        # color that's tracked regardless of the protocol's active finger.
+        valid_fingers = (*FINGER_NAMES.values(), "single")
+        if finger not in valid_fingers:
             raise typer.BadParameter(
-                f"unknown finger '{finger}'. Expected one of: {', '.join(FINGER_NAMES.values())}",
+                f"unknown finger '{finger}'. Expected one of: {', '.join(valid_fingers)}",
                 param_hint="--finger-color",
             )
         if color not in AVAILABLE_COLORS:
@@ -1210,44 +1529,26 @@ def _parse_finger_color_flags(values: list[str] | None) -> dict[str, str]:
     return colors
 
 
-def _get_fingers_needed(
-    config: Configuration,
-    run_mode: RunModeLiteral,
-    pair_finger: FingerName,
-) -> list[str]:
-    if run_mode == "comparison":
-        finger_ids_in_csv: set[int] = set()
-        for pair in config.pairs:
-            if pair.first.value > 0:
-                finger_ids_in_csv.add(pair.first.finger_id)
-                finger_ids_in_csv.add(pair.second.finger_id)
-        return ["thumb"] + sorted(
-            {FINGER_NAMES[fid] for fid in finger_ids_in_csv if fid in FINGER_NAMES},
-            key=lambda n: list(FINGER_NAMES.values()).index(n)
-        )
-    return [pair_finger]
-
-
-def _resolve_pair_finger(
-    run_mode: RunModeLiteral,
-    pair_finger: FingerChoice | None,
-) -> FingerName:
-    if pair_finger is None:
-        return get_pair_finger(run_mode)
-
-    resolved = pair_finger.value
-    if run_mode == "comparison" and resolved not in ("middle", "ring", "pinky"):
-        raise typer.BadParameter(
-            "comparison mode pair finger must be one of: middle, ring, pinky",
-            param_hint="--pair-finger",
-        )
-    return resolved  # type: ignore[return-value]
+def _get_fingers_needed(config: Configuration, run_mode: RunModeLiteral) -> list[str]:
+    # Single-finger mode tracks one color regardless of which finger the protocol
+    # marks active, so we only need to collect that one color.
+    if run_mode == "single_finger":
+        return ["single"]
+    finger_ids_in_csv: set[int] = set()
+    for pair in config.pairs:
+        if pair.first.value > 0:
+            finger_ids_in_csv.add(pair.first.finger_id)
+            finger_ids_in_csv.add(pair.second.finger_id)
+    configured_fingers = sorted(
+        {FINGER_NAMES[fid] for fid in finger_ids_in_csv if fid in FINGER_NAMES and FINGER_NAMES[fid] != "thumb"},
+        key=lambda n: list(FINGER_NAMES.values()).index(n)
+    )
+    return ["thumb"] + configured_fingers
 
 
 def _resolve_finger_colors(
     config: Configuration,
     run_mode: RunModeLiteral,
-    pair_finger: FingerName,
     vision_type: VisionType,
     finger_color_flags: list[str] | None,
 ) -> dict[str, str]:
@@ -1257,7 +1558,7 @@ def _resolve_finger_colors(
             raise typer.BadParameter("--finger-color can only be used with a color vision type")
         return {}
 
-    fingers_needed = _get_fingers_needed(config, run_mode, pair_finger)
+    fingers_needed = _get_fingers_needed(config, run_mode)
     unexpected = set(provided_colors) - set(fingers_needed)
     if unexpected:
         raise typer.BadParameter(
@@ -1268,7 +1569,13 @@ def _resolve_finger_colors(
     finger_colors = dict(provided_colors)
     missing_fingers = [finger for finger in fingers_needed if finger not in finger_colors]
     if missing_fingers:
-        original_print(f"Assign colors for fingers: {', '.join(missing_fingers)}")
+        if missing_fingers == ["single"]:
+            original_print(
+                "Single-finger mode: assign one color for the tracked finger "
+                "(used regardless of which finger the protocol marks active)."
+            )
+        else:
+            original_print(f"Assign colors for fingers: {', '.join(missing_fingers)}")
         selected = get_finger_colors(missing_fingers, set(finger_colors.values()))
         duplicate_colors = set(finger_colors.values()) & set(selected.values())
         if duplicate_colors:
@@ -1284,7 +1591,7 @@ def _resolve_finger_colors(
 def create_experiment_folder(
     config: Configuration,
     run_mode: RunModeLiteral,
-    pair_finger: FingerName,
+    motor_set_id: MotorSetId,
 ):
     experiment_path = Path(experiment_folder)
     if not experiment_path.exists():
@@ -1297,7 +1604,7 @@ def create_experiment_folder(
         folder_id = max(int(folder.name.split('_')[-1]) for folder in existing_folders) + 1
 
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
-    folder_path = experiment_path / f"{timestamp}_{run_mode}_{pair_finger}_{folder_id:03d}"
+    folder_path = experiment_path / f"{timestamp}_{run_mode}_config_fingers_motor_set_{motor_set_id.value}_{folder_id:03d}"
     
     folder_path.mkdir()
     config.write_configuration(folder_path / "configuration.csv")
@@ -1305,26 +1612,72 @@ def create_experiment_folder(
     return folder_path
 
 
+def _resolve_resume_context(
+    experiment_root: Path, from_pair: int | None
+) -> tuple[Path, Configuration, int]:
+    """Locate the latest experiment folder and the pair_number to resume at."""
+    folder = _find_latest_experiment(experiment_root)
+    if folder is None:
+        raise typer.BadParameter(
+            f"No experiment folder found under {experiment_root}",
+            param_hint="--continue-last-experiment",
+        )
+
+    config_path = folder / "configuration.csv"
+    if not config_path.exists():
+        raise typer.BadParameter(
+            f"Resume target {folder} is missing configuration.csv",
+            param_hint="--continue-last-experiment",
+        )
+
+    config = Configuration.read_configuration(str(config_path))
+
+    if from_pair is not None:
+        if from_pair < 1:
+            raise typer.BadParameter("--from-pair must be >= 1", param_hint="--from-pair")
+        resume_pair_number = from_pair
+    else:
+        last = _find_last_pair_number(folder)
+        resume_pair_number = last if last is not None else 1
+
+    return folder, config, resume_pair_number
+
+
 def main(
     run_mode: Annotated[RunMode | None, typer.Option("--run-mode", help="Experiment run mode. Asked interactively when omitted.")] = None,
-    pair_finger: Annotated[FingerChoice | None, typer.Option("--pair-finger", help="Finger used for this run. Asked interactively when omitted.")] = None,
+    motor_set: Annotated[int | None, typer.Option("--motor-set", min=0, max=4, help="Physical motor set index 0-4. Index n drives motors n*3 through n*3+2. Asked interactively when omitted.")] = None,
     vision_type: Annotated[VisionType | None, typer.Option("--vision-type", help="Vision backend. Asked interactively when omitted.")] = None,
-    finger_color: Annotated[list[str] | None, typer.Option("--finger-color", help="Color assignment as FINGER=COLOR. Repeat for each required color-tracked finger.")] = None,
+    finger_color: Annotated[list[str] | None, typer.Option("--finger-color", help="Color assignment as FINGER=COLOR. Repeat for each required color-tracked finger. In single_finger run mode use FINGER=single (e.g. --finger-color single=red): one color is tracked regardless of which finger the protocol marks active.")] = None,
     side_camera_enabled: Annotated[bool | None, typer.Option("--side-camera-enabled/--side-camera-disabled", help="Whether the side camera is enabled. Asked interactively when omitted.")] = None,
     play_white_noise: Annotated[bool | None, typer.Option("--white-noise/--no-white-noise", help="Whether frontend should play white-noise masking. Asked interactively when omitted.")] = None,
     mirror_hand: Annotated[bool | None, typer.Option("--mirror-hand/--no-mirror-hand", help="Whether to mirror hand orientation. Asked interactively when omitted.")] = None,
     target_cycle_count: Annotated[int | None, typer.Option("--target-cycle-count", min=1, help="Number of cycles to apply. Asked interactively when omitted.")] = None,
     is_debug: Annotated[bool, typer.Option("--debug/--no-debug", help="Enable debug prints/logs and send the debug flag to frontend packets.")] = True,
+    continue_last_experiment: Annotated[bool, typer.Option("--continue-last-experiment", "--continue-last", help="Resume the latest experiment folder. Reuses its configuration.csv and starts at the beginning of a pair.")] = False,
+    from_pair: Annotated[int | None, typer.Option("--from-pair", min=1, help="With --continue-last-experiment, resume at this pair number from configuration.csv. Defaults to the last pair_NNN folder present.")] = None,
 ):
     set_is_debug(is_debug)
-    config = Configuration.read_configuration('configuration.csv')
+
+    if from_pair is not None and not continue_last_experiment:
+        raise typer.BadParameter(
+            "--from-pair requires --continue-last-experiment",
+            param_hint="--from-pair",
+        )
+
+    resume_pair_number: int | None = None
+    if continue_last_experiment:
+        path, config, resume_pair_number = _resolve_resume_context(Path(experiment_folder), from_pair)
+        print(f"Resuming experiment {path.name} at pair {resume_pair_number}")
+    else:
+        config = Configuration.read_configuration('configuration.csv')
+        path = None  # created after run params are resolved
+
     resolved_run_mode: RunModeLiteral = (run_mode.value if run_mode is not None else get_run_mode())  # type: ignore[assignment]
-    resolved_pair_finger = _resolve_pair_finger(resolved_run_mode, pair_finger)
+    resolved_motor_set_id = _resolve_motor_set_id(motor_set)
     resolved_vision_type = vision_type if vision_type is not None else get_vision_type()
     finger_colors = _resolve_finger_colors(
         config,
         resolved_run_mode,
-        resolved_pair_finger,
         resolved_vision_type,
         finger_color,
     )
@@ -1336,12 +1689,15 @@ def main(
         HandOrientation.MIRRORED if mirror_hand else HandOrientation.NOT_MIRRORED
     ) if mirror_hand is not None else get_hand_orientation()
     resolved_target_cycle_count = target_cycle_count if target_cycle_count is not None else get_target_cycle_count()
-    path = create_experiment_folder(config, resolved_run_mode, resolved_pair_finger)
-    
+
+    if path is None:
+        path = create_experiment_folder(config, resolved_run_mode, resolved_motor_set_id)
+
     experiment = start_experiment(
-        config, path, resolved_run_mode, resolved_pair_finger, hand_orientation,
+        config, path, resolved_run_mode, resolved_motor_set_id, hand_orientation,
         resolved_target_cycle_count, resolved_vision_type, tapping_enabled, finger_colors,
         side_camera_off, resolved_play_white_noise, is_debug,
+        resume_pair_number=resume_pair_number,
     )
     try:
         while True:

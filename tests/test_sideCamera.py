@@ -6,12 +6,12 @@ import numpy as np
 
 class SideCameraTest:
     def __init__(self):
-        self._is_pinching = False
+        self._is_interacting = False
         self._active_finger = "index" # Can be changed to "middle" or "ring"
         self._active_landmark = mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP
         self._running = True
         self.SIDE_CAMERA = 0
-        self.BASE_PINCH_THRESHOLD = 1.0  # pixels
+        self.BASE_INTERACTION_THRESHOLD = 1.0  # pixels
         self._width = 640  # Default camera width
         self._height = 480  # Default camera height
         #!new
@@ -32,13 +32,13 @@ class SideCameraTest:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
 
-    def _calculate_pinch_threshold(self, depth: float) -> float:
+    def _calculate_interaction_threshold(self, depth: float) -> float:
         """Adjust threshold based on depth (distance from side camera)"""
         #!new
-        return self.BASE_PINCH_THRESHOLD * (depth) * self._threshold_multipliers[self._active_finger]
+        return self.BASE_INTERACTION_THRESHOLD * (depth) * self._threshold_multipliers[self._active_finger]
 
-    def _detect_pinch(self, frame: np.ndarray, hands: Any):
-        """Process side camera frame to detect pinch gesture"""
+    def _detect_interaction(self, frame: np.ndarray, hands: Any):
+        """Process side camera frame to detect interaction gesture"""
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb_frame)
         
@@ -80,22 +80,22 @@ class SideCameraTest:
             
             finger_tip = hand_landmarks.landmark[self._active_landmark]
             depth = abs(finger_tip.z)
-            threshold = self._calculate_pinch_threshold(depth)
+            threshold = self._calculate_interaction_threshold(depth)
             
             #!new
             current_distance = self._finger_distances[self._active_finger]
-            self._is_pinching = current_distance < threshold
+            self._is_interacting = current_distance < threshold
             
             # Draw landmarks and connections for visualization
             mp.solutions.drawing_utils.draw_landmarks(
                 frame, hand_landmarks, mp.solutions.hands.HAND_CONNECTIONS)
             
             #!new
-            # Draw pinch status with flipped text
-            pinch_status = f"Pinching with {self._active_finger}" if self._is_pinching else "Not Pinching"
+            # Draw interaction status with flipped text
+            interaction_status = f"Interacting with {self._active_finger}" if self._is_interacting else "Not Interacting"
             flipped_frame = cv2.flip(frame.copy(), 1)  # Create a copy for text
-            cv2.putText(flipped_frame, pinch_status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                       1, (0, 255, 0) if self._is_pinching else (0, 0, 255), 2)
+            cv2.putText(flipped_frame, interaction_status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                       1, (0, 255, 0) if self._is_interacting else (0, 0, 255), 2)
             
             #!new
             # Draw distances for all fingers
@@ -113,10 +113,10 @@ class SideCameraTest:
             text_region = flipped_frame[0:y_pos+30, 0:500]
             frame[0:y_pos+30, self._width-500:self._width] = cv2.flip(text_region, 1)
         else:
-            self._is_pinching = False
+            self._is_interacting = False
 
     def start_side_camera(self):
-        """Process side camera feed to detect pinch gestures"""
+        """Process side camera feed to detect interaction gestures"""
         cap = cv2.VideoCapture(self.SIDE_CAMERA)
         if not cap.isOpened():
             print("Side camera not available")
@@ -135,7 +135,7 @@ class SideCameraTest:
                 if not ret:
                     continue
 
-                self._detect_pinch(frame, hands)
+                self._detect_interaction(frame, hands)
                     
                 cv2.imshow("Side Camera", cv2.flip(frame, 1))
                 key = cv2.waitKey(1) & 0xFF

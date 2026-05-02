@@ -130,7 +130,8 @@ class PygameFrontEnd:
         self._input_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._input_socket.connect((server_address, backend_port))
         
-        # Initialize pygame for visualization and keyboard input
+        # Initialize pygame for visualization. Moderator keyboard commands are
+        # sent by moderator_control.py, not by this frontend window.
         self._white_noise.pre_init_mixer()
         pygame.init()
         pygame.font.init()
@@ -151,7 +152,7 @@ class PygameFrontEnd:
 
     def _draw_comparison(self, tracking_obj: TrackingObject) -> None:
         # Draw virtual object
-        color = (FIRST_COLOR if tracking_obj.pairIndex == 0 else SECOND_COLOR) if tracking_obj.isPinched else (128, 128, 128)
+        color = (FIRST_COLOR if tracking_obj.pairIndex == 0 else SECOND_COLOR) if tracking_obj.isInteracting else (128, 128, 128)
         size = tracking_obj.size
         rect = pygame.Rect(
             int(tracking_obj.x * self._width - size / 2),
@@ -186,7 +187,7 @@ class PygameFrontEnd:
         # - returning: a clear center point marks the target to come back to
         center = (self._width // 2, self._height // 2)
         return_cue_active = return_progress > 0.001 or outbound_progress >= 0.995
-        if tracking_obj.isPinched:
+        if tracking_obj.isInteracting:
             if return_cue_active:
                 pygame.draw.circle(self.screen, (0, 200, 0), center, 16, 3)
                 pygame.draw.circle(self.screen, (0, 200, 0), center, 7)
@@ -272,7 +273,7 @@ class PygameFrontEnd:
         self.screen.blit(subtitle, subtitle_rect)
 
     def _draw_break(self, elapsed_seconds: int):
-        title = self._title_font.render("Break — press Enter on the keyboard", True, (255, 255, 255))
+        title = self._title_font.render("Break", True, (255, 255, 255))
         title_rect = title.get_rect(center=(self._width/2, self._height/2 - 50))
         self.screen.blit(title, title_rect)
 
@@ -283,6 +284,15 @@ class PygameFrontEnd:
         instr = self._font.render("Switch fingers on the screen", True, (255, 255, 255))
         instr_rect = instr.get_rect(center=(self._width/2, self._height/2 + 50))
         self.screen.blit(instr, instr_rect)
+
+    def _draw_moderator_pause(self, elapsed_seconds: int):
+        title = self._title_font.render("Pause", True, (255, 255, 255))
+        title_rect = title.get_rect(center=(self._width/2, self._height/2 - 50))
+        self.screen.blit(title, title_rect)
+
+        subtitle = self._font.render(f"Paused for: {elapsed_seconds} s", True, (255, 255, 255))
+        subtitle_rect = subtitle.get_rect(center=(self._width/2, self._height/2 + 10))
+        self.screen.blit(subtitle, subtitle_rect)
 
     def _draw_end(self):
         # Draw end screen title
@@ -323,6 +333,9 @@ class PygameFrontEnd:
             case ExperimentState.BREAK.value:
                 self._draw_break(packet.stateData.pauseTime)
 
+            case ExperimentState.MODERATOR_PAUSE.value:
+                self._draw_moderator_pause(packet.stateData.pauseTime)
+
             case ExperimentState.END.value:
                 self._draw_end()
 
@@ -334,9 +347,6 @@ class PygameFrontEnd:
     def _handle_pygame_events(self, event: pygame.event.Event) -> bool:
         """ Handle pygame events and returns if the program should continue running"""
         match event.type:
-            # case pygame.KEYDOWN:
-            #     if event.key == pygame.K_SPACE:
-            #         self.toggle_pinch()
             case pygame.QUIT:
                 self._running = False
                 self._white_noise.stop()
