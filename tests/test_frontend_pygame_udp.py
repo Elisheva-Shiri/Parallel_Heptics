@@ -1,3 +1,5 @@
+import pytest
+
 from frontend_pygame import _recv_latest_datagram, _should_show_cycle_counter
 
 
@@ -40,9 +42,10 @@ def test_recv_latest_datagram_preserves_existing_timeout():
     assert fake_socket.timeout_values == [0.25]
 
 
-def test_cycle_counter_hidden_for_single_iteration():
-    assert not _should_show_cycle_counter(1)
-
-
-def test_cycle_counter_shown_for_multiple_iterations():
-    assert _should_show_cycle_counter(2)
+@pytest.mark.parametrize(
+    "iterations, expected",
+    [(1, False), (2, True)],
+    ids=["single_hidden", "multiple_shown"],
+)
+def test_cycle_counter_visibility(iterations, expected):
+    assert _should_show_cycle_counter(iterations) is expected
