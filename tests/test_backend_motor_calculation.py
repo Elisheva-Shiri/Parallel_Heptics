@@ -1,4 +1,5 @@
-import math
+﻿import math
+from pathlib import Path
 
 import pytest
 
@@ -168,3 +169,41 @@ def test_mirrored_orientation(obj_x, obj_y, mirrored_x, mirrored_y):
     )
 
     assert _to_tuples(mirrored_result) == _to_tuples(normal_result)
+
+
+def test_ik_strategy_origin_returns_zero_positions():
+    controller = _make_controller(MovementStrategy.IK)
+
+    actual = controller.calculate_motor_movements(
+        motor_set_id=MotorSetId.MOTORS_3_5,
+        stiffness_value=1.0,
+        obj_x=0.0,
+        obj_y=0.0,
+        motors_enabled=True,
+    )
+
+    assert _to_tuples(actual) == [(3, 0), (4, 0), (5, 0)]
+
+
+def test_ik_strategy_returns_three_scaled_motor_commands():
+    controller = _make_controller(MovementStrategy.IK)
+
+    actual = controller.calculate_motor_movements(
+        motor_set_id=MotorSetId.MOTORS_3_5,
+        stiffness_value=0.5,
+        obj_x=160.0,
+        obj_y=0.0,
+        motors_enabled=True,
+    )
+
+    assert [movement.index for movement in actual] == [3, 4, 5]
+    assert any(movement.pos != 0 for movement in actual)
+
+
+def test_ik_strategy_uses_repo_local_solver_module():
+    controller = _make_controller(MovementStrategy.IK)
+    module_path = Path(controller._get_ik_module().__file__).resolve()
+
+    assert module_path.name == "unified_ik_starter.py"
+    assert module_path.parent.name == "kinematics"
+    assert module_path.parents[1] == Path(__file__).resolve().parents[1]
