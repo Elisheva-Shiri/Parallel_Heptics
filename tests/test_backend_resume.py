@@ -225,9 +225,48 @@ def test_resolve_resume_context_defaults_to_pair_one_when_no_pair_folders(tmp_pa
 
 
 def test_resolve_resume_context_honours_from_pair_override(tmp_path):
-    _seed_experiment(tmp_path, "exp", pair_count=3)
+    folder = _seed_experiment(tmp_path, "exp", pair_count=3)
+    (folder / "pair_001").mkdir()
+    (folder / "pair_002").mkdir()
+    (folder / "pair_003").mkdir()
+
     _, _, pair_number = backend._resolve_resume_context(tmp_path, 3)
+
     assert pair_number == 3
+
+
+def test_resolve_resume_context_allows_redoing_last_started_pair(tmp_path):
+    folder = _seed_experiment(tmp_path, "exp", pair_count=3)
+    (folder / "pair_001").mkdir()
+    (folder / "pair_002").mkdir()
+
+    _, _, pair_number = backend._resolve_resume_context(tmp_path, 2)
+
+    assert pair_number == 2
+
+
+def test_resolve_resume_context_rejects_future_from_pair(tmp_path):
+    folder = _seed_experiment(tmp_path, "exp", pair_count=3)
+    (folder / "pair_001").mkdir()
+    (folder / "pair_002").mkdir()
+
+    with pytest.raises(typer.BadParameter, match="higher than the latest started pair"):
+        backend._resolve_resume_context(tmp_path, 3)
+
+
+def test_resolve_resume_context_rejects_future_from_pair_when_none_started(tmp_path):
+    _seed_experiment(tmp_path, "exp", pair_count=3)
+
+    with pytest.raises(typer.BadParameter, match="no pair_NNN folders exist"):
+        backend._resolve_resume_context(tmp_path, 2)
+
+
+def test_resolve_resume_context_allows_pair_one_when_none_started(tmp_path):
+    _seed_experiment(tmp_path, "exp", pair_count=3)
+
+    _, _, pair_number = backend._resolve_resume_context(tmp_path, 1)
+
+    assert pair_number == 1
 
 
 def test_resolve_resume_context_rejects_non_positive_from_pair(tmp_path):
