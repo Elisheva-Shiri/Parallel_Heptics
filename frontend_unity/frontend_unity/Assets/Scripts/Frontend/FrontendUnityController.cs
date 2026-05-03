@@ -36,6 +36,7 @@ namespace ParallelHeptics.FrontendUnity
         private const float TextOffset = 0.006f;
         private const float TextScaleFactor = 0.5f;
         private const int CueCircleSegments = 96;
+        // Full-size visual cue radius. The backend-provided movementAreaScale controls the active fraction.
         private const float OutboundCueRadiusPixels = 190f;
         private const float AmbientNoiseLowPassAlpha = 0.075f;
         private const float AmbientNoiseRawMix = 0.16f;
@@ -438,7 +439,7 @@ namespace ParallelHeptics.FrontendUnity
 
             bool showCue = trackingObject.isInteracting;
             bool returnCueActive = showCue && ShouldShowReturnCue(trackingObject);
-            SetOutboundCueCircle(visible: showCue && !returnCueActive);
+            SetOutboundCueCircle(visible: showCue && !returnCueActive, movementAreaScale: trackingObject.movementAreaScale);
             _returnCuePoint.SetActive(returnCueActive);
             _titleText.text = string.Empty;
 
@@ -1108,7 +1109,7 @@ namespace ParallelHeptics.FrontendUnity
             SetBar(bar, width, height, x);
         }
 
-        private void SetOutboundCueCircle(bool visible)
+        private void SetOutboundCueCircle(bool visible, float movementAreaScale)
         {
             _outboundCueCircle.SetActive(visible);
             if (!visible)
@@ -1116,7 +1117,8 @@ namespace ParallelHeptics.FrontendUnity
                 return;
             }
 
-            float radius = mapper.PixelsToPanelSize(0f, OutboundCueRadiusPixels).y;
+            float radiusPixels = OutboundCueRadiusPixels * Mathf.Clamp01(movementAreaScale <= 0f ? 1f : movementAreaScale);
+            float radius = mapper.PixelsToPanelSize(0f, radiusPixels).y;
             SetCircleRadius(radius);
         }
 

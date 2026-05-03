@@ -22,7 +22,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
         [Test]
         public void ExperimentPacketJsonMatchesBackendShape()
         {
-            const string json = "{\"stateData\":{\"state\":1,\"pauseTime\":0},\"landmarks\":[{\"x\":0.25,\"z\":0.75}],\"trackingObject\":{\"x\":0.5,\"z\":0.4,\"size\":40.0,\"isInteracting\":true,\"progress\":0.25,\"returnProgress\":0.5,\"cycleCount\":1,\"targetCycleCount\":2,\"pairIndex\":0},\"playWhiteNoise\":true,\"isDebug\":false}";
+            const string json = "{\"stateData\":{\"state\":1,\"pauseTime\":0},\"landmarks\":[{\"x\":0.25,\"z\":0.75}],\"trackingObject\":{\"x\":0.5,\"z\":0.4,\"size\":40.0,\"isInteracting\":true,\"movementAreaScale\":0.5,\"progress\":0.25,\"returnProgress\":0.5,\"cycleCount\":1,\"targetCycleCount\":2,\"pairIndex\":0},\"playWhiteNoise\":true,\"isDebug\":false}";
 
             ExperimentPacket packet = JsonUtility.FromJson<ExperimentPacket>(json);
 
@@ -31,6 +31,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
             Assert.AreEqual(1, packet.landmarks.Count);
             Assert.AreEqual(0.25f, packet.landmarks[0].x, 0.0001f);
             Assert.IsTrue(packet.trackingObject.isInteracting);
+            Assert.AreEqual(0.5f, packet.trackingObject.movementAreaScale, 0.0001f);
             Assert.AreEqual(0.5f, packet.trackingObject.returnProgress, 0.0001f);
             Assert.IsTrue(packet.playWhiteNoise);
             Assert.IsFalse(packet.isDebug);
@@ -266,6 +267,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
                 Assert.NotNull(buildSceneGraph);
                 Assert.NotNull(renderPacket);
                 buildSceneGraph.Invoke(controller, null);
+                const float packetMovementAreaScale = 0.5f;
 
                 var packet = new ExperimentPacket
                 {
@@ -277,6 +279,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
                         z = 0.5f,
                         size = 40f,
                         isInteracting = true,
+                        movementAreaScale = packetMovementAreaScale,
                         progress = 0f,
                         returnProgress = 0f,
                         cycleCount = 0,
@@ -325,6 +328,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
                 Assert.NotNull(buildSceneGraph);
                 Assert.NotNull(renderPacket);
                 buildSceneGraph.Invoke(controller, null);
+                const float packetMovementAreaScale = 0.5f;
 
                 var outboundPacket = new ExperimentPacket
                 {
@@ -336,6 +340,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
                         z = 0.5f,
                         size = 40f,
                         isInteracting = true,
+                        movementAreaScale = packetMovementAreaScale,
                         progress = 0.4f,
                         returnProgress = 0f,
                         cycleCount = 0,
@@ -358,6 +363,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
                 var outboundRenderer = outboundCue.GetComponent<LineRenderer>();
                 Assert.NotNull(outboundRenderer);
                 float initialRadius = outboundRenderer.GetPosition(0).x;
+                Assert.AreEqual(190f * packetMovementAreaScale / 480f * 2f, initialRadius, 0.0001f, "The side target cue should scale from the backend-provided movement area scale.");
                 outboundPacket.trackingObject.progress = 0.8f;
                 renderPacket.Invoke(controller, new object[] { outboundPacket });
                 Assert.AreEqual(initialRadius, outboundRenderer.GetPosition(0).x, 0.0001f, "The outbound cue is a fixed max-range target ring; progress changes only the bar.");

@@ -16,7 +16,7 @@ from typing import Annotated
 import typer
 from pydantic import BaseModel
 from structures import ControlAction, ExperimentControl, ExperimentState, FingerPosition, QuestionInput, StateData, TrackingObject, ExperimentPacket
-from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, FINGER_NAMES, FingerName, CENTER_THRESHOLD, EDGE_THRESHOLD, TAPPING_HEIGHT_RATIO, STIFFNESS_MAX
+from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, FINGER_NAMES, FingerName, CENTER_THRESHOLD, EDGE_THRESHOLD, MOVEMENT_AREA_SCALE, TAPPING_HEIGHT_RATIO, STIFFNESS_MAX
 import queue
 from queue import Queue
 from enum import StrEnum
@@ -241,6 +241,10 @@ class Experiment:
         # Movement tracking thresholds
         self.CENTER_THRESHOLD = CENTER_THRESHOLD  # Pixels from center to start movement
         self.EDGE_THRESHOLD = EDGE_THRESHOLD  # Pixels from edge to count as reached edge
+        self.MOVEMENT_AREA_SCALE = max(0.0, min(1.0, MOVEMENT_AREA_SCALE))
+        full_movement_radius = max(0.0, min(self._top_width / 2, self._top_height / 2) - self.EDGE_THRESHOLD)
+        self._movement_target_radius = full_movement_radius * self.MOVEMENT_AREA_SCALE
+        self._movement_edge_threshold = max(0.0, min(self._top_width / 2, self._top_height / 2) - self._movement_target_radius)
         self.last_x = self._top_width/2  # Track last x position
         self.last_y = self._top_height/2  # Track last y position
         self.reached_edge = False  # Track if reached edge
@@ -252,7 +256,7 @@ class Experiment:
             movement_strategy=self._movement_strategy,
             top_width=self._top_width,
             top_height=self._top_height,
-            edge_threshold=self.EDGE_THRESHOLD,
+            edge_threshold=self._movement_edge_threshold,
             move_factor=MOVE_FACTOR,
             hand_orientation=self._hand_orientation,
         )
@@ -1087,6 +1091,7 @@ class Experiment:
                         z=self._virtual_object.y / self._top_height,
                         size=self._virtual_object.size,
                         isInteracting=self._virtual_object.is_interacting,
+                        movementAreaScale=self.MOVEMENT_AREA_SCALE,
                         progress=self._virtual_object.progress,
                         returnProgress=self._virtual_object.return_progress,
                         cycleCount=self._virtual_object.cycle_counter,
@@ -1147,7 +1152,7 @@ class Experiment:
             self.in_center = False
             
         # Check if reached edge
-        max_distance = min(self._top_width/2, self._top_height/2) - self.EDGE_THRESHOLD
+        max_distance = self._movement_target_radius
         if distance_from_center > max_distance:
             self.reached_edge = True
             
@@ -1164,6 +1169,7 @@ class Experiment:
             if distance_from_center < last_distance:
                 self._virtual_object.progress = max(0.0, self._virtual_object.progress - 0.1)
         else:
+            self._virtual_object.progress = 1.0
             return_distance = max_distance - self.CENTER_THRESHOLD
             if return_distance <= 0:
                 self._virtual_object.return_progress = 1.0 if distance_from_center < self.CENTER_THRESHOLD else 0.0

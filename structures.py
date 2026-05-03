@@ -29,6 +29,7 @@ class FingerPosition(Position):
 class TrackingObject(Position):
     size: float
     isInteracting: bool
+    movementAreaScale: float = 0.0
     # TODO - move progress/cycleCount to another object
     progress: float
     returnProgress: float

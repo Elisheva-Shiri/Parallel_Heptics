@@ -34,6 +34,7 @@ namespace ParallelHeptics.FrontendUnity
         public float z;
         public float size;
         public bool isInteracting;
+        public float movementAreaScale = 1f;
         public float progress;
         public float returnProgress;
         public int cycleCount;

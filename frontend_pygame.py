@@ -3,7 +3,7 @@ import random
 import socket
 import sys
 from array import array
-from consts import BACKEND_PORT, TOP_HEIGHT, PYGAME_PORT, FRONTEND_FPS, TOP_WIDTH
+from consts import BACKEND_PORT, MOVEMENT_AREA_SCALE, TOP_HEIGHT, PYGAME_PORT, FRONTEND_FPS, TOP_WIDTH
 from structures import ExperimentControl, ExperimentPacket, ExperimentState, FingerPosition, QuestionInput, TrackingObject
 
 FIRST_COLOR = (255, 165, 0)  # Orange
@@ -13,8 +13,8 @@ WHITE_NOISE_SECONDS = 2.0
 WHITE_NOISE_VOLUME = 0.15
 AMBIENT_NOISE_LOW_PASS_ALPHA = 0.075
 AMBIENT_NOISE_RAW_MIX = 0.16
+# Full-size visual cue radius. MOVEMENT_AREA_SCALE controls the active fraction.
 OUTBOUND_CUE_RADIUS = 215
-
 
 def _should_show_cycle_counter(target_cycle_count: int) -> bool:
     return target_cycle_count > 1
@@ -221,7 +221,13 @@ class PygameFrontEnd:
                 pygame.draw.circle(self.screen, (0, 200, 0), center, 16, 3)
                 pygame.draw.circle(self.screen, (0, 200, 0), center, 7)
             else:
-                pygame.draw.circle(self.screen, (144, 238, 144), center, OUTBOUND_CUE_RADIUS, 4)
+                movement_area_scale = (
+                    tracking_obj.movementAreaScale
+                    if tracking_obj.movementAreaScale > 0
+                    else MOVEMENT_AREA_SCALE
+                )
+                outbound_cue_radius = round(OUTBOUND_CUE_RADIUS * max(0.0, min(1.0, movement_area_scale)))
+                pygame.draw.circle(self.screen, (144, 238, 144), center, outbound_cue_radius, 4)
             
         # Draw movement counter only when multiple iterations are possible.
         if _should_show_cycle_counter(tracking_obj.targetCycleCount):
