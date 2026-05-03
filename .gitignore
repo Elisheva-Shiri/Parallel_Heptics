@@ -209,6 +209,9 @@ debug_experiments/
 live_experiments/
 todo.md
 
+# Track only the ESP32 serial bridge executable; keep logs/config ignored.
+!esp32_serial_bridge/esp32_bridge.exe
+
 ### Unity
 **/[Ll]ibrary/
 **/[Tt]emp/
