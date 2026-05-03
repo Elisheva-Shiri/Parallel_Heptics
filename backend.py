@@ -31,6 +31,7 @@ IS_DEBUG = True
 DEBUG_LOG_MOTOR_RANGE = True  # Log min/max motor positions on shutdown (no per-message overhead)
 
 original_print = builtins.print
+PROTOCOLS_FOLDER = Path(__file__).resolve().parent / "protocols"
 
 
 def set_is_debug(enabled: bool) -> None:
@@ -1601,6 +1602,82 @@ def get_target_cycle_count() -> int:
         original_print("Invalid input. Please enter a positive whole number.")
 
 
+def _get_protocol_files(protocols_folder: Path = PROTOCOLS_FOLDER) -> list[Path]:
+    """Return selectable top-level protocol CSVs, ignoring nested folders."""
+    if not protocols_folder.exists() or not protocols_folder.is_dir():
+        return []
+    return sorted(
+        path
+        for path in protocols_folder.iterdir()
+        if path.is_file() and path.suffix.lower() == ".csv"
+    )
+
+
+def _resolve_protocol_path(
+    protocol: str,
+    protocols_folder: Path = PROTOCOLS_FOLDER,
+) -> Path:
+    protocol_files = _get_protocol_files(protocols_folder)
+    if not protocol_files:
+        raise typer.BadParameter(
+            f"No top-level CSV protocol files found in {protocols_folder}",
+            param_hint="--protocol",
+        )
+
+    protocol = protocol.strip()
+    if not protocol:
+        raise typer.BadParameter("protocol cannot be empty", param_hint="--protocol")
+
+    if protocol.isdigit():
+        protocol_index = int(protocol)
+        if 1 <= protocol_index <= len(protocol_files):
+            return protocol_files[protocol_index - 1]
+        raise typer.BadParameter(
+            f"protocol number must be between 1 and {len(protocol_files)}",
+            param_hint="--protocol",
+        )
+
+    protocol_path = Path(protocol)
+    if protocol_path.is_absolute() or protocol_path.name != protocol:
+        raise typer.BadParameter(
+            "protocol must be a file name from the protocols folder, not a path",
+            param_hint="--protocol",
+        )
+
+    requested_name = protocol if protocol_path.suffix else f"{protocol}.csv"
+    for protocol_file in protocol_files:
+        if protocol_file.name.lower() == requested_name.lower():
+            return protocol_file
+
+    available = ", ".join(path.name for path in protocol_files)
+    raise typer.BadParameter(
+        f"unknown protocol '{protocol}'. Available protocols: {available}",
+        param_hint="--protocol",
+    )
+
+
+def get_protocol_path() -> Path:
+    protocol_files = _get_protocol_files()
+    if not protocol_files:
+        raise typer.BadParameter(
+            f"No top-level CSV protocol files found in {PROTOCOLS_FOLDER}",
+            param_hint="--protocol",
+        )
+
+    original_print("Available protocols:")
+    for index, protocol_file in enumerate(protocol_files, start=1):
+        original_print(f"  {index}. {protocol_file.name}")
+
+    while True:
+        user_input = input("Select protocol [1]: ").strip()
+        if user_input == "":
+            return protocol_files[0]
+        try:
+            return _resolve_protocol_path(user_input)
+        except typer.BadParameter as exc:
+            original_print(f"Invalid input. {exc}")
+
+
 def get_run_mode() -> Literal["comparison", "single_finger"]:
     while True:
         user_input = input("Run mode - [C]omparison / [S]ingle_finger [C]: ").strip().upper()
@@ -1876,6 +1953,7 @@ def main(
     run_mode: Annotated[RunMode | None, typer.Option("--run-mode", help="Experiment run mode. Asked interactively when omitted.")] = None,
     motor_set: Annotated[int | None, typer.Option("--motor-set", min=0, max=4, help="Physical motor set index 0-4. Index n drives motors n*3 through n*3+2. Asked interactively when omitted.")] = None,
     vision_type: Annotated[VisionType | None, typer.Option("--vision-type", help="Vision backend. Asked interactively when omitted.")] = None,
+    protocol: Annotated[str | None, typer.Option("--protocol", help="Protocol CSV to load from the top level of protocols/. Accepts a file name, stem, or listed number. Asked interactively when omitted for new experiments.")] = None,
     finger_color: Annotated[list[str] | None, typer.Option("--finger-color", help="Color assignment as FINGER=COLOR. Repeat for each required color-tracked finger. In single_finger run mode use FINGER=single (e.g. --finger-color single=red): one color is tracked regardless of which finger the protocol marks active.")] = None,
     side_camera_enabled: Annotated[bool | None, typer.Option("--side-camera-enabled/--side-camera-disabled", help="Whether the side camera is enabled. Asked interactively when omitted.")] = None,
     play_white_noise: Annotated[bool | None, typer.Option("--white-noise/--no-white-noise", help="Whether frontend should play white-noise masking. Asked interactively when omitted.")] = None,
@@ -1899,7 +1977,9 @@ def main(
         path, config, resume_pair_number = _resolve_resume_context(Path(experiment_folder), from_pair)
         print(f"Resuming experiment {path.name} at pair {resume_pair_number}")
     else:
-        config = Configuration.read_configuration('configuration.csv')
+        protocol_path = _resolve_protocol_path(protocol) if protocol is not None else get_protocol_path()
+        print(f"Using protocol {protocol_path.name}")
+        config = Configuration.read_configuration(str(protocol_path))
         path = None  # created after run params are resolved
 
     resolved_run_mode: RunModeLiteral = (run_mode.value if run_mode is not None else get_run_mode())  # type: ignore[assignment]

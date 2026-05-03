@@ -90,8 +90,9 @@ this only if you want to change comparisons / standard / amounts:
 uv run configuration.py
 ```
 
-Per-participant protocols already live in `protocols/` and are loaded by the
-backend automatically based on the run mode.
+Per-participant protocols already live as top-level CSV files in `protocols/`.
+The backend can prompt for one at startup or accept it with `--protocol`; nested
+folders such as `protocols/detailed/` are ignored by the selector.
 
 ### 5. Start the ESP32 serial bridge
 
@@ -115,9 +116,16 @@ The backend owns the TCP control socket that the frontend and
 uv run backend.py
 ```
 
-The backend prompts interactively for run mode, motor set, vision type, side
-camera, white noise, hand mirroring, and target cycle count. Any answer can
-also be passed as a flag — see `uv run backend.py --help`. Per-run output
+The backend prompts interactively for protocol, run mode, motor set, vision
+type, side camera, white noise, hand mirroring, and target cycle count. Any
+answer can also be passed as a flag — see `uv run backend.py --help`. For
+example, choose a protocol directly with:
+
+```bash
+uv run backend.py --protocol participant_1
+```
+
+Per-run output
 (video, finger CSVs, answers) lands in `live_experiments/<timestamp>_…/` (or
 `debug_experiments/` when `IS_DEBUG = True`).
 
