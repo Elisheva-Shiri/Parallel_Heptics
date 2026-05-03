@@ -16,7 +16,7 @@ _BASE_PACKET = (
     '"stateData":{"state":1,"pauseTime":0},'
     '"landmarks":[{"x":0.25,"z":0.75}],'
     '"trackingObject":{"x":0.5,"z":0.4,"size":40.0,"isInteracting":true,'
-    '"progress":0.25,"returnProgress":0.5,"cycleCount":1,'
+    '"movementAreaScale":0.5,"progress":0.25,"returnProgress":0.5,"cycleCount":1,'
     '"targetCycleCount":2,"pairIndex":0}'
 )
 
@@ -70,3 +70,4 @@ def test_experiment_packet_flags(extra, expected_white_noise, expected_debug):
 
     assert packet.playWhiteNoise is expected_white_noise
     assert packet.isDebug is expected_debug
+    assert packet.trackingObject.movementAreaScale == 0.5

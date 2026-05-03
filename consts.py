@@ -12,6 +12,7 @@ TARGET_CYCLE_COUNT = 1
 PAUSE_SLEEP_SECONDS = 60
 CENTER_THRESHOLD = 20
 EDGE_THRESHOLD = 30
+MOVEMENT_AREA_SCALE = 2  # 1.0 = full size, 0.5 = half size, 2/3 = current working-area size
 TAPPING_HEIGHT_RATIO = 0.3  # top 30% is inactive, bottom 70% is active
 STIFFNESS_MAX = 175
 
