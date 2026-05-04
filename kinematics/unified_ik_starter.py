@@ -7,14 +7,13 @@ Frozen design choices from the user
 -----------------------------------
 1) P2 construction:
    - top:   P2_top = Pm
-   - right: rotate (P1 -> Pm) by -120 deg in XY
-   - left:  rotate (P1 -> Pm) by +120 deg in XY
+   - right: P2_right = rotate (P1 -> Pm) by -120 deg in XY
+   - left:  P2_left = rotate (P1 -> Pm) by +120 deg in XY
 
 2) phi2 definition:
-   - use the angle of vector (P2 -> P1) for all legs
-   - for the top leg, since P2_top = Pm, this becomes the same practical rule
-     as the earlier top note:
-         phi2 = atan2(y1 - yPm, x1 - xPm)
+   - use the angle of vector (P2 -> P1) for all legs, this becomes the same practical rule
+   - phi2 = atan2(y1 - yPm, x1 - xPm)
+   - for the top leg, since P2_top = Pm
 
 3) phi3 definition:
    - use the interior triangle angle from vectors for all legs:
@@ -27,8 +26,7 @@ Frozen design choices from the user
        phi5 = atan2(y3 - yp, x3 - xp)
        phi6 = atan2(z3 - zp, y3 - yp)
 
-5) d5 does not exist.
-6) historical d4 is renamed to d2.
+5) historical d4 is renamed to d2.
 
 Design intent
 -------------
