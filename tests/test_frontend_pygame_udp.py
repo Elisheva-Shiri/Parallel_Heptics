@@ -1,6 +1,12 @@
 import pytest
 
-from frontend_pygame import _recv_latest_datagram, _should_show_cycle_counter
+from frontend_pygame import (
+    _control_payload,
+    _fallback_visual_cue_radius_pixels,
+    _recv_latest_datagram,
+    _should_show_cycle_counter,
+)
+from structures import ControlAction, ExperimentControl, TrackingObject, VisualCueMode
 
 
 class FakeUdpSocket:
@@ -49,3 +55,31 @@ def test_recv_latest_datagram_preserves_existing_timeout():
 )
 def test_cycle_counter_visibility(iterations, expected):
     assert _should_show_cycle_counter(iterations) is expected
+
+
+def test_control_payload_omits_null_fields_and_terminates_message():
+    payload = _control_payload(
+        ExperimentControl(moderatorAction=ControlAction.TOGGLE_INTERACTION)
+    )
+
+    assert payload == b'{"moderatorAction":"toggle_interaction"}\n'
+
+
+def test_fallback_visual_cue_radius_is_not_progress_clamped():
+    tracking_obj = TrackingObject(
+        x=1.25,
+        z=0.5,
+        size=40.0,
+        isInteracting=True,
+        visualCueMode=VisualCueMode.CIRCLE_BORDER,
+        visualCueRadiusPixels=0.0,
+        progress=1.0,
+        returnProgress=1.0,
+        cycleCount=0,
+        targetCycleCount=1,
+        pairIndex=0,
+    )
+
+    assert _fallback_visual_cue_radius_pixels(tracking_obj, 640, 480) == pytest.approx(
+        480.0 + 20.0
+    )

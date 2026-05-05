@@ -3,6 +3,7 @@ import pytest
 import backend
 import frontend_pygame
 from motor_controller import MotorController, MotorSetId, MovementStrategy
+from vision.base_vision import HandPosition
 
 
 def _to_tuples(movements):
@@ -23,6 +24,15 @@ def _make_movement_experiment() -> backend.Experiment:
     experiment.reached_edge = False
     experiment.in_center = True
     experiment._require_release = False
+    experiment._movement_cycle_ready = False
+    experiment._is_interacting = True
+    experiment._tapping_enabled = False
+    experiment._current_position = HandPosition(
+        thumb_x=backend.TOP_WIDTH / 2,
+        thumb_y=backend.TOP_HEIGHT / 2,
+        active_finger_x=backend.TOP_WIDTH / 2,
+        active_finger_y=backend.TOP_HEIGHT / 2,
+    )
     experiment._virtual_object = backend.VirtualObject(
         original_x=backend.TOP_WIDTH / 2,
         original_y=backend.TOP_HEIGHT / 2,
@@ -34,7 +44,7 @@ def _make_movement_experiment() -> backend.Experiment:
 def test_side_target_radius_uses_movement_area_scale_from_consts():
     full_radius = min(backend.TOP_WIDTH / 2, backend.TOP_HEIGHT / 2) - backend.EDGE_THRESHOLD
     scaled_movement_radius = full_radius * backend.MOVEMENT_AREA_SCALE
-    scaled_pygame_radius = frontend_pygame.OUTBOUND_CUE_RADIUS * frontend_pygame.MOVEMENT_AREA_SCALE
+    scaled_pygame_radius = frontend_pygame.OUTBOUND_CUE_RADIUS * backend.MOVEMENT_AREA_SCALE
 
     assert scaled_movement_radius / full_radius == pytest.approx(backend.MOVEMENT_AREA_SCALE)
     assert scaled_pygame_radius / frontend_pygame.OUTBOUND_CUE_RADIUS == pytest.approx(backend.MOVEMENT_AREA_SCALE)
@@ -64,9 +74,62 @@ def test_outbound_and_return_progress_use_scaled_side_target():
     experiment._virtual_object.x = center_x
     experiment._update_movement_progress()
 
+    assert experiment._virtual_object.cycle_counter == 0
+    assert experiment._virtual_object.is_interacting is True
+    assert experiment._virtual_object.progress == pytest.approx(1.0)
+    assert experiment._virtual_object.return_progress == pytest.approx(1.0)
+    assert experiment._movement_cycle_ready is True
+
+    experiment._is_interacting = False
+    experiment._update_virtual_object(stiffness_value=10, pair_index=0)
+
     assert experiment._virtual_object.cycle_counter == 1
-    assert experiment._virtual_object.is_interacting is False
-    assert experiment._require_release is True
+    assert experiment._virtual_object.progress == pytest.approx(0.0)
+    assert experiment._virtual_object.return_progress == pytest.approx(0.0)
+    assert experiment._movement_cycle_ready is False
+
+
+def test_releasing_before_both_bars_fill_resets_current_object_session():
+    experiment = _make_movement_experiment()
+    center_x = experiment._virtual_object.original_x
+    center_y = experiment._virtual_object.original_y
+    target_radius = experiment._movement_target_radius
+
+    experiment._virtual_object.x = center_x + target_radius + 1
+    experiment._virtual_object.y = center_y
+    experiment._update_movement_progress()
+
+    assert experiment._virtual_object.progress == pytest.approx(1.0)
+    assert experiment._virtual_object.return_progress == pytest.approx(0.0)
+
+    experiment._is_interacting = False
+    experiment._update_virtual_object(stiffness_value=10, pair_index=0)
+
+    assert experiment._virtual_object.cycle_counter == 0
+    assert experiment._virtual_object.progress == pytest.approx(0.0)
+    assert experiment._virtual_object.return_progress == pytest.approx(0.0)
+    assert experiment.reached_edge is False
+
+
+def test_visual_cue_radius_tracks_object_without_progress_clamp():
+    experiment = _make_movement_experiment()
+    center_x = experiment._virtual_object.original_x
+    center_y = experiment._virtual_object.original_y
+    target_radius = experiment._movement_target_radius
+
+    experiment._virtual_object.x = center_x + target_radius * 1.5
+    experiment._virtual_object.y = center_y
+    experiment._update_movement_progress()
+
+    assert experiment._virtual_object.progress == pytest.approx(1.0)
+    assert experiment._visual_cue_radius_pixels() == pytest.approx(
+        target_radius * 1.5 + experiment._virtual_object.size * 0.5
+    )
+
+    experiment._virtual_object.x = center_x
+    assert experiment._visual_cue_radius_pixels() == pytest.approx(
+        experiment._virtual_object.size * 0.5
+    )
 
 
 def test_haptic_workspace_clamp_uses_scaled_target_from_consts():
@@ -81,7 +144,7 @@ def test_haptic_workspace_clamp_uses_scaled_target_from_consts():
 
     actual = controller.calculate_motor_movements(
         motor_set_id=MotorSetId.MOTORS_3_5,
-        obj_x=400.0,
+        obj_x=target_radius + 80.0,
         obj_y=0.0,
         motors_enabled=True,
     )

@@ -69,7 +69,17 @@ namespace ParallelHeptics.FrontendUnity
         public void SendQuestionInput(QuestionInput input)
         {
             string json = JsonUtility.ToJson(new ExperimentControl { questionInput = (int)input });
-            _sendQueue.Enqueue(Encoding.UTF8.GetBytes(json));
+            EnqueueJson(json);
+        }
+
+        public void SendInteractionToggle()
+        {
+            EnqueueJson("{\"moderatorAction\":\"toggle_interaction\"}");
+        }
+
+        private void EnqueueJson(string json)
+        {
+            _sendQueue.Enqueue(Encoding.UTF8.GetBytes(json + "\n"));
             _sendSignal.Set();
         }
 

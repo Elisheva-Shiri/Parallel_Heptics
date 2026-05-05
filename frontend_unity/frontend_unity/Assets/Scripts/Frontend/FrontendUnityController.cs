@@ -25,7 +25,6 @@ namespace ParallelHeptics.FrontendUnity
         private static readonly Color DarkBarColor = new Color32(64, 64, 64, 255);
         private static readonly Color LightGreenColor = new Color32(144, 238, 144, 255);
         private static readonly Color GreenColor = new Color32(0, 200, 0, 255);
-        private static readonly Color OutboundCueColor = LightGreenColor;
         private static readonly Color CenterCueColor = GreenColor;
         private static readonly Vector3 DefaultTabletopPosition = new Vector3(0f, 0.75f, 0.55f);
         private static readonly Vector3 DefaultTabletopEulerAngles = new Vector3(-90f, 0f, 0f);
@@ -36,10 +35,22 @@ namespace ParallelHeptics.FrontendUnity
         private const float TextOffset = 0.006f;
         private const float TextScaleFactor = 0.5f;
         private const int CueCircleSegments = 96;
-        // Full-size visual cue radius. The backend-provided movementAreaScale controls the active fraction.
-        private const float OutboundCueRadiusPixels = 190f;
         private const float AmbientNoiseLowPassAlpha = 0.075f;
         private const float AmbientNoiseRawMix = 0.16f;
+        private const string CueModeCircleBorder = "circle_border";
+        private const string CueModeCircleFilled = "circle_filled";
+        private const string CueModeRubberBand = "rubber_band";
+        // Intentionally excludes CommonUsages.menuButton because Quest maps
+        // menu/system-style buttons closest to the Meta/calibration role.
+        private static readonly UnityEngine.XR.InputFeatureUsage<bool>[] ControllerInteractionButtons =
+        {
+            UnityEngine.XR.CommonUsages.primaryButton,
+            UnityEngine.XR.CommonUsages.secondaryButton,
+            UnityEngine.XR.CommonUsages.gripButton,
+            UnityEngine.XR.CommonUsages.triggerButton,
+            UnityEngine.XR.CommonUsages.primary2DAxisClick,
+            UnityEngine.XR.CommonUsages.secondary2DAxisClick
+        };
 
         [Header("Backend protocol")]
         [SerializeField] private string backendHost = "localhost";
@@ -55,6 +66,7 @@ namespace ParallelHeptics.FrontendUnity
         [SerializeField] private int maxFingerObjects = 10;
         [SerializeField] private float fingerDiameter = 0.1f;
         [SerializeField] private float holdSeconds = 1.0f;
+        [SerializeField] private bool enableControllerInteractionToggle = true;
         [SerializeField] private bool showDebugStatus;
 
         [Header("Audio masking")]
@@ -73,6 +85,8 @@ namespace ParallelHeptics.FrontendUnity
 
         private readonly List<GameObject> _fingerObjects = new List<GameObject>();
         private readonly Dictionary<Color, Material> _materials = new Dictionary<Color, Material>();
+        private readonly Dictionary<string, bool> _controllerButtonPressed = new Dictionary<string, bool>();
+        private readonly List<UnityEngine.XR.InputDevice> _controllerDevices = new List<UnityEngine.XR.InputDevice>();
         private ExperimentUdpReceiver _receiver;
         private ExperimentControlClient _controlClient;
         private HoldButtonSelector _holdSelector;
@@ -82,6 +96,10 @@ namespace ParallelHeptics.FrontendUnity
         private GameObject _trackingObject;
         private GameObject _outboundCueCircle;
         private LineRenderer _outboundCueRenderer;
+        private GameObject _filledCueCircle;
+        private MeshFilter _filledCueMeshFilter;
+        private GameObject _rubberBandCue;
+        private LineRenderer _rubberBandRenderer;
         private GameObject _returnCuePoint;
         private GameObject _progressBackground;
         private GameObject _outboundProgress;
@@ -306,6 +324,7 @@ namespace ParallelHeptics.FrontendUnity
         private void Update()
         {
             HandleCalibrationInput();
+            HandleControllerInteractionToggle();
 
             if (_receiver.TryGetLatestJson(out string json))
             {
@@ -335,6 +354,48 @@ namespace ParallelHeptics.FrontendUnity
                 float age = Time.unscaledTime - _lastPacketTime;
                 string packetStatus = _lastPacketTime < 0f ? "waiting for UDP" : $"last UDP {age:0.00}s ago";
                 _statusText.text = $"Unity Frontend | UDP:{udpListenPort} TCP:{tcpBackendPort} | {packetStatus}";
+            }
+        }
+
+        private void HandleControllerInteractionToggle()
+        {
+            if (!enableControllerInteractionToggle || _controlClient == null)
+            {
+                return;
+            }
+
+            _controllerDevices.Clear();
+            UnityEngine.XR.InputDevices.GetDevicesWithCharacteristics(
+                UnityEngine.XR.InputDeviceCharacteristics.Controller,
+                _controllerDevices);
+
+            for (int deviceIndex = 0; deviceIndex < _controllerDevices.Count; deviceIndex++)
+            {
+                UnityEngine.XR.InputDevice device = _controllerDevices[deviceIndex];
+                if (!device.isValid)
+                {
+                    continue;
+                }
+
+                for (int usageIndex = 0; usageIndex < ControllerInteractionButtons.Length; usageIndex++)
+                {
+                    UnityEngine.XR.InputFeatureUsage<bool> usage = ControllerInteractionButtons[usageIndex];
+                    bool isPressed = false;
+                    if (!device.TryGetFeatureValue(usage, out isPressed))
+                    {
+                        continue;
+                    }
+
+                    string key = $"{device.deviceId}:{usage.name}";
+                    _controllerButtonPressed.TryGetValue(key, out bool wasPressed);
+                    if (isPressed && !wasPressed)
+                    {
+                        _controlClient.SendInteractionToggle();
+                        LogIfDebug($"Controller interaction toggle from {device.name} {usage.name}");
+                    }
+
+                    _controllerButtonPressed[key] = isPressed;
+                }
             }
         }
 
@@ -431,16 +492,14 @@ namespace ParallelHeptics.FrontendUnity
                 return;
             }
 
-            _trackingObject.transform.localPosition = mapper.NormalizedToLocal(trackingObject.x, trackingObject.z, ForegroundOffset);
+            _trackingObject.transform.localPosition = mapper.NormalizedToLocalUnclamped(trackingObject.x, trackingObject.z, ForegroundOffset);
             Vector2 objectSize = mapper.PixelsToPanelSize(trackingObject.size, trackingObject.size);
             _trackingObject.transform.localScale = new Vector3(objectSize.x, objectSize.y, 0.006f);
             Color color = trackingObject.isInteracting ? (trackingObject.pairIndex == 0 ? FirstColor : SecondColor) : GrayColor;
             SetMaterial(_trackingObject, color);
 
-            bool showCue = trackingObject.isInteracting;
-            bool returnCueActive = showCue && ShouldShowReturnCue(trackingObject);
-            SetOutboundCueCircle(visible: showCue && !returnCueActive, movementAreaScale: trackingObject.movementAreaScale);
-            _returnCuePoint.SetActive(returnCueActive);
+            SetVisualCue(trackingObject.isInteracting, trackingObject, color);
+            _returnCuePoint.SetActive(false);
             _titleText.text = string.Empty;
 
             float barWidth = mapper.PanelWidth * 0.72f;
@@ -517,7 +576,7 @@ namespace ParallelHeptics.FrontendUnity
             bool message = state == ExperimentState.Pause || state == ExperimentState.Break || state == ExperimentState.ModeratorPause || state == ExperimentState.End || question;
 
             _trackingObject.SetActive(comparison);
-            _outboundCueCircle.SetActive(false);
+            SetAllVisualCuesActive(false);
             _returnCuePoint.SetActive(false);
             _progressBackground.SetActive(comparison);
             _outboundProgress.SetActive(comparison);
@@ -546,10 +605,12 @@ namespace ParallelHeptics.FrontendUnity
             _panelBackground = CreateQuad("Black Panel", _panelRoot, Vector3.zero, new Vector3(mapper.PanelWidth, mapper.PanelHeight, 1f), PanelColor);
             _trackingObject = CreateCube("Tracking Object", _dynamicRoot, Vector3.zero, Vector3.one, GrayColor);
 
-            _outboundCueCircle = CreateCircleCue("Outbound Edge Cue", _dynamicRoot, OutboundCueColor);
+            _outboundCueCircle = CreateCircleCue("Outbound Edge Cue", _dynamicRoot, FirstColor);
+            _filledCueCircle = CreateFilledCircleCue("Filled Circle Cue", _dynamicRoot, FirstColor);
+            _rubberBandCue = CreateRubberBandCue("Rubber Band Cue", _dynamicRoot, FirstColor);
             float pointDiameter = Mathf.Min(mapper.PanelWidth, mapper.PanelHeight) * 0.07f;
             _returnCuePoint = CreateSphere("Center Return Point", _dynamicRoot, new Vector3(0f, 0f, ForegroundOffset), new Vector3(pointDiameter, pointDiameter, pointDiameter * 0.18f), CenterCueColor);
-            _outboundCueCircle.SetActive(false);
+            SetAllVisualCuesActive(false);
             _returnCuePoint.SetActive(false);
 
             float progressY = -mapper.PanelHeight * 0.41f;
@@ -614,6 +675,41 @@ namespace ParallelHeptics.FrontendUnity
             _outboundCueRenderer.startColor = color;
             _outboundCueRenderer.endColor = color;
             SetCircleRadius(0f);
+
+            return go;
+        }
+
+        private GameObject CreateFilledCircleCue(string objectName, Transform parent, Color color)
+        {
+            GameObject go = new GameObject(objectName);
+            go.transform.SetParent(parent, false);
+            go.transform.localPosition = new Vector3(0f, 0f, SurfaceOffset);
+
+            _filledCueMeshFilter = go.AddComponent<MeshFilter>();
+            var renderer = go.AddComponent<MeshRenderer>();
+            renderer.sharedMaterial = GetMaterial(color);
+            SetFilledCircleRadius(0f);
+
+            return go;
+        }
+
+        private GameObject CreateRubberBandCue(string objectName, Transform parent, Color color)
+        {
+            GameObject go = new GameObject(objectName);
+            go.transform.SetParent(parent, false);
+            go.transform.localPosition = new Vector3(0f, 0f, SurfaceOffset);
+
+            _rubberBandRenderer = go.AddComponent<LineRenderer>();
+            _rubberBandRenderer.useWorldSpace = false;
+            _rubberBandRenderer.loop = false;
+            _rubberBandRenderer.positionCount = 2;
+            _rubberBandRenderer.widthMultiplier = Mathf.Min(mapper.PanelWidth, mapper.PanelHeight) * 0.01f;
+            _rubberBandRenderer.numCapVertices = 5;
+            _rubberBandRenderer.material = GetMaterial(color);
+            _rubberBandRenderer.startColor = color;
+            _rubberBandRenderer.endColor = color;
+            _rubberBandRenderer.SetPosition(0, Vector3.zero);
+            _rubberBandRenderer.SetPosition(1, Vector3.zero);
 
             return go;
         }
@@ -1088,11 +1184,6 @@ namespace ParallelHeptics.FrontendUnity
             }
         }
 
-        private static bool ShouldShowReturnCue(TrackingObject trackingObject)
-        {
-            return trackingObject.returnProgress > 0.001f || trackingObject.progress >= 0.995f;
-        }
-
         private void SetBar(GameObject bar, float width, float height, float centerX)
         {
             width = Mathf.Max(0f, width);
@@ -1109,17 +1200,89 @@ namespace ParallelHeptics.FrontendUnity
             SetBar(bar, width, height, x);
         }
 
-        private void SetOutboundCueCircle(bool visible, float movementAreaScale)
+        private void SetVisualCue(bool visible, TrackingObject trackingObject, Color color)
         {
-            _outboundCueCircle.SetActive(visible);
-            if (!visible)
+            SetAllVisualCuesActive(false);
+            if (!visible || trackingObject == null)
             {
                 return;
             }
 
-            float radiusPixels = OutboundCueRadiusPixels * Mathf.Clamp01(movementAreaScale <= 0f ? 1f : movementAreaScale);
-            float radius = mapper.PixelsToPanelSize(0f, radiusPixels).y;
-            SetCircleRadius(radius);
+            string mode = NormalizeVisualCueMode(trackingObject.visualCueMode);
+            float radius = mapper.PixelsToPanelSize(0f, GetVisualCueRadiusPixels(trackingObject)).y;
+            switch (mode)
+            {
+                case CueModeCircleFilled:
+                    _filledCueCircle.SetActive(true);
+                    SetMaterial(_filledCueCircle, color);
+                    SetFilledCircleRadius(radius);
+                    break;
+                case CueModeRubberBand:
+                    _rubberBandCue.SetActive(true);
+                    SetRubberBandCue(trackingObject, color);
+                    break;
+                case CueModeCircleBorder:
+                default:
+                    _outboundCueCircle.SetActive(true);
+                    _outboundCueRenderer.material = GetMaterial(color);
+                    _outboundCueRenderer.startColor = color;
+                    _outboundCueRenderer.endColor = color;
+                    SetCircleRadius(radius);
+                    break;
+            }
+        }
+
+        private void SetAllVisualCuesActive(bool active)
+        {
+            if (_outboundCueCircle != null)
+            {
+                _outboundCueCircle.SetActive(active);
+            }
+            if (_filledCueCircle != null)
+            {
+                _filledCueCircle.SetActive(active);
+            }
+            if (_rubberBandCue != null)
+            {
+                _rubberBandCue.SetActive(active);
+            }
+        }
+
+        private static string NormalizeVisualCueMode(string visualCueMode)
+        {
+            if (string.IsNullOrEmpty(visualCueMode))
+            {
+                return CueModeCircleBorder;
+            }
+
+            string normalized = visualCueMode.Trim().ToLowerInvariant();
+            switch (normalized)
+            {
+                case "border":
+                case "outline":
+                    return CueModeCircleBorder;
+                case "filled":
+                case "fill":
+                    return CueModeCircleFilled;
+                case "line":
+                case "rubber":
+                case "rubber-band":
+                    return CueModeRubberBand;
+                default:
+                    return normalized;
+            }
+        }
+
+        private static float GetVisualCueRadiusPixels(TrackingObject trackingObject)
+        {
+            if (trackingObject.visualCueRadiusPixels > 0f)
+            {
+                return trackingObject.visualCueRadiusPixels;
+            }
+
+            float dx = (trackingObject.x - 0.5f) * 640f;
+            float dz = (trackingObject.z - 0.5f) * 480f;
+            return Mathf.Sqrt(dx * dx + dz * dz) + trackingObject.size * 0.5f;
         }
 
         private void SetCircleRadius(float radius)
@@ -1135,6 +1298,58 @@ namespace ParallelHeptics.FrontendUnity
                 float angle = i * Mathf.PI * 2f / CueCircleSegments;
                 _outboundCueRenderer.SetPosition(i, new Vector3(Mathf.Cos(angle) * radius, Mathf.Sin(angle) * radius, 0f));
             }
+        }
+
+        private void SetFilledCircleRadius(float radius)
+        {
+            if (_filledCueMeshFilter == null)
+            {
+                return;
+            }
+
+            radius = Mathf.Max(0f, radius);
+            var vertices = new Vector3[CueCircleSegments + 1];
+            var triangles = new int[CueCircleSegments * 3];
+            vertices[0] = Vector3.zero;
+            for (int i = 0; i < CueCircleSegments; i++)
+            {
+                float angle = i * Mathf.PI * 2f / CueCircleSegments;
+                vertices[i + 1] = new Vector3(Mathf.Cos(angle) * radius, Mathf.Sin(angle) * radius, 0f);
+            }
+
+            for (int i = 0; i < CueCircleSegments; i++)
+            {
+                int triangleIndex = i * 3;
+                triangles[triangleIndex] = 0;
+                triangles[triangleIndex + 1] = i + 1;
+                triangles[triangleIndex + 2] = i == CueCircleSegments - 1 ? 1 : i + 2;
+            }
+
+            Mesh mesh = _filledCueMeshFilter.sharedMesh;
+            if (mesh == null)
+            {
+                mesh = new Mesh { name = "Filled Circle Cue Mesh" };
+                _filledCueMeshFilter.sharedMesh = mesh;
+            }
+            mesh.Clear();
+            mesh.vertices = vertices;
+            mesh.triangles = triangles;
+            mesh.RecalculateBounds();
+        }
+
+        private void SetRubberBandCue(TrackingObject trackingObject, Color color)
+        {
+            if (_rubberBandRenderer == null)
+            {
+                return;
+            }
+
+            _rubberBandRenderer.material = GetMaterial(color);
+            _rubberBandRenderer.startColor = color;
+            _rubberBandRenderer.endColor = color;
+            Vector3 objectPosition = mapper.NormalizedToLocalUnclamped(trackingObject.x, trackingObject.z, 0f);
+            _rubberBandRenderer.SetPosition(0, Vector3.zero);
+            _rubberBandRenderer.SetPosition(1, new Vector3(objectPosition.x, objectPosition.y, 0f));
         }
 
         private void SetChildFillBar(GameObject bar, float progress)

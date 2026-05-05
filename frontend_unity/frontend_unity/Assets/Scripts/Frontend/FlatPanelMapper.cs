@@ -24,6 +24,11 @@ namespace ParallelHeptics.FrontendUnity
             return new Vector3((Mathf.Clamp01(x) - 0.5f) * panelWidth, (Mathf.Clamp01(z) - 0.5f) * panelHeight, depthOffset);
         }
 
+        public Vector3 NormalizedToLocalUnclamped(float x, float z, float depthOffset = -0.02f)
+        {
+            return new Vector3((x - 0.5f) * panelWidth, (z - 0.5f) * panelHeight, depthOffset);
+        }
+
         public Vector2 NormalizedToPanel2D(float x, float z)
         {
             return new Vector2((Mathf.Clamp01(x) - 0.5f) * panelWidth, (Mathf.Clamp01(z) - 0.5f) * panelHeight);
