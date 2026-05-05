@@ -73,11 +73,12 @@ def test_finish_break_is_ignored_outside_break_state(experiment):
     assert experiment._control_queue.empty()
 
 
-def test_toggle_interaction_requires_manual_interaction_mode(experiment):
+def test_toggle_interaction_is_available_with_side_camera_enabled(experiment):
     experiment._manual_interaction_enabled = False
 
     response = experiment._handle_control_message(
         ExperimentControl(moderatorAction=ControlAction.TOGGLE_INTERACTION)
     )
 
-    assert response["ok"] is False
+    assert response["ok"] is True
+    assert experiment._is_interacting is False

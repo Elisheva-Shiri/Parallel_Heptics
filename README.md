@@ -1,10 +1,11 @@
 # Parallel Heptics
 
 Hand-tracking psychophysics experiment for studying perceived stiffness through
-parallel haptic feedback. A top-view camera tracks the participant's fingers, a
-side camera detects interaction gestures, and an ESP32-driven servo cluster
-delivers the haptic response. Participants see and interact with a virtual
-object either on screen (pygame) or in VR (Unity + Meta Quest via Quest Link).
+parallel haptic feedback. A top-view camera tracks the participant's fingers,
+the optional side camera remains available for side-view/z data, and an
+ESP32-driven servo cluster delivers the haptic response. Participants see and
+interact with a virtual object either on screen (pygame) or in VR (Unity + Meta
+Quest via Quest Link).
 
 ## Components
 
@@ -22,7 +23,9 @@ object either on screen (pygame) or in VR (Unity + Meta Quest via Quest Link).
   `HARDWARE_PORT` (12347); the bridge is what forwards them to the ESP32 over
   serial. Without it, motor commands go nowhere.
 - **Moderator control** (`moderator_control.py`) — one-shot CLI for the
-  moderator to toggle interaction, finish a break, or pause the run.
+  moderator to toggle interaction, finish a break, or pause the run. Subjects
+  can also toggle interaction from the active frontend: press Space in pygame,
+  or press a Quest controller button in Unity (excluding the Meta/system button).
 
 The data path is:
 
@@ -117,7 +120,7 @@ uv run backend.py
 ```
 
 The backend prompts interactively for protocol, run mode, motor set, vision
-type, side camera, white noise, hand mirroring, and target cycle count. Any
+type, optional side camera, white noise, hand mirroring, and target cycle count. Any
 answer can also be passed as a flag — see `uv run backend.py --help`. For
 example, choose a protocol directly with:
 
@@ -169,7 +172,7 @@ which app you launch.
 From any terminal in the repo root, run **one** at a time:
 
 ```bash
-uv run moderator_control.py --toggle-interaction   # -i, manual interaction toggle
+uv run moderator_control.py --toggle-interaction   # -i, manual interaction toggle (also available via Space/Unity controller)
 uv run moderator_control.py --toggle-break         # -b, finish a configured break
 uv run moderator_control.py --pause                # -p, unscheduled pause; run again to resume
 ```

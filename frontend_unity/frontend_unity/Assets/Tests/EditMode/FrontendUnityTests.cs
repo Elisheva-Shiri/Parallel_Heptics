@@ -22,7 +22,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
         [Test]
         public void ExperimentPacketJsonMatchesBackendShape()
         {
-            const string json = "{\"stateData\":{\"state\":1,\"pauseTime\":0},\"landmarks\":[{\"x\":0.25,\"z\":0.75}],\"trackingObject\":{\"x\":0.5,\"z\":0.4,\"size\":40.0,\"isInteracting\":true,\"movementAreaScale\":0.5,\"progress\":0.25,\"returnProgress\":0.5,\"cycleCount\":1,\"targetCycleCount\":2,\"pairIndex\":0},\"playWhiteNoise\":true,\"isDebug\":false}";
+            const string json = "{\"stateData\":{\"state\":1,\"pauseTime\":0},\"landmarks\":[{\"x\":0.25,\"z\":0.75}],\"trackingObject\":{\"x\":0.5,\"z\":0.4,\"size\":40.0,\"isInteracting\":true,\"movementAreaScale\":0.5,\"visualCueMode\":\"circle_filled\",\"visualCueRadiusPixels\":44.0,\"progress\":0.25,\"returnProgress\":0.5,\"cycleCount\":1,\"targetCycleCount\":2,\"pairIndex\":0},\"playWhiteNoise\":true,\"isDebug\":false}";
 
             ExperimentPacket packet = JsonUtility.FromJson<ExperimentPacket>(json);
 
@@ -32,6 +32,8 @@ namespace ParallelHeptics.FrontendUnity.Tests
             Assert.AreEqual(0.25f, packet.landmarks[0].x, 0.0001f);
             Assert.IsTrue(packet.trackingObject.isInteracting);
             Assert.AreEqual(0.5f, packet.trackingObject.movementAreaScale, 0.0001f);
+            Assert.AreEqual("circle_filled", packet.trackingObject.visualCueMode);
+            Assert.AreEqual(44f, packet.trackingObject.visualCueRadiusPixels, 0.0001f);
             Assert.AreEqual(0.5f, packet.trackingObject.returnProgress, 0.0001f);
             Assert.IsTrue(packet.playWhiteNoise);
             Assert.IsFalse(packet.isDebug);
@@ -94,6 +96,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
 
             Assert.AreEqual(new Vector2(-0.1f, -0.1f), mapper.NormalizedToPanel2D(0f, 0f));
             Assert.AreEqual(new Vector2(0.1f, 0.1f), mapper.NormalizedToPanel2D(1f, 1f));
+            Assert.Greater(mapper.NormalizedToLocalUnclamped(1.5f, 0.5f).x, 0.1f);
         }
 
         [Test]
@@ -229,8 +232,8 @@ namespace ParallelHeptics.FrontendUnity.Tests
                 panelRoot = GameObject.Find("Flat VR Frontend Panel");
                 Assert.NotNull(panelRoot);
                 Assert.IsTrue(FindDynamicChild(panelRoot, "Tracking Object").activeSelf);
-                Assert.IsFalse(FindDynamicChild(panelRoot, "Outbound Edge Cue").activeSelf);
-                Assert.IsTrue(FindDynamicChild(panelRoot, "Center Return Point").activeSelf);
+                Assert.IsTrue(FindDynamicChild(panelRoot, "Outbound Edge Cue").activeSelf);
+                Assert.IsFalse(FindDynamicChild(panelRoot, "Center Return Point").activeSelf);
                 Assert.IsTrue(FindDynamicChild(panelRoot, "Progress Background").activeSelf);
                 Assert.IsTrue(FindDynamicChild(panelRoot, "Return Progress").activeSelf);
                 Assert.IsTrue(FindDynamicChild(panelRoot, "Finger Landmark 1").activeSelf);
@@ -315,7 +318,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
         }
 
         [Test]
-        public void ComparisonCuesSwitchDirectionAndHideOutsideComparison()
+        public void ComparisonCuesFollowBackendCueRadiusModesAndHideOutsideComparison()
         {
             GameObject controllerObject = new GameObject("Comparison Cue Test Controller");
             GameObject panelRoot = null;
@@ -328,7 +331,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
                 Assert.NotNull(buildSceneGraph);
                 Assert.NotNull(renderPacket);
                 buildSceneGraph.Invoke(controller, null);
-                const float packetMovementAreaScale = 0.5f;
+                const float backendCueRadiusPixels = 500f;
 
                 var outboundPacket = new ExperimentPacket
                 {
@@ -340,7 +343,8 @@ namespace ParallelHeptics.FrontendUnity.Tests
                         z = 0.5f,
                         size = 40f,
                         isInteracting = true,
-                        movementAreaScale = packetMovementAreaScale,
+                        visualCueMode = "circle_border",
+                        visualCueRadiusPixels = backendCueRadiusPixels,
                         progress = 0.4f,
                         returnProgress = 0f,
                         cycleCount = 0,
@@ -363,14 +367,40 @@ namespace ParallelHeptics.FrontendUnity.Tests
                 var outboundRenderer = outboundCue.GetComponent<LineRenderer>();
                 Assert.NotNull(outboundRenderer);
                 float initialRadius = outboundRenderer.GetPosition(0).x;
-                Assert.AreEqual(190f * packetMovementAreaScale / 480f * 2f, initialRadius, 0.0001f, "The side target cue should scale from the backend-provided movement area scale.");
+                float expectedRadius = backendCueRadiusPixels / 480f * 2f;
+                Assert.AreEqual(expectedRadius, initialRadius, 0.0001f, "The cue radius should come from the backend visual cue radius, not clamped progress.");
                 outboundPacket.trackingObject.progress = 0.8f;
+                outboundPacket.trackingObject.returnProgress = 0.5f;
                 renderPacket.Invoke(controller, new object[] { outboundPacket });
-                Assert.AreEqual(initialRadius, outboundRenderer.GetPosition(0).x, 0.0001f, "The outbound cue is a fixed max-range target ring; progress changes only the bar.");
+                Assert.AreEqual(expectedRadius, outboundRenderer.GetPosition(0).x, 0.0001f, "Progress bars should not drive the circle radius.");
+                outboundPacket.trackingObject.visualCueRadiusPixels = 20f;
+                renderPacket.Invoke(controller, new object[] { outboundPacket });
+                Assert.AreEqual(20f / 480f * 2f, outboundRenderer.GetPosition(0).x, 0.0001f, "The border circle should remain visible at the center-sized radius.");
+
+                outboundPacket.trackingObject.visualCueMode = "circle_filled";
+                outboundPacket.trackingObject.visualCueRadiusPixels = backendCueRadiusPixels;
+                renderPacket.Invoke(controller, new object[] { outboundPacket });
+                GameObject filledCue = FindDynamicChild(panelRoot, "Filled Circle Cue");
+                Assert.IsTrue(filledCue.activeSelf);
+                Assert.IsFalse(outboundCue.activeSelf);
+                Assert.IsFalse(FindDynamicChild(panelRoot, "Rubber Band Cue").activeSelf);
+                Assert.NotNull(filledCue.GetComponent<MeshFilter>().sharedMesh);
+
+                outboundPacket.trackingObject.visualCueMode = "rubber_band";
+                outboundPacket.trackingObject.x = 1.25f;
+                renderPacket.Invoke(controller, new object[] { outboundPacket });
+                GameObject rubberBandCue = FindDynamicChild(panelRoot, "Rubber Band Cue");
+                Assert.IsTrue(rubberBandCue.activeSelf);
+                Assert.IsFalse(outboundCue.activeSelf);
+                Assert.IsFalse(filledCue.activeSelf);
+                var rubberBandRenderer = rubberBandCue.GetComponent<LineRenderer>();
+                Assert.Greater(rubberBandRenderer.GetPosition(1).x, 1f, "The rubber-band line should follow unclamped object coordinates.");
 
                 outboundPacket.trackingObject.isInteracting = false;
                 renderPacket.Invoke(controller, new object[] { outboundPacket });
                 Assert.IsFalse(FindDynamicChild(panelRoot, "Outbound Edge Cue").activeSelf);
+                Assert.IsFalse(FindDynamicChild(panelRoot, "Filled Circle Cue").activeSelf);
+                Assert.IsFalse(FindDynamicChild(panelRoot, "Rubber Band Cue").activeSelf);
                 Assert.IsFalse(FindDynamicChild(panelRoot, "Center Return Point").activeSelf);
                 Assert.IsTrue(FindDynamicChild(panelRoot, "Progress Background").activeSelf);
 

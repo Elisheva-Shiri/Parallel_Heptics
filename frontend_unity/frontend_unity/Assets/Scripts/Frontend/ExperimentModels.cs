@@ -35,6 +35,8 @@ namespace ParallelHeptics.FrontendUnity
         public float size;
         public bool isInteracting;
         public float movementAreaScale = 1f;
+        public string visualCueMode = "circle_border";
+        public float visualCueRadiusPixels;
         public float progress;
         public float returnProgress;
         public int cycleCount;

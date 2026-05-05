@@ -19,6 +19,11 @@ class ControlAction(str, Enum):
     FINISH_BREAK = "finish_break"
     TOGGLE_PAUSE = "toggle_pause"
 
+class VisualCueMode(str, Enum):
+    CIRCLE_BORDER = "circle_border"
+    CIRCLE_FILLED = "circle_filled"
+    RUBBER_BAND = "rubber_band"
+
 class Position(BaseModel):
     x: float
     z: float
@@ -30,6 +35,8 @@ class TrackingObject(Position):
     size: float
     isInteracting: bool
     movementAreaScale: float = 0.0
+    visualCueMode: VisualCueMode = VisualCueMode.CIRCLE_BORDER
+    visualCueRadiusPixels: float = 0.0
     # TODO - move progress/cycleCount to another object
     progress: float
     returnProgress: float
@@ -51,6 +58,6 @@ class ExperimentPacket(BaseModel):
 class ExperimentControl(BaseModel):
     # Backward-compatible question input used by pygame/Unity answer buttons.
     questionInput: int | None = None
-    # Moderator-only command path used by moderator_control.py.
+    # Command path used by moderator_control.py and frontend interaction toggles.
     moderatorAction: ControlAction | None = None
 

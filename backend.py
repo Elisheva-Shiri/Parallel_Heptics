@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import math
 import signal
+import subprocess
 from time import sleep
 import cv2
 import threading
@@ -15,8 +16,8 @@ import socket
 from typing import Annotated
 import typer
 from pydantic import BaseModel
-from structures import ControlAction, ExperimentControl, ExperimentState, FingerPosition, QuestionInput, StateData, TrackingObject, ExperimentPacket
-from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, FINGER_NAMES, FingerName, CENTER_THRESHOLD, EDGE_THRESHOLD, MOVEMENT_AREA_SCALE, TAPPING_HEIGHT_RATIO, STIFFNESS_MAX
+from structures import ControlAction, ExperimentControl, ExperimentState, FingerPosition, QuestionInput, StateData, TrackingObject, ExperimentPacket, VisualCueMode
+from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, FINGER_NAMES, FingerName, CENTER_THRESHOLD, EDGE_THRESHOLD, MOVEMENT_AREA_SCALE, STIFFNESS_MAX
 import queue
 from queue import Queue
 from enum import StrEnum
@@ -68,6 +69,7 @@ MOTOR_TYPE = MotorType.HARDWARE
 MOVEMENT_STRATEGY = MovementStrategy.IK
 MOTOR_OPPOSES_OBJECT_MOTION = True
 RECORDING_DATA = True
+VISUAL_CUE_MODE = VisualCueMode.CIRCLE_BORDER
 
 ANSWERS_HEADER = [
     'timestamp',
@@ -185,6 +187,7 @@ class Experiment:
         backend_port: int = BACKEND_PORT,
         hardware_port: int = HARDWARE_PORT,
         play_white_noise: bool = False,
+        visual_cue_mode: VisualCueMode = VISUAL_CUE_MODE,
         is_debug: bool = True,
         resume_pair_number: Optional[int] = None,
     ):
@@ -210,7 +213,10 @@ class Experiment:
         self._tapping_enabled = tapping_enabled
         self._finger_colors = finger_colors or {}
         self._side_camera_off = side_camera_off
-        self._manual_interaction_enabled = side_camera_off
+        # Interaction is controlled explicitly by frontend/controller toggles or
+        # moderator commands. The side camera may still be enabled for optional
+        # side-view/z recording, but it no longer owns interaction state.
+        self._manual_interaction_enabled = True
         # TODO - add Start screen if needed,
         # and adjust to ExperimentState.START
         self._state = ExperimentState.COMPARISON
@@ -222,6 +228,7 @@ class Experiment:
         self._hand_orientation = hand_orientation
         self._movement_strategy = movement_strategy
         self._play_white_noise = play_white_noise
+        self._visual_cue_mode = visual_cue_mode
         self._is_debug = is_debug
         self._state_lock = Lock()
         self._cleanup_lock = Lock()
@@ -250,6 +257,7 @@ class Experiment:
         self.reached_edge = False  # Track if reached edge
         self.in_center = True  # Track if in center
         self._require_release = False  # Require release before next cycle
+        self._movement_cycle_ready = False  # Full edge-and-return cycle is waiting for interaction release
         
         # Motor Controller
         self._motor_controller = MotorController(
@@ -546,8 +554,24 @@ class Experiment:
     def _sleep_motors(self):
         sleep(1.0 / self._motors_communication_rate)
 
+    def _visual_cue_radius_pixels(self) -> float:
+        """Return the cue radius in backend pixels, independent of progress bars.
+
+        The progress bars intentionally clamp at the configured movement target.
+        The visual cue should instead continue to follow the physical object, so
+        it is derived from the current object displacement and includes half the
+        object size to keep the circle visible when the object is at center.
+        """
+        center_x = self._top_width / 2
+        center_y = self._top_height / 2
+        distance_from_center = math.sqrt(
+            (self._virtual_object.x - center_x) ** 2
+            + (self._virtual_object.y - center_y) ** 2
+        )
+        return max(0.0, distance_from_center + self._virtual_object.size * 0.5)
+
     def _update_virtual_object(self, stiffness_value: int, pair_index: int) -> None:
-        """Update virtual object position based on hand position and interaction/tap state"""
+        """Update virtual object position based on hand position and explicit interaction state."""
         if self._current_position is None:
             return
 
@@ -577,22 +601,43 @@ class Experiment:
             self._virtual_object.y = contact_y
             self._update_movement_progress()
         else:
+            completed_cycle = (
+                getattr(self, "_movement_cycle_ready", False)
+                or (
+                    self._virtual_object.progress >= 0.995
+                    and self._virtual_object.return_progress >= 0.995
+                )
+            )
+            if completed_cycle:
+                self._virtual_object.cycle_counter += 1
+
             # Return to original position when released
             self._virtual_object.x = self._virtual_object.original_x
             self._virtual_object.y = self._virtual_object.original_y
             self._virtual_object.progress = 0.0
             self._virtual_object.return_progress = 0.0
+            self.reached_edge = False
+            self.in_center = True
+            self._movement_cycle_ready = False
+            self._require_release = False
+            self.last_x = self._virtual_object.original_x
+            self.last_y = self._virtual_object.original_y
 
         # Update stiffness and index
         self._virtual_object.stiffness_value = stiffness_value
         self._virtual_object.pair_index = pair_index
 
     def _check_comparison_end(self) -> bool:
-        return self._virtual_object.cycle_counter == self._target_cycle_count
+        return self._virtual_object.cycle_counter >= self._target_cycle_count
 
     def _reset_comparison(self):
         self._is_interacting = False
         self._require_release = False
+        self._movement_cycle_ready = False
+        self.reached_edge = False
+        self.in_center = True
+        self.last_x = self._virtual_object.original_x
+        self.last_y = self._virtual_object.original_y
         self._virtual_object.reset()
 
     def _get_finger_name(self, finger_id: int) -> FingerName:
@@ -719,8 +764,6 @@ class Experiment:
                 return {"ok": False, "message": "Ignored toggle_interaction while moderator pause is active"}
             if self._get_state() != ExperimentState.COMPARISON:
                 return {"ok": False, "message": f"Ignored toggle_interaction while state is {self._get_state().name}"}
-            if not self._manual_interaction_enabled:
-                return {"ok": False, "message": "Ignored toggle_interaction because side-camera/tap detection is active"}
 
             self._toggle_interaction()
             return {"ok": True, "message": f"Interaction is now {'ON' if self._is_interacting else 'OFF'}"}
@@ -1092,6 +1135,8 @@ class Experiment:
                         size=self._virtual_object.size,
                         isInteracting=self._virtual_object.is_interacting,
                         movementAreaScale=self.MOVEMENT_AREA_SCALE,
+                        visualCueMode=self._visual_cue_mode,
+                        visualCueRadiusPixels=self._visual_cue_radius_pixels(),
                         progress=self._virtual_object.progress,
                         returnProgress=self._virtual_object.return_progress,
                         cycleCount=self._virtual_object.cycle_counter,
@@ -1128,6 +1173,12 @@ class Experiment:
             self._virtual_object.return_progress = 0.0
             self.reached_edge = False
             self.in_center = True
+            self._movement_cycle_ready = False
+            return
+
+        if getattr(self, "_movement_cycle_ready", False):
+            self._virtual_object.progress = 1.0
+            self._virtual_object.return_progress = 1.0
             return
 
         center_x = self._top_width / 2
@@ -1140,13 +1191,15 @@ class Experiment:
         # Check if in center region
         if distance_from_center < self.CENTER_THRESHOLD:
             if not self.in_center and self.reached_edge:
-                # Completed full movement
-                self._virtual_object.cycle_counter += 1
-                self._virtual_object.progress = 0.0
-                self._virtual_object.return_progress = 0.0
-                self.reached_edge = False
-                self._virtual_object.is_interacting = False
-                self._require_release = True
+                # Completed full movement. Keep both bars filled and wait for
+                # the user to stop interacting before advancing the session.
+                self._virtual_object.progress = 1.0
+                self._virtual_object.return_progress = 1.0
+                self._movement_cycle_ready = True
+                self.in_center = True
+                self.last_x = self._virtual_object.x
+                self.last_y = self._virtual_object.y
+                return
             self.in_center = True
         else:
             self.in_center = False
@@ -1286,7 +1339,7 @@ class Experiment:
             self._safe_destroy_window("Top Camera")
 
     def start_side_camera(self):
-        """Process side camera feed to detect interaction gestures"""
+        """Process side camera feed for optional side-view/z recording only."""
         RETRIES = 10
         
         cap = cv2.VideoCapture(self.SIDE_CAMERA, cv2.CAP_DSHOW)
@@ -1299,8 +1352,7 @@ class Experiment:
 
         if not cap.isOpened():
             cap.release()
-            print("Side camera not available - use moderator_control.py --toggle-interaction for manual interaction control")
-            self._manual_interaction_enabled = True
+            print("Side camera not available - continuing without side-camera data")
             return
         
         self._register_camera_capture("side", cap)
@@ -1314,11 +1366,6 @@ class Experiment:
                 if not ret:
                     continue
 
-                if self._tapping_enabled:
-                    self._detect_tapping(frame)
-                else:
-                    self._detect_interaction(frame)
-                
                 # Add frame to recording queue if recording
                 if self._side_writer:
                     try:
@@ -1348,53 +1395,13 @@ class Experiment:
         return self._is_interacting
 
     def _toggle_interaction(self):
-        """Toggle interaction state when not using camera"""
+        """Toggle explicit interaction state from a frontend/controller/moderator command."""
         print(f"toggle interaction from {self._is_interacting} to {not self._is_interacting}")
         self._is_interacting = not self._is_interacting
     
     def _process_top_view(self, frame: np.ndarray) -> HandPosition:
         return self._vision.detect_hand(frame)
 
-    def _detect_interaction(self, frame: np.ndarray):
-        if self._is_moderator_paused():
-            self._is_interacting = False
-            return
-
-        current_pos = self.get_hand_position(with_lock=False)
-        if current_pos is None or all([
-            current_pos.thumb_x == 0,
-            current_pos.thumb_y == 0,
-            current_pos.active_finger_x == 0,
-            current_pos.active_finger_y == 0,
-        ]):
-            if self._is_interacting:
-                print("Can't find hand, stopping interaction")
-                self._is_interacting = False
-            return
-        
-        prev_interaction = self._is_interacting
-        self._is_interacting = self._vision.detect_interaction(
-            frame,
-            current_pos,
-            self._side_camera_location
-        )
-        if prev_interaction != self._is_interacting:
-            print(f"Interaction changed to {self._is_interacting}")
-
-    def _detect_tapping(self, frame: np.ndarray):
-        """Detect tapping using side camera: finger in bottom 70% = tapping."""
-        if self._is_moderator_paused():
-            self._is_interacting = False
-            return
-
-        side_pos = self._vision.detect_side_hand(frame)
-        finger_y = side_pos.active_finger_y
-        threshold_y = self._side_height * TAPPING_HEIGHT_RATIO
-        prev = self._is_interacting
-        self._is_interacting = finger_y > threshold_y and finger_y > 0
-        if prev != self._is_interacting:
-            print(f"Tapping changed to {self._is_interacting}")
-        
     def cleanup(self):
         """Clean up resources"""
         with self._cleanup_lock:
@@ -1447,6 +1454,7 @@ def start_experiment(
     finger_colors: dict[str, str],
     side_camera_off: bool = False,
     play_white_noise: bool = False,
+    visual_cue_mode: VisualCueMode = VISUAL_CUE_MODE,
     is_debug: bool = True,
     resume_pair_number: Optional[int] = None,
 ):
@@ -1464,6 +1472,7 @@ def start_experiment(
         finger_colors=finger_colors,
         side_camera_off=side_camera_off,
         play_white_noise=play_white_noise,
+        visual_cue_mode=visual_cue_mode,
         is_debug=is_debug,
         resume_pair_number=resume_pair_number,
     )
@@ -1687,9 +1696,9 @@ def get_protocol_path() -> Path:
 def get_run_mode() -> Literal["comparison", "single_finger"]:
     while True:
         user_input = input("Run mode - [C]omparison / [S]ingle_finger [C]: ").strip().upper()
-        if user_input in ("", "C"):
+        if user_input in ("", "C", "COMPARISON"):
             return "comparison"
-        if user_input == "S":
+        if user_input in ("S", "SINGLE_FINGER", "SINGLE-FINGER"):
             return "single_finger"
         original_print("Invalid input. Please enter C or S.")
 
@@ -1706,6 +1715,9 @@ def get_vision_type() -> VisionType:
             return VisionType.MEDIAPIPE
         if user_input.isdigit() and 1 <= int(user_input) <= len(options):
             return options[int(user_input) - 1]
+        for option in options:
+            if user_input.lower() == option.value:
+                return option
         original_print(f"Invalid input. Please enter a number between 1 and {len(options)}.")
 
 
@@ -1745,7 +1757,7 @@ def get_side_camera_off() -> bool:
 
 
 def get_play_white_noise() -> bool:
-    """Ask whether the frontend should play white-noise masking. Default is no."""
+    """Ask whether the frontend should play white-noise masking."""
     while True:
         user_input = input("Apply white noise? [y/N]: ").strip().lower()
         if user_input in ("", "n", "no"):
@@ -1781,7 +1793,7 @@ def get_finger_colors(
 
 
 def get_hand_orientation() -> HandOrientation:
-    """Get user input for mirrored hand orientation (default: not mirrored)."""
+    """Get user input for mirrored hand orientation."""
     while True:
         user_input = input("Mirror hand orientation? [y/N]: ").strip().lower()
         if user_input in ("", "n", "no"):
@@ -1789,6 +1801,94 @@ def get_hand_orientation() -> HandOrientation:
         if user_input in ("y", "yes"):
             return HandOrientation.MIRRORED
         original_print("Invalid input. Please enter Y or N.")
+
+
+def get_movement_strategy() -> MovementStrategy:
+    options = list(MovementStrategy)
+    original_print("Available movement strategies:")
+    for index, strategy in enumerate(options, start=1):
+        default_marker = " (default)" if strategy == MOVEMENT_STRATEGY else ""
+        original_print(f"  {index}. {strategy.value}{default_marker}")
+
+    while True:
+        default_index = options.index(MOVEMENT_STRATEGY) + 1
+        user_input = input(f"Select movement strategy [{default_index}]: ").strip().lower()
+        if user_input == "":
+            return MOVEMENT_STRATEGY
+        if user_input.isdigit() and 1 <= int(user_input) <= len(options):
+            return options[int(user_input) - 1]
+        for strategy in options:
+            if user_input == strategy.value:
+                return strategy
+        original_print(f"Invalid input. Please enter a number between 1 and {len(options)}.")
+
+
+def get_visual_cue_mode() -> VisualCueMode:
+    options = list(VisualCueMode)
+    original_print("Available graphical experiences:")
+    labels = {
+        VisualCueMode.CIRCLE_BORDER: "border-only growing circle",
+        VisualCueMode.CIRCLE_FILLED: "filled growing circle",
+        VisualCueMode.RUBBER_BAND: "rubber-band line to center",
+    }
+    for index, mode in enumerate(options, start=1):
+        default_marker = " (default)" if mode == VISUAL_CUE_MODE else ""
+        original_print(f"  {index}. {mode.value} - {labels[mode]}{default_marker}")
+
+    while True:
+        default_index = options.index(VISUAL_CUE_MODE) + 1
+        user_input = input(f"Select graphical experience [{default_index}]: ").strip().lower()
+        if user_input == "":
+            return VISUAL_CUE_MODE
+        if user_input.isdigit() and 1 <= int(user_input) <= len(options):
+            return options[int(user_input) - 1]
+        for mode in options:
+            if user_input == mode.value:
+                return mode
+        aliases = {
+            "border": VisualCueMode.CIRCLE_BORDER,
+            "outline": VisualCueMode.CIRCLE_BORDER,
+            "filled": VisualCueMode.CIRCLE_FILLED,
+            "fill": VisualCueMode.CIRCLE_FILLED,
+            "line": VisualCueMode.RUBBER_BAND,
+            "rubber": VisualCueMode.RUBBER_BAND,
+            "rubber-band": VisualCueMode.RUBBER_BAND,
+        }
+        if user_input in aliases:
+            return aliases[user_input]
+        original_print(f"Invalid input. Please enter a number between 1 and {len(options)}.")
+
+
+def get_is_debug() -> bool:
+    while True:
+        user_input = input("Enable debug output? [Y/n]: ").strip().lower()
+        if user_input in ("", "y", "yes"):
+            return True
+        if user_input in ("n", "no"):
+            return False
+        original_print("Invalid input. Please enter Y or N.")
+
+
+def get_continue_last_experiment() -> bool:
+    while True:
+        user_input = input("Continue latest experiment? [y/N]: ").strip().lower()
+        if user_input == "":
+            return False
+        if user_input in ("y", "yes"):
+            return True
+        if user_input in ("n", "no"):
+            return False
+        original_print("Invalid input. Please enter Y or N.")
+
+
+def get_resume_from_pair() -> int | None:
+    while True:
+        user_input = input("Resume from [L]ast started pair or explicit pair number [L]: ").strip().lower()
+        if user_input in ("", "l", "last"):
+            return None
+        if user_input.isdigit() and int(user_input) > 0:
+            return int(user_input)
+        original_print("Invalid input. Please enter L or a positive whole number.")
 
 
 def _is_color_vision(vision_type: VisionType) -> bool:
@@ -1955,6 +2055,59 @@ def _resolve_resume_context(
     return folder, config, resume_pair_number
 
 
+def _format_replay_command(
+    *,
+    run_mode: RunModeLiteral,
+    motor_set_id: MotorSetId,
+    vision_type: VisionType,
+    protocol_path: Path | None,
+    finger_colors: dict[str, str],
+    side_camera_off: bool,
+    play_white_noise: bool,
+    hand_orientation: HandOrientation,
+    movement_strategy: MovementStrategy,
+    target_cycle_count: int,
+    visual_cue_mode: VisualCueMode,
+    is_debug: bool,
+    continue_last_experiment: bool,
+    resume_pair_number: int | None,
+) -> str:
+    args = [
+        "uv",
+        "run",
+        "python",
+        "backend.py",
+        "--run-mode",
+        run_mode,
+        "--motor-set",
+        str(motor_set_id.value),
+        "--vision-type",
+        vision_type.value,
+    ]
+
+    if continue_last_experiment:
+        args.append("--continue-last-experiment")
+        if resume_pair_number is not None:
+            args.extend(["--from-pair", str(resume_pair_number)])
+    else:
+        args.append("--new-experiment")
+        if protocol_path is not None:
+            args.extend(["--protocol", protocol_path.name])
+
+    for finger, color in sorted(finger_colors.items()):
+        args.extend(["--finger-color", f"{finger}={color}"])
+
+    args.append("--side-camera-disabled" if side_camera_off else "--side-camera-enabled")
+    args.append("--white-noise" if play_white_noise else "--no-white-noise")
+    args.append("--mirror-hand" if hand_orientation == HandOrientation.MIRRORED else "--no-mirror-hand")
+    args.extend(["--movement-strategy", movement_strategy.value])
+    args.extend(["--target-cycle-count", str(target_cycle_count)])
+    args.extend(["--visual-cue-mode", visual_cue_mode.value])
+    args.append("--debug" if is_debug else "--no-debug")
+
+    return subprocess.list2cmdline(args)
+
+
 def main(
     run_mode: Annotated[RunMode | None, typer.Option("--run-mode", help="Experiment run mode. Asked interactively when omitted.")] = None,
     motor_set: Annotated[int | None, typer.Option("--motor-set", min=0, max=4, help="Physical motor set index 0-4. Index n drives motors n*3 through n*3+2. Asked interactively when omitted.")] = None,
@@ -1964,23 +2117,33 @@ def main(
     side_camera_enabled: Annotated[bool | None, typer.Option("--side-camera-enabled/--side-camera-disabled", help="Whether the side camera is enabled. Asked interactively when omitted.")] = None,
     play_white_noise: Annotated[bool | None, typer.Option("--white-noise/--no-white-noise", help="Whether frontend should play white-noise masking. Asked interactively when omitted.")] = None,
     mirror_hand: Annotated[bool | None, typer.Option("--mirror-hand/--no-mirror-hand", help="Whether to mirror hand orientation. Asked interactively when omitted.")] = None,
-    movement_strategy: Annotated[MovementStrategy, typer.Option("--movement-strategy", help="Motor movement mapping strategy. Use 'ik' for the IK solver ported into this repository.")] = MOVEMENT_STRATEGY,
+    movement_strategy: Annotated[MovementStrategy | None, typer.Option("--movement-strategy", help="Motor movement mapping strategy. Asked interactively when omitted. Use 'ik' for the IK solver ported into this repository.")] = None,
     target_cycle_count: Annotated[int | None, typer.Option("--target-cycle-count", min=1, help="Number of cycles to apply. Asked interactively when omitted.")] = None,
-    is_debug: Annotated[bool, typer.Option("--debug/--no-debug", help="Enable debug prints/logs and send the debug flag to frontend packets.")] = True,
-    continue_last_experiment: Annotated[bool, typer.Option("--continue-last-experiment", "--continue-last", help="Resume the latest experiment folder. Reuses its configuration.csv and starts at the beginning of a pair.")] = False,
-    from_pair: Annotated[int | None, typer.Option("--from-pair", min=1, help="With --continue-last-experiment, resume at this pair number from configuration.csv. Must be no higher than the latest pair_NNN folder so the last started pair is re-done. Defaults to the last pair_NNN folder present.")] = None,
+    visual_cue_mode: Annotated[VisualCueMode | None, typer.Option("--visual-cue-mode", help="Graphical experience: circle_border, circle_filled, or rubber_band. Asked interactively when omitted.")] = None,
+    is_debug: Annotated[bool | None, typer.Option("--debug/--no-debug", help="Enable debug prints/logs and send the debug flag to frontend packets. Asked interactively when omitted.")] = None,
+    continue_last_experiment: Annotated[bool | None, typer.Option("--continue-last-experiment/--new-experiment", "--continue-last/--new", help="Resume the latest experiment folder or start a new one. Asked interactively when omitted.")] = None,
+    from_pair: Annotated[int | None, typer.Option("--from-pair", min=1, help="With --continue-last-experiment, resume at this pair number from configuration.csv. Asked interactively when omitted while continuing. Must be no higher than the latest pair_NNN folder so the last started pair is re-done.")] = None,
 ):
-    set_is_debug(is_debug)
+    resolved_is_debug = is_debug if is_debug is not None else get_is_debug()
+    set_is_debug(resolved_is_debug)
 
-    if from_pair is not None and not continue_last_experiment:
+    resolved_continue_last_experiment = (
+        continue_last_experiment
+        if continue_last_experiment is not None
+        else get_continue_last_experiment()
+    )
+
+    if from_pair is not None and not resolved_continue_last_experiment:
         raise typer.BadParameter(
             "--from-pair requires --continue-last-experiment",
             param_hint="--from-pair",
         )
 
     resume_pair_number: int | None = None
-    if continue_last_experiment:
-        path, config, resume_pair_number = _resolve_resume_context(Path(experiment_folder), from_pair)
+    protocol_path: Path | None = None
+    if resolved_continue_last_experiment:
+        resolved_from_pair = from_pair if from_pair is not None else get_resume_from_pair()
+        path, config, resume_pair_number = _resolve_resume_context(Path(experiment_folder), resolved_from_pair)
         print(f"Resuming experiment {path.name} at pair {resume_pair_number}")
     else:
         protocol_path = _resolve_protocol_path(protocol) if protocol is not None else get_protocol_path()
@@ -2004,7 +2167,9 @@ def main(
     hand_orientation = (
         HandOrientation.MIRRORED if mirror_hand else HandOrientation.NOT_MIRRORED
     ) if mirror_hand is not None else get_hand_orientation()
+    resolved_movement_strategy = movement_strategy if movement_strategy is not None else get_movement_strategy()
     resolved_target_cycle_count = target_cycle_count if target_cycle_count is not None else get_target_cycle_count()
+    resolved_visual_cue_mode = visual_cue_mode if visual_cue_mode is not None else get_visual_cue_mode()
 
     if path is None:
         path = create_experiment_folder(config, resolved_run_mode, resolved_motor_set_id)
@@ -2012,10 +2177,29 @@ def main(
     if resume_pair_number is not None:
         _prepare_resume_outputs(path, resume_pair_number)
 
+    replay_command = _format_replay_command(
+        run_mode=resolved_run_mode,
+        motor_set_id=resolved_motor_set_id,
+        vision_type=resolved_vision_type,
+        protocol_path=protocol_path,
+        finger_colors=finger_colors,
+        side_camera_off=side_camera_off,
+        play_white_noise=resolved_play_white_noise,
+        hand_orientation=hand_orientation,
+        movement_strategy=resolved_movement_strategy,
+        target_cycle_count=resolved_target_cycle_count,
+        visual_cue_mode=resolved_visual_cue_mode,
+        is_debug=resolved_is_debug,
+        continue_last_experiment=resolved_continue_last_experiment,
+        resume_pair_number=resume_pair_number,
+    )
+    original_print("Replay this configuration without prompts:")
+    original_print(f"  {replay_command}")
+
     experiment = start_experiment(
         config, path, resolved_run_mode, resolved_motor_set_id, hand_orientation,
-        movement_strategy, resolved_target_cycle_count, resolved_vision_type, tapping_enabled, finger_colors,
-        side_camera_off, resolved_play_white_noise, is_debug,
+        resolved_movement_strategy, resolved_target_cycle_count, resolved_vision_type, tapping_enabled, finger_colors,
+        side_camera_off, resolved_play_white_noise, resolved_visual_cue_mode, resolved_is_debug,
         resume_pair_number=resume_pair_number,
     )
 

@@ -2,9 +2,10 @@ import pygame
 import random
 import socket
 import sys
+import math
 from array import array
-from consts import BACKEND_PORT, MOVEMENT_AREA_SCALE, TOP_HEIGHT, PYGAME_PORT, FRONTEND_FPS, TOP_WIDTH
-from structures import ExperimentControl, ExperimentPacket, ExperimentState, FingerPosition, QuestionInput, TrackingObject
+from consts import BACKEND_PORT, TOP_HEIGHT, PYGAME_PORT, FRONTEND_FPS, TOP_WIDTH
+from structures import ControlAction, ExperimentControl, ExperimentPacket, ExperimentState, FingerPosition, QuestionInput, TrackingObject, VisualCueMode
 
 FIRST_COLOR = (255, 165, 0)  # Orange
 SECOND_COLOR = (0, 0, 255)  # Blue
@@ -18,6 +19,21 @@ OUTBOUND_CUE_RADIUS = 215
 
 def _should_show_cycle_counter(target_cycle_count: int) -> bool:
     return target_cycle_count > 1
+
+
+def _visual_cue_mode_value(mode: VisualCueMode | str | None) -> str:
+    if isinstance(mode, VisualCueMode):
+        return mode.value
+    return mode or VisualCueMode.CIRCLE_BORDER.value
+
+
+def _tracking_object_pixel_center(tracking_obj: TrackingObject, width: int, height: int) -> tuple[int, int]:
+    return (int(tracking_obj.x * width), int(tracking_obj.z * height))
+
+
+def _fallback_visual_cue_radius_pixels(tracking_obj: TrackingObject, width: int, height: int) -> float:
+    object_x, object_y = _tracking_object_pixel_center(tracking_obj, width, height)
+    return math.hypot(object_x - width / 2, object_y - height / 2) + tracking_obj.size * 0.5
 
 
 def _recv_latest_datagram(data_socket: socket.socket, max_bytes: int) -> bytes:
@@ -65,6 +81,10 @@ def _make_white_noise_buffer(
     if sys.byteorder != "little":
         samples.byteswap()
     return samples.tobytes()
+
+
+def _control_payload(control: ExperimentControl) -> bytes:
+    return (control.model_dump_json(exclude_none=True) + "\n").encode()
 
 
 class _WhiteNoiseLoop:
@@ -180,12 +200,28 @@ class PygameFrontEnd:
             clock.tick(self._virtual_world_fps)
 
     def _draw_comparison(self, tracking_obj: TrackingObject) -> None:
-        # Draw virtual object
         color = (FIRST_COLOR if tracking_obj.pairIndex == 0 else SECOND_COLOR) if tracking_obj.isInteracting else (128, 128, 128)
         size = tracking_obj.size
+        center = (self._width // 2, self._height // 2)
+        object_center = _tracking_object_pixel_center(tracking_obj, self._width, self._height)
+        cue_mode = _visual_cue_mode_value(tracking_obj.visualCueMode)
+        visual_cue_radius = (
+            tracking_obj.visualCueRadiusPixels
+            if tracking_obj.visualCueRadiusPixels > 0
+            else _fallback_visual_cue_radius_pixels(tracking_obj, self._width, self._height)
+        )
+
+        # Draw filled/line cues behind the object so the object remains visible.
+        if tracking_obj.isInteracting:
+            if cue_mode == VisualCueMode.CIRCLE_FILLED.value:
+                pygame.draw.circle(self.screen, color, center, max(1, round(visual_cue_radius)))
+            elif cue_mode == VisualCueMode.RUBBER_BAND.value:
+                pygame.draw.line(self.screen, color, center, object_center, 4)
+
+        # Draw virtual object
         rect = pygame.Rect(
-            int(tracking_obj.x * self._width - size / 2),
-            int(tracking_obj.z * self._height - size / 2),
+            int(object_center[0] - size / 2),
+            int(object_center[1] - size / 2),
             int(size),
             int(size)
         )
@@ -211,23 +247,9 @@ class PygameFrontEnd:
         if second_fill_width > 0:
             pygame.draw.rect(self.screen, (0, 200, 0), (bar_x + half_width, bar_y, second_fill_width, bar_height))
 
-        # Draw the comparison cue:
-        # - outbound: a clean circle expands from center until it reaches the screen edge
-        # - returning: a clear center point marks the target to come back to
-        center = (self._width // 2, self._height // 2)
-        return_cue_active = return_progress > 0.001 or outbound_progress >= 0.995
-        if tracking_obj.isInteracting:
-            if return_cue_active:
-                pygame.draw.circle(self.screen, (0, 200, 0), center, 16, 3)
-                pygame.draw.circle(self.screen, (0, 200, 0), center, 7)
-            else:
-                movement_area_scale = (
-                    tracking_obj.movementAreaScale
-                    if tracking_obj.movementAreaScale > 0
-                    else MOVEMENT_AREA_SCALE
-                )
-                outbound_cue_radius = round(OUTBOUND_CUE_RADIUS * max(0.0, min(1.0, movement_area_scale)))
-                pygame.draw.circle(self.screen, (144, 238, 144), center, outbound_cue_radius, 4)
+        # Draw the border cue in front, matching the previous border-only look.
+        if tracking_obj.isInteracting and cue_mode == VisualCueMode.CIRCLE_BORDER.value:
+            pygame.draw.circle(self.screen, color, center, max(1, round(visual_cue_radius)), 4)
             
         # Draw movement counter only when multiple iterations are possible.
         if _should_show_cycle_counter(tracking_obj.targetCycleCount):
@@ -267,7 +289,7 @@ class PygameFrontEnd:
             if self._left_button_timer >= self._button_hold_time and not self._left_button_sent:
                 self._left_button_timer = self._button_hold_time  # limit the timer to the hold time
                 self._input_socket.sendall(
-                    ExperimentControl(questionInput=QuestionInput.LEFT.value).model_dump_json().encode()
+                    _control_payload(ExperimentControl(questionInput=QuestionInput.LEFT.value))
                 )
                 self._left_button_sent = True
         else:
@@ -279,7 +301,7 @@ class PygameFrontEnd:
             if self._right_button_timer >= self._button_hold_time and not self._right_button_sent:
                 self._right_button_timer = self._button_hold_time  # limit the timer to the hold time
                 self._input_socket.sendall(
-                    ExperimentControl(questionInput=QuestionInput.RIGHT.value).model_dump_json().encode()
+                    _control_payload(ExperimentControl(questionInput=QuestionInput.RIGHT.value))
                 )
                 self._right_button_sent = True
         else:
@@ -389,6 +411,13 @@ class PygameFrontEnd:
                 self._white_noise.stop()
                 pygame.quit()
                 return False
+            case pygame.KEYDOWN:
+                if event.key == pygame.K_SPACE:
+                    self._input_socket.sendall(
+                        _control_payload(
+                            ExperimentControl(moderatorAction=ControlAction.TOGGLE_INTERACTION)
+                        )
+                    )
         return True
 
 
