@@ -37,9 +37,21 @@ namespace ParallelHeptics.FrontendUnity
         private const int CueCircleSegments = 96;
         private const float AmbientNoiseLowPassAlpha = 0.075f;
         private const float AmbientNoiseRawMix = 0.16f;
+        private const float ControllerAnalogPressThreshold = 0.55f;
         private const string CueModeCircleBorder = "circle_border";
         private const string CueModeCircleFilled = "circle_filled";
         private const string CueModeRubberBand = "rubber_band";
+        private static readonly string[] InputSystemControllerControlNames =
+        {
+            "triggerPressed",
+            "gripPressed",
+            "trigger",
+            "grip",
+            "indexTrigger",
+            "handTrigger",
+            "primaryButton",
+            "secondaryButton"
+        };
         // Intentionally excludes CommonUsages.menuButton because Quest maps
         // menu/system-style buttons closest to the Meta/calibration role.
         private static readonly UnityEngine.XR.InputFeatureUsage<bool>[] ControllerInteractionButtons =
@@ -50,6 +62,11 @@ namespace ParallelHeptics.FrontendUnity
             UnityEngine.XR.CommonUsages.triggerButton,
             UnityEngine.XR.CommonUsages.primary2DAxisClick,
             UnityEngine.XR.CommonUsages.secondary2DAxisClick
+        };
+        private static readonly UnityEngine.XR.InputFeatureUsage<float>[] ControllerInteractionAxes =
+        {
+            UnityEngine.XR.CommonUsages.trigger,
+            UnityEngine.XR.CommonUsages.grip
         };
 
         [Header("Backend protocol")]
@@ -139,6 +156,10 @@ namespace ParallelHeptics.FrontendUnity
         private float _lastPacketTime = -1000f;
         private long _lastMalformedLogFrame = -9999;
         private bool _isDebug = true;
+        private float _lastBorderCueRadius = -1f;
+        private float _lastFilledCueRadius = -1f;
+        private Vector3 _lastRubberBandEnd = new Vector3(float.NaN, float.NaN, float.NaN);
+        private float _nextControllerDiagnosticTime;
 
         private enum CalibrationKey
         {
@@ -364,40 +385,221 @@ namespace ParallelHeptics.FrontendUnity
                 return;
             }
 
-            _controllerDevices.Clear();
-            UnityEngine.XR.InputDevices.GetDevicesWithCharacteristics(
-                UnityEngine.XR.InputDeviceCharacteristics.Controller,
-                _controllerDevices);
-
-            for (int deviceIndex = 0; deviceIndex < _controllerDevices.Count; deviceIndex++)
+#if ENABLE_INPUT_SYSTEM
+            if (HasKeyboardSpacePressedThisFrame())
             {
-                UnityEngine.XR.InputDevice device = _controllerDevices[deviceIndex];
-                if (!device.isValid)
+                SendInteractionToggle("keyboard Space");
+                return;
+            }
+
+            if (TrySendControllerToggleFromInputSystemDevices())
+            {
+                return;
+            }
+#endif
+
+            bool sentThisFrame = TrySendControllerToggleFromXrNode(UnityEngine.XR.XRNode.LeftHand)
+                || TrySendControllerToggleFromXrNode(UnityEngine.XR.XRNode.RightHand);
+            if (!sentThisFrame)
+            {
+                _controllerDevices.Clear();
+                UnityEngine.XR.InputDevices.GetDevicesWithCharacteristics(
+                    UnityEngine.XR.InputDeviceCharacteristics.Controller,
+                    _controllerDevices);
+
+                for (int deviceIndex = 0; deviceIndex < _controllerDevices.Count; deviceIndex++)
+                {
+                    if (TrySendControllerToggleFromXrDevice(
+                            _controllerDevices[deviceIndex],
+                            $"characteristics:{deviceIndex}",
+                            ref sentThisFrame))
+                    {
+                        sentThisFrame = true;
+                    }
+                }
+            }
+
+            LogControllerDiagnosticsIfNeeded();
+        }
+
+        private bool TrySendControllerToggleFromXrNode(UnityEngine.XR.XRNode node)
+        {
+            UnityEngine.XR.InputDevice device = UnityEngine.XR.InputDevices.GetDeviceAtXRNode(node);
+            bool sentThisFrame = false;
+            return TrySendControllerToggleFromXrDevice(device, $"node:{node}", ref sentThisFrame);
+        }
+
+        private bool TrySendControllerToggleFromXrDevice(UnityEngine.XR.InputDevice device, string deviceKeyPrefix, ref bool sentThisFrame)
+        {
+            if (!device.isValid)
+            {
+                return false;
+            }
+
+            bool sawInput = false;
+            for (int usageIndex = 0; usageIndex < ControllerInteractionButtons.Length; usageIndex++)
+            {
+                UnityEngine.XR.InputFeatureUsage<bool> usage = ControllerInteractionButtons[usageIndex];
+                bool isPressed = false;
+                if (!device.TryGetFeatureValue(usage, out isPressed))
                 {
                     continue;
                 }
 
-                for (int usageIndex = 0; usageIndex < ControllerInteractionButtons.Length; usageIndex++)
+                sawInput = true;
+                string key = $"xr:{deviceKeyPrefix}:{device.name}:{device.characteristics}:{usage.name}";
+                _controllerButtonPressed.TryGetValue(key, out bool wasPressed);
+                if (isPressed && !wasPressed && !sentThisFrame)
                 {
-                    UnityEngine.XR.InputFeatureUsage<bool> usage = ControllerInteractionButtons[usageIndex];
-                    bool isPressed = false;
-                    if (!device.TryGetFeatureValue(usage, out isPressed))
-                    {
-                        continue;
-                    }
-
-                    string key = $"{device.deviceId}:{usage.name}";
-                    _controllerButtonPressed.TryGetValue(key, out bool wasPressed);
-                    if (isPressed && !wasPressed)
-                    {
-                        _controlClient.SendInteractionToggle();
-                        LogIfDebug($"Controller interaction toggle from {device.name} {usage.name}");
-                    }
-
-                    _controllerButtonPressed[key] = isPressed;
+                    SendInteractionToggle($"{device.name} {usage.name}");
+                    sentThisFrame = true;
                 }
+
+                _controllerButtonPressed[key] = isPressed;
+            }
+
+            for (int usageIndex = 0; usageIndex < ControllerInteractionAxes.Length; usageIndex++)
+            {
+                UnityEngine.XR.InputFeatureUsage<float> usage = ControllerInteractionAxes[usageIndex];
+                float value = 0f;
+                if (!device.TryGetFeatureValue(usage, out value))
+                {
+                    continue;
+                }
+
+                sawInput = true;
+                bool isPressed = value >= ControllerAnalogPressThreshold;
+                string key = $"xr:{deviceKeyPrefix}:{device.name}:{device.characteristics}:axis:{usage.name}";
+                _controllerButtonPressed.TryGetValue(key, out bool wasPressed);
+                if (isPressed && !wasPressed && !sentThisFrame)
+                {
+                    SendInteractionToggle($"{device.name} {usage.name} axis ({value:0.00})");
+                    sentThisFrame = true;
+                }
+
+                _controllerButtonPressed[key] = isPressed;
+            }
+
+            return sawInput;
+        }
+
+        private void SendInteractionToggle(string source)
+        {
+            _controlClient.SendInteractionToggle();
+            LogIfDebug($"Interaction toggle from {source}");
+        }
+
+        private void LogControllerDiagnosticsIfNeeded()
+        {
+            if (!_isDebug || Time.unscaledTime < _nextControllerDiagnosticTime)
+            {
+                return;
+            }
+
+            _nextControllerDiagnosticTime = Time.unscaledTime + 5f;
+            var left = UnityEngine.XR.InputDevices.GetDeviceAtXRNode(UnityEngine.XR.XRNode.LeftHand);
+            var right = UnityEngine.XR.InputDevices.GetDeviceAtXRNode(UnityEngine.XR.XRNode.RightHand);
+            if (!left.isValid && !right.isValid)
+            {
+                LogIfDebug("No valid XR left/right controller devices detected yet.");
             }
         }
+
+#if ENABLE_INPUT_SYSTEM
+        private static bool HasKeyboardSpacePressedThisFrame()
+        {
+            Keyboard keyboard = Keyboard.current;
+            return keyboard != null && keyboard.spaceKey.wasPressedThisFrame;
+        }
+
+        private bool TrySendControllerToggleFromInputSystemDevices()
+        {
+            bool sentThisFrame = false;
+            foreach (UnityEngine.InputSystem.InputDevice device in UnityEngine.InputSystem.InputSystem.devices)
+            {
+                if (!IsControllerOrHandInputSystemDevice(device))
+                {
+                    continue;
+                }
+
+                for (int i = 0; i < InputSystemControllerControlNames.Length; i++)
+                {
+                    string controlName = InputSystemControllerControlNames[i];
+                    if (TryReadInputSystemControlPressed(device, controlName, out bool isPressed, out float value))
+                    {
+                        string key = $"inputsystem:{device.deviceId}:{controlName}";
+                        _controllerButtonPressed.TryGetValue(key, out bool wasPressed);
+                        if (isPressed && !wasPressed && !sentThisFrame)
+                        {
+                            SendInteractionToggle($"{device.displayName}/{controlName} ({value:0.00})");
+                            sentThisFrame = true;
+                        }
+
+                        _controllerButtonPressed[key] = isPressed;
+                    }
+                }
+            }
+
+            return sentThisFrame;
+        }
+
+        private static bool TryReadInputSystemControlPressed(
+            UnityEngine.InputSystem.InputDevice device,
+            string controlName,
+            out bool isPressed,
+            out float value)
+        {
+            isPressed = false;
+            value = 0f;
+
+            UnityEngine.InputSystem.InputControl control = device.TryGetChildControl<UnityEngine.InputSystem.InputControl>(controlName);
+            if (control == null)
+            {
+                return false;
+            }
+
+            if (control is UnityEngine.InputSystem.Controls.ButtonControl button)
+            {
+                value = button.ReadValue();
+                isPressed = button.isPressed || value >= ControllerAnalogPressThreshold;
+                return true;
+            }
+
+            if (control is UnityEngine.InputSystem.Controls.AxisControl axis)
+            {
+                value = axis.ReadValue();
+                isPressed = value >= ControllerAnalogPressThreshold;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsControllerOrHandInputSystemDevice(UnityEngine.InputSystem.InputDevice device)
+        {
+            string layout = (device.layout ?? string.Empty).ToLowerInvariant();
+            string name = (device.name ?? string.Empty).ToLowerInvariant();
+            string displayName = (device.displayName ?? string.Empty).ToLowerInvariant();
+            if (layout.Contains("controller") || layout.Contains("touch") ||
+                name.Contains("controller") || name.Contains("touch") ||
+                displayName.Contains("controller") || displayName.Contains("touch"))
+            {
+                return true;
+            }
+
+            foreach (UnityEngine.InputSystem.Utilities.InternedString usage in device.usages)
+            {
+                string usageName = usage.ToString();
+                if (usageName == "LeftHand" || usageName == "RightHand")
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+#endif
 
         private void RenderPacket(ExperimentPacket packet)
         {
@@ -1026,6 +1228,7 @@ namespace ParallelHeptics.FrontendUnity
             if (_xrOrigin == null)
             {
                 _xrOriginObject = new GameObject("XR Origin (Bootstrap)");
+                _xrOriginObject.SetActive(false);
                 _xrOriginObject.transform.SetParent(null, false);
                 _xrOriginObject.transform.position = Vector3.zero;
                 _xrOriginObject.transform.rotation = Quaternion.identity;
@@ -1037,10 +1240,12 @@ namespace ParallelHeptics.FrontendUnity
                 // still readable even when no headset pose is overriding the transform.
                 mainCamera.transform.SetParent(_cameraOffsetObject.transform, true);
 
+                EnsureTrackedPoseDriver(mainCamera);
                 _xrOrigin = _xrOriginObject.AddComponent<XROrigin>();
                 _xrOrigin.Camera = mainCamera;
                 _xrOrigin.CameraFloorOffsetObject = _cameraOffsetObject;
                 _xrOrigin.RequestedTrackingOriginMode = XROrigin.TrackingOriginMode.Floor;
+                _xrOriginObject.SetActive(true);
                 _ownsXrOrigin = true;
             }
             else
@@ -1061,7 +1266,12 @@ namespace ParallelHeptics.FrontendUnity
                 }
             }
 
-            EnsureTrackedPoseDriver(mainCamera);
+#if ENABLE_INPUT_SYSTEM
+            if (_trackedPoseDriver == null)
+#endif
+            {
+                EnsureTrackedPoseDriver(mainCamera);
+            }
         }
 
         private void EnsureTrackedPoseDriver(Camera mainCamera)
@@ -1133,22 +1343,19 @@ namespace ParallelHeptics.FrontendUnity
             _cameraBackgroundColor = _mainCamera.backgroundColor;
 
             _arSession = FindFirstObjectInSceneOfType<ARSession>();
-            if (_arSession == null)
-            {
-                _arSessionObject = new GameObject("AR Session (Passthrough Calibration)");
-                _arSession = _arSessionObject.AddComponent<ARSession>();
-                _ownsArSession = true;
-            }
-            else
+            if (_arSession != null)
             {
                 _arSessionObject = _arSession.gameObject;
                 _ownsArSession = false;
+                _arSession.enabled = false;
+                _arSession.attemptUpdate = true;
             }
-            _arSession.enabled = false;
-            _arSession.attemptUpdate = true;
 
-            _arCameraManager = _mainCamera.GetComponent<ARCameraManager>() ?? _mainCamera.gameObject.AddComponent<ARCameraManager>();
-            _arCameraManager.enabled = false;
+            _arCameraManager = _mainCamera.GetComponent<ARCameraManager>();
+            if (_arCameraManager != null)
+            {
+                _arCameraManager.enabled = false;
+            }
         }
 
         private void ApplyCalibrationVisibility()
@@ -1202,28 +1409,30 @@ namespace ParallelHeptics.FrontendUnity
 
         private void SetVisualCue(bool visible, TrackingObject trackingObject, Color color)
         {
-            SetAllVisualCuesActive(false);
             if (!visible || trackingObject == null)
             {
+                SetAllVisualCuesActive(false);
                 return;
             }
 
             string mode = NormalizeVisualCueMode(trackingObject.visualCueMode);
             float radius = mapper.PixelsToPanelSize(0f, GetVisualCueRadiusPixels(trackingObject)).y;
+            bool filledMode = mode == CueModeCircleFilled;
+            bool rubberBandMode = mode == CueModeRubberBand;
+            SetActiveIfNeeded(_outboundCueCircle, !filledMode && !rubberBandMode);
+            SetActiveIfNeeded(_filledCueCircle, filledMode);
+            SetActiveIfNeeded(_rubberBandCue, rubberBandMode);
             switch (mode)
             {
                 case CueModeCircleFilled:
-                    _filledCueCircle.SetActive(true);
                     SetMaterial(_filledCueCircle, color);
                     SetFilledCircleRadius(radius);
                     break;
                 case CueModeRubberBand:
-                    _rubberBandCue.SetActive(true);
                     SetRubberBandCue(trackingObject, color);
                     break;
                 case CueModeCircleBorder:
                 default:
-                    _outboundCueCircle.SetActive(true);
                     _outboundCueRenderer.material = GetMaterial(color);
                     _outboundCueRenderer.startColor = color;
                     _outboundCueRenderer.endColor = color;
@@ -1234,17 +1443,16 @@ namespace ParallelHeptics.FrontendUnity
 
         private void SetAllVisualCuesActive(bool active)
         {
-            if (_outboundCueCircle != null)
+            SetActiveIfNeeded(_outboundCueCircle, active);
+            SetActiveIfNeeded(_filledCueCircle, active);
+            SetActiveIfNeeded(_rubberBandCue, active);
+        }
+
+        private static void SetActiveIfNeeded(GameObject go, bool active)
+        {
+            if (go != null && go.activeSelf != active)
             {
-                _outboundCueCircle.SetActive(active);
-            }
-            if (_filledCueCircle != null)
-            {
-                _filledCueCircle.SetActive(active);
-            }
-            if (_rubberBandCue != null)
-            {
-                _rubberBandCue.SetActive(active);
+                go.SetActive(active);
             }
         }
 
@@ -1293,6 +1501,12 @@ namespace ParallelHeptics.FrontendUnity
             }
 
             radius = Mathf.Max(0f, radius);
+            if (Mathf.Abs(radius - _lastBorderCueRadius) < 0.0001f)
+            {
+                return;
+            }
+
+            _lastBorderCueRadius = radius;
             for (int i = 0; i < CueCircleSegments; i++)
             {
                 float angle = i * Mathf.PI * 2f / CueCircleSegments;
@@ -1308,6 +1522,12 @@ namespace ParallelHeptics.FrontendUnity
             }
 
             radius = Mathf.Max(0f, radius);
+            if (Mathf.Abs(radius - _lastFilledCueRadius) < 0.0001f)
+            {
+                return;
+            }
+
+            _lastFilledCueRadius = radius;
             var vertices = new Vector3[CueCircleSegments + 1];
             var triangles = new int[CueCircleSegments * 3];
             vertices[0] = Vector3.zero;
@@ -1348,8 +1568,15 @@ namespace ParallelHeptics.FrontendUnity
             _rubberBandRenderer.startColor = color;
             _rubberBandRenderer.endColor = color;
             Vector3 objectPosition = mapper.NormalizedToLocalUnclamped(trackingObject.x, trackingObject.z, 0f);
+            Vector3 rubberBandEnd = new Vector3(objectPosition.x, objectPosition.y, 0f);
+            if ((_lastRubberBandEnd - rubberBandEnd).sqrMagnitude < 0.00000001f)
+            {
+                return;
+            }
+
+            _lastRubberBandEnd = rubberBandEnd;
             _rubberBandRenderer.SetPosition(0, Vector3.zero);
-            _rubberBandRenderer.SetPosition(1, new Vector3(objectPosition.x, objectPosition.y, 0f));
+            _rubberBandRenderer.SetPosition(1, rubberBandEnd);
         }
 
         private void SetChildFillBar(GameObject bar, float progress)
