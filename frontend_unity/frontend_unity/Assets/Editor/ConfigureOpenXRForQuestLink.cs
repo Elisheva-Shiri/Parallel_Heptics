@@ -22,6 +22,13 @@ namespace ParallelHeptics.FrontendUnity.Editor
             "com.unity.openxr.feature.arfoundation-meta-camera",
             "com.unity.openxr.feature.meta-display-utilities"
         };
+        private static readonly string[] QuestLinkControllerFeatureIds =
+        {
+            "com.unity.openxr.feature.input.oculustouch",
+            "com.unity.openxr.feature.input.metaquestplus",
+            "com.unity.openxr.feature.input.metaquestpro",
+            "com.unity.openxr.feature.input.khrsimpleprofile"
+        };
 
         [MenuItem("Parallel Heptics/Configure OpenXR for Quest Link")]
         public static void Configure()
@@ -57,43 +64,54 @@ namespace ParallelHeptics.FrontendUnity.Editor
             generalSettings.AssignedSettings.automaticRunning = true;
 
             bool assigned = XRPackageMetadataStore.AssignLoader(generalSettings.AssignedSettings, OpenXrLoaderTypeName, buildTargetGroup);
-            int enabledFeatureCount = EnableQuestLinkPassthroughFeatures(buildTargetGroup);
+            int enabledFeatureCount = EnableQuestLinkFeatures(buildTargetGroup);
             EditorUtility.SetDirty(perBuildTargetSettings);
             EditorUtility.SetDirty(generalSettings);
             EditorUtility.SetDirty(generalSettings.AssignedSettings);
             AssetDatabase.SaveAssets();
 
             Debug.Log(assigned
-                ? $"Configured OpenXR for PC/Standalone Quest Link and enabled {enabledFeatureCount} Meta passthrough feature(s). Restart Play Mode if it was already running."
-                : $"OpenXR loader was already configured or could not be reassigned; enabled {enabledFeatureCount} Meta passthrough feature(s). Check Project Settings > XR Plug-in Management > PC, Mac & Linux Standalone.");
+                ? $"Configured OpenXR for PC/Standalone Quest Link and enabled {enabledFeatureCount} Quest Link feature(s), including controller input profiles. Restart Play Mode if it was already running."
+                : $"OpenXR loader was already configured or could not be reassigned; enabled {enabledFeatureCount} Quest Link feature(s), including controller input profiles. Check Project Settings > XR Plug-in Management > PC, Mac & Linux Standalone.");
         }
 
-        private static int EnableQuestLinkPassthroughFeatures(BuildTargetGroup buildTargetGroup)
+        private static int EnableQuestLinkFeatures(BuildTargetGroup buildTargetGroup)
         {
             OpenXRSettings settings = OpenXRSettings.GetSettingsForBuildTargetGroup(buildTargetGroup);
             if (settings == null)
             {
-                Debug.LogWarning("OpenXR settings were not available; Meta Quest Link passthrough features could not be enabled.");
+                Debug.LogWarning("OpenXR settings were not available; Quest Link passthrough/controller features could not be enabled.");
                 return 0;
             }
 
             FeatureHelpers.RefreshFeatures(buildTargetGroup);
-            int enabledCount = 0;
+            int enabledPassthroughCount = 0;
+            int enabledControllerCount = 0;
             OpenXRFeature[] features = FeatureHelpers.GetFeaturesWithIdsForBuildTarget(buildTargetGroup, QuestLinkPassthroughFeatureIds);
             foreach (OpenXRFeature feature in features)
             {
-                enabledCount += SetFeatureEnabledForStandalone(feature) ? 1 : 0;
+                enabledPassthroughCount += SetFeatureEnabledForStandalone(feature) ? 1 : 0;
+            }
+
+            OpenXRFeature[] controllerFeatures = FeatureHelpers.GetFeaturesWithIdsForBuildTarget(buildTargetGroup, QuestLinkControllerFeatureIds);
+            foreach (OpenXRFeature feature in controllerFeatures)
+            {
+                enabledControllerCount += SetFeatureEnabledForStandalone(feature) ? 1 : 0;
             }
 
             SetFeatureEnabledForStandalone(FeatureHelpers.GetFeatureWithIdForBuildTarget(buildTargetGroup, MetaOpenXrLifeCycleFeatureId));
 
-            if (enabledCount < QuestLinkPassthroughFeatureIds.Length)
+            if (enabledPassthroughCount < QuestLinkPassthroughFeatureIds.Length)
             {
-                Debug.LogWarning($"Enabled {enabledCount}/{QuestLinkPassthroughFeatureIds.Length} Meta Quest Link passthrough features. If passthrough is unavailable, confirm com.unity.xr.meta-openxr is installed and Meta Quest Link developer passthrough is enabled.");
+                Debug.LogWarning($"Enabled {enabledPassthroughCount}/{QuestLinkPassthroughFeatureIds.Length} Meta Quest Link passthrough features. If passthrough is unavailable, confirm com.unity.xr.meta-openxr is installed and Meta Quest Link developer passthrough is enabled.");
+            }
+            if (enabledControllerCount < QuestLinkControllerFeatureIds.Length)
+            {
+                Debug.LogWarning($"Enabled {enabledControllerCount}/{QuestLinkControllerFeatureIds.Length} Quest Link controller input profiles. Controller triggers require the Oculus/Meta Quest controller profile for the active headset.");
             }
 
             EditorUtility.SetDirty(settings);
-            return enabledCount;
+            return enabledPassthroughCount + enabledControllerCount;
         }
 
         private static bool SetFeatureEnabledForStandalone(OpenXRFeature feature)
