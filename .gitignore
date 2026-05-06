@@ -220,6 +220,8 @@ todo.md
 **/[Bb]uilds/
 **/[Ll]ogs/
 **/[Uu]ser[Ss]ettings/
+**/.vs/
+**/UpgradeLog*.htm
 *.csproj
 *.sln
 
