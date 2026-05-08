@@ -230,3 +230,9 @@ todo.md
 
 # Motor response experiment: video + frames (default output next to package code)
 analysis/motor_response_experiment/responses/
+
+# Motor response analyzer servo generated responses
+analysis/motor_response_analizer_servo/responses/
+
+# Psychophysics analysis generated outputs
+analysis/psychophysics_analysis/results/

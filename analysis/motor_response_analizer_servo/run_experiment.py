@@ -71,9 +71,9 @@ import pandas as pd
 if __package__ in (None, ""):
     THIS_DIR = Path(__file__).resolve().parent
     sys.path.insert(0, str(THIS_DIR.parent))
-    from motor_response_experiment.protocol import build_protocol, ProtocolStep, DEFAULT_DELTAS
-    from motor_response_experiment.motor_io import MotorSerial, DryRunMotor
-    from motor_response_experiment.vision_angle import (
+    from motor_response_analizer_servo.protocol import build_protocol, ProtocolStep, DEFAULT_DELTAS
+    from motor_response_analizer_servo.motor_io import MotorSerial, DryRunMotor
+    from motor_response_analizer_servo.vision_angle import (
         SpoolAngleDetector,
         SpoolROI,
         detect_dark_spot,
@@ -81,7 +81,7 @@ if __package__ in (None, ""):
         find_spool_roi,
         manual_pick_spool,
     )
-    from motor_response_experiment.camera_recorder import CameraConfig, CameraRecorder
+    from motor_response_analizer_servo.camera_recorder import CameraConfig, CameraRecorder
 else:
     from .protocol import build_protocol, ProtocolStep, DEFAULT_DELTAS
     from .motor_io import MotorSerial, DryRunMotor
@@ -311,7 +311,7 @@ def _run_analysis_plots(out_dir: Path) -> None:
     """Generate ``plots/*.png`` and ``per_delta_summary.csv`` (see ``analyze.py``)."""
     try:
         if __package__ in (None, ""):
-            from motor_response_experiment.analyze import analyze
+            from motor_response_analizer_servo.analyze import analyze
         else:
             from .analyze import analyze
     except ImportError as e:
