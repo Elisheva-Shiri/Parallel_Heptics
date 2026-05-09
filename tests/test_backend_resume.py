@@ -11,6 +11,7 @@ import backend
 
 PAUSE_ROW = (0, 0, 0, 0)
 BREAK_ROW = (-2, -2, -2, -2)
+START_ROW = (-3, -3, -3, -3)
 END_ROW = (-1, -1, -1, -1)
 COMPARISON_ROW = (85, 0, 85, 2)
 
@@ -70,10 +71,12 @@ def _read_answer_pair_numbers(path: Path) -> list[int]:
     [
         (END_ROW, backend.Experiment._is_end_marker, True),
         (BREAK_ROW, backend.Experiment._is_break_marker, True),
+        (START_ROW, backend.Experiment._is_start_marker, True),
         (PAUSE_ROW, backend.Experiment._is_pause_marker, True),
         (COMPARISON_ROW, backend.Experiment._is_comparison_pair, True),
         (PAUSE_ROW, backend.Experiment._is_comparison_pair, False),
         (BREAK_ROW, backend.Experiment._is_comparison_pair, False),
+        (START_ROW, backend.Experiment._is_comparison_pair, False),
         (END_ROW, backend.Experiment._is_comparison_pair, False),
     ],
 )

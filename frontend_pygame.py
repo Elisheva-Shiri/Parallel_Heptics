@@ -352,6 +352,20 @@ class PygameFrontEnd:
         subtitle_rect = subtitle.get_rect(center=(self._width/2, self._height/2 + 10))
         self.screen.blit(subtitle, subtitle_rect)
 
+    def _draw_start(self):
+        box_size = 40
+        box_rect = pygame.Rect(
+            self._width // 2 - box_size // 2,
+            self._height // 2 - box_size // 2,
+            box_size,
+            box_size,
+        )
+        pygame.draw.rect(self.screen, (128, 128, 128), box_rect)
+
+        title = self._title_font.render("Let's start", True, (255, 255, 255))
+        title_rect = title.get_rect(center=(self._width/2, self._height/2 - 100))
+        self.screen.blit(title, title_rect)
+
     def _draw_end(self):
         # Draw end screen title
         title = self._title_font.render("Thank you for participating!", True, (255, 255, 255))
@@ -374,6 +388,9 @@ class PygameFrontEnd:
         self._white_noise.set_enabled(packet.playWhiteNoise)
 
         match packet.stateData.state:
+            case ExperimentState.START.value:
+                self._draw_start()
+
             case ExperimentState.COMPARISON.value:
                 self._draw_comparison(packet.trackingObject)
 
@@ -395,11 +412,12 @@ class PygameFrontEnd:
             case _:
                 pass
 
-        # Draw fingers last so the cursor stays visible above target objects
-        # (comparison cube, question buttons) instead of being painted under them.
-        for finger_position in packet.landmarks:
-            pygame.draw.circle(self.screen, (211, 211, 211),
-                            (int(finger_position.x * self._width), int(finger_position.z * self._height)), 5)
+        if packet.stateData.state != ExperimentState.START.value:
+            # Draw fingers last so the cursor stays visible above target objects
+            # (comparison cube, question buttons) instead of being painted under them.
+            for finger_position in packet.landmarks:
+                pygame.draw.circle(self.screen, (211, 211, 211),
+                                (int(finger_position.x * self._width), int(finger_position.z * self._height)), 5)
 
         pygame.display.flip()
 

@@ -449,12 +449,21 @@ class Experiment:
         return pair.first.value == -2
 
     @staticmethod
+    def _is_start_marker(pair: StiffnessPair) -> bool:
+        return pair.first.value == -3
+
+    @staticmethod
     def _is_pause_marker(pair: StiffnessPair) -> bool:
         return pair.first.value == 0
 
     @classmethod
     def _is_comparison_pair(cls, pair: StiffnessPair) -> bool:
-        return not (cls._is_end_marker(pair) or cls._is_break_marker(pair) or cls._is_pause_marker(pair))
+        return not (
+            cls._is_end_marker(pair)
+            or cls._is_break_marker(pair)
+            or cls._is_start_marker(pair)
+            or cls._is_pause_marker(pair)
+        )
 
     def _config_index_for_pair_number(self, pair_number: int) -> int:
         """Return the config row index of the Nth comparison pair (1-based)."""
@@ -771,11 +780,11 @@ class Experiment:
         if action == ControlAction.FINISH_BREAK:
             if self._is_moderator_paused():
                 return {"ok": False, "message": "Ignored finish_break while moderator pause is active; resume pause first"}
-            if self._get_state() != ExperimentState.BREAK:
+            if self._get_state() not in {ExperimentState.BREAK, ExperimentState.START}:
                 return {"ok": False, "message": f"Ignored finish_break while state is {self._get_state().name}"}
 
             self._control_queue.put(ExperimentControl(moderatorAction=action))
-            return {"ok": True, "message": "Queued break finish"}
+            return {"ok": True, "message": "Queued continue"}
 
         if action == ControlAction.TOGGLE_PAUSE:
             return self._toggle_moderator_pause()
@@ -939,6 +948,20 @@ class Experiment:
                     writer = csv.writer(f)
                     writer.writerow([break_started_at.isoformat(), f"{break_duration:.3f}"])
 
+            elif self._is_start_marker(pair):
+                if (
+                    pair.second.value != -3
+                    or pair.first.finger_id != -3
+                    or pair.second.finger_id != -3
+                ):
+                    raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
+
+                print("Let's start — run moderator_control.py --toggle-break to continue")
+                self._set_state(ExperimentState.START)
+                self._pause_time = 0
+                self._wait_for_break_continue()
+                self._set_state(ExperimentState.COMPARISON)
+
             elif self._is_pause_marker(pair):
                 if pair.second.value != 0:
                     raise Exception("Misaligned numbers, invalidated configuration/experiment - please contact the staff")
@@ -1098,31 +1121,33 @@ class Experiment:
     def _frontend_network_loop(self):
         """Thread that sends hand position data over UDP"""
         while self._running:
-            current_pos = self.get_hand_position()
-            if current_pos:
+            state_for_packet = self._get_state()
+            pause_for_packet = self._pause_time
+            with self._state_lock:
+                moderator_pause_started_at = self._moderator_pause_started_at
+            if moderator_pause_started_at is not None:
+                state_for_packet = ExperimentState.MODERATOR_PAUSE
+                pause_for_packet = int(
+                    (datetime.now() - moderator_pause_started_at).total_seconds()
+                )
+            elif state_for_packet == ExperimentState.BREAK and self._break_started_at is not None:
+                pause_for_packet = int(
+                    (datetime.now() - self._break_started_at).total_seconds()
+                )
+
+            hide_finger_detection = state_for_packet == ExperimentState.START
+            current_pos = None if hide_finger_detection else self.get_hand_position()
+            if hide_finger_detection or current_pos:
+                finger_positions: list[FingerPosition] = []
                 if self._tapping_enabled:
-                    finger_positions = [
+                    finger_positions = [] if current_pos is None else [
                         FingerPosition(x=current_pos.active_finger_x / self._top_width, z=current_pos.active_finger_y / self._top_height)
                     ]
-                else:
+                elif current_pos is not None:
                     finger_positions = [
                         FingerPosition(x=current_pos.thumb_x / self._top_width, z=current_pos.thumb_y / self._top_height),
                         FingerPosition(x=current_pos.active_finger_x / self._top_width, z=current_pos.active_finger_y / self._top_height)
                     ]
-
-                state_for_packet = self._get_state()
-                pause_for_packet = self._pause_time
-                with self._state_lock:
-                    moderator_pause_started_at = self._moderator_pause_started_at
-                if moderator_pause_started_at is not None:
-                    state_for_packet = ExperimentState.MODERATOR_PAUSE
-                    pause_for_packet = int(
-                        (datetime.now() - moderator_pause_started_at).total_seconds()
-                    )
-                elif state_for_packet == ExperimentState.BREAK and self._break_started_at is not None:
-                    pause_for_packet = int(
-                        (datetime.now() - self._break_started_at).total_seconds()
-                    )
 
                 packet = ExperimentPacket(
                     stateData=StateData(state=state_for_packet.value, pauseTime=pause_for_packet),

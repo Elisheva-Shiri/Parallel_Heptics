@@ -619,10 +619,13 @@ namespace ParallelHeptics.FrontendUnity
             }
             ExperimentState state = (ExperimentState)packet.stateData.state;
             SetStateVisibility(state);
-            RenderFingers(packet.landmarks);
+            RenderFingers(state == ExperimentState.Start ? null : packet.landmarks);
 
             switch (state)
             {
+                case ExperimentState.Start:
+                    RenderStart(packet.trackingObject);
+                    break;
                 case ExperimentState.Comparison:
                     RenderComparison(packet.trackingObject);
                     _holdSelector.Reset();
@@ -720,6 +723,20 @@ namespace ParallelHeptics.FrontendUnity
             return targetCycleCount > 1;
         }
 
+        private void RenderStart(TrackingObject trackingObject)
+        {
+            _holdSelector.Reset();
+            _titleText.transform.localPosition = new Vector3(0f, -mapper.PanelHeight * 0.34f, TextOffset);
+            _titleText.text = "Let's start";
+            _subtitleText.text = string.Empty;
+
+            float objectSizePixels = trackingObject == null || trackingObject.size <= 0f ? 40f : trackingObject.size;
+            Vector2 objectSize = mapper.PixelsToPanelSize(objectSizePixels, objectSizePixels);
+            _trackingObject.transform.localPosition = new Vector3(0f, 0f, ForegroundOffset);
+            _trackingObject.transform.localScale = new Vector3(objectSize.x, objectSize.y, 0.006f);
+            SetMaterial(_trackingObject, GrayColor);
+        }
+
         private void RenderQuestion(List<FingerPosition> landmarks)
         {
             _titleText.text = "Which object is stiffer?";
@@ -774,10 +791,11 @@ namespace ParallelHeptics.FrontendUnity
 
             _lastState = state;
             bool comparison = state == ExperimentState.Comparison;
+            bool start = state == ExperimentState.Start;
             bool question = state == ExperimentState.Question;
-            bool message = state == ExperimentState.Pause || state == ExperimentState.Break || state == ExperimentState.ModeratorPause || state == ExperimentState.End || question;
+            bool message = state == ExperimentState.Start || state == ExperimentState.Pause || state == ExperimentState.Break || state == ExperimentState.ModeratorPause || state == ExperimentState.End || question;
 
-            _trackingObject.SetActive(comparison);
+            _trackingObject.SetActive(comparison || start);
             SetAllVisualCuesActive(false);
             _returnCuePoint.SetActive(false);
             _progressBackground.SetActive(comparison);

@@ -73,6 +73,17 @@ def test_finish_break_is_ignored_outside_break_state(experiment):
     assert experiment._control_queue.empty()
 
 
+def test_finish_break_continues_start_marker_state(experiment):
+    experiment._state = ExperimentState.START
+
+    response = experiment._handle_control_message(
+        ExperimentControl(moderatorAction=ControlAction.FINISH_BREAK)
+    )
+
+    assert response["ok"] is True
+    assert not experiment._control_queue.empty()
+
+
 def test_toggle_interaction_is_available_with_side_camera_enabled(experiment):
     experiment._manual_interaction_enabled = False
 
