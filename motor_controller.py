@@ -140,6 +140,7 @@ class MotorController:
 
         obj_x, obj_y = self._apply_hand_orientation(obj_x, obj_y)
         obj_x, obj_y = self._apply_stiffness_value(obj_x, obj_y, stiffness_value)
+        obj_x, obj_y = self._apply_actuator_destination_polarity(obj_x, obj_y)
 
         match self._movement_strategy:
             case MovementStrategy.FREE_FORM:
@@ -177,6 +178,10 @@ class MotorController:
     def _apply_stiffness_value(self, obj_x: float, obj_y: float, stiffness_value: float) -> tuple[float, float]:
         """Apply stiffness value to object displacement."""
         return (obj_x * stiffness_value, obj_y * stiffness_value)
+
+    def _apply_actuator_destination_polarity(self, obj_x: float, obj_y: float) -> tuple[float, float]:
+        """Use the opposite target position because actuator motion is reversed."""
+        return (-obj_x, -obj_y)
 
     def _determine_movement_direction(self, obj_x: float, obj_y: float) -> tuple[str, float]:
         """Determine movement direction and distance from displacement.

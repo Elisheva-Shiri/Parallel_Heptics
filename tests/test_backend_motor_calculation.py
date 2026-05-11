@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from motor_controller import HandOrientation, MotorController, MotorSetId, MovementStrategy
+from motor_controller import HandOrientation, MotorController, MotorMovement, MotorSetId, MovementStrategy
 
 
 def _to_tuples(movements):
@@ -21,7 +21,7 @@ def _make_controller(strategy: MovementStrategy, **overrides) -> MotorController
     return MotorController(**kwargs)
 
 
-def test_cardinal_strategy_uses_major_axis():
+def test_cardinal_strategy_uses_opposite_major_axis_destination():
     controller = _make_controller(MovementStrategy.CARDINAL)
 
     actual = controller.calculate_motor_movements(
@@ -32,7 +32,7 @@ def test_cardinal_strategy_uses_major_axis():
     )
     expected = controller._calculate_cardinal_motor_movements(
         motor_set_id=MotorSetId.MOTORS_3_5,
-        direction="left",
+        direction="right",
         distance=40.0,
     )
 
@@ -51,7 +51,7 @@ def test_cardinal_diagonal_strategy_uses_diagonal_when_threshold_met():
     )
     expected = controller._calculate_diagonal_motor_movements(
         motor_set_id=MotorSetId.MOTORS_3_5,
-        direction="down-right",
+        direction="up-left",
         distance=math.hypot(obj_x, obj_y),
     )
 
@@ -85,7 +85,7 @@ def test_free_form_clamps_using_screen_radius():
     )
     expected = controller._calculate_freeform_motor_movements(
         motor_set_id=MotorSetId.MOTORS_3_5,
-        obj_x=40.0,
+        obj_x=-40.0,
         obj_y=0.0,
     )
 
@@ -141,6 +141,36 @@ def test_move_factor_scales_motor_positions():
 
     expected = [(m.index, m.pos * move_factor) for m in baseline]
     assert _to_tuples(actual) == expected
+
+
+def test_build_message_preserves_motor_position_order():
+    controller = _make_controller(MovementStrategy.FREE_FORM)
+    motors = [
+        MotorMovement(index=3, pos=120),
+        MotorMovement(index=4, pos=-45),
+        MotorMovement(index=5, pos=0),
+    ]
+
+    assert controller.build_message(motors) == "ZM3P120M4P-45M5P0F"
+
+
+def test_ik_strategy_uses_opposite_destination_position():
+    actual_controller = _make_controller(MovementStrategy.IK)
+    expected_controller = _make_controller(MovementStrategy.IK)
+
+    actual = actual_controller.calculate_motor_movements(
+        motor_set_id=MotorSetId.MOTORS_3_5,
+        obj_x=160.0,
+        obj_y=0.0,
+        motors_enabled=True,
+    )
+    expected = expected_controller._calculate_ik_motor_movements(
+        motor_set_id=MotorSetId.MOTORS_3_5,
+        obj_x=-160.0,
+        obj_y=0.0,
+    )
+
+    assert _to_tuples(actual) == _to_tuples(expected)
 
 
 @pytest.mark.parametrize(
