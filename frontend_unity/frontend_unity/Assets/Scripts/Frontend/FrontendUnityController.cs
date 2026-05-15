@@ -35,9 +35,12 @@ namespace ParallelHeptics.FrontendUnity
         private const float TextOffset = 0.006f;
         private const float TextScaleFactor = 0.5f;
         private const int CueCircleSegments = 96;
+        private const int XrSafeVSyncCount = 1;
+        private const int DesktopPreviewTargetFrameRate = 90;
         private const float AmbientNoiseLowPassAlpha = 0.075f;
         private const float AmbientNoiseRawMix = 0.16f;
         private const float ControllerAnalogPressThreshold = 0.55f;
+        private const float ControllerToggleDebounceSeconds = 0.25f;
         private const string CueModeCircleBorder = "circle_border";
         private const string CueModeCircleFilled = "circle_filled";
         private const string CueModeRubberBand = "rubber_band";
@@ -160,6 +163,7 @@ namespace ParallelHeptics.FrontendUnity
         private float _lastFilledCueRadius = -1f;
         private Vector3 _lastRubberBandEnd = new Vector3(float.NaN, float.NaN, float.NaN);
         private float _nextControllerDiagnosticTime;
+        private float _nextControllerToggleTime;
 
         private enum CalibrationKey
         {
@@ -188,9 +192,7 @@ namespace ParallelHeptics.FrontendUnity
 
         private void Awake()
         {
-            Application.runInBackground = true;
-            Application.targetFrameRate = -1;
-            QualitySettings.vSyncCount = 0;
+            ConfigureRuntimeFramePacing();
 
             _receiver = GetOrAddComponent<ExperimentUdpReceiver>(gameObject);
             _receiver.Configure(udpListenPort, bindUdpLoopbackOnly);
@@ -205,6 +207,17 @@ namespace ParallelHeptics.FrontendUnity
             ConfigurePassthroughSupport();
             ApplyCalibrationVisibility();
             SetStateVisibility(ExperimentState.Start);
+        }
+
+        private static void ConfigureRuntimeFramePacing()
+        {
+            Application.runInBackground = true;
+            // Quest Link/OpenXR owns the final HMD cadence. Keeping v-sync enabled
+            // prevents the desktop mirror from running unbounded and starving the
+            // GPU/video encoder, which shows up in the headset as blocky pixels,
+            // reprojection waves, and delayed frames.
+            QualitySettings.vSyncCount = XrSafeVSyncCount;
+            Application.targetFrameRate = DesktopPreviewTargetFrameRate;
         }
 
         private void OnDestroy()
@@ -392,15 +405,21 @@ namespace ParallelHeptics.FrontendUnity
                 return;
             }
 
-            if (TrySendControllerToggleFromInputSystemDevices())
+            if (TrySendControllerToggleFromInputSystemDevices(out bool sawInputSystemController))
             {
+                return;
+            }
+            if (sawInputSystemController)
+            {
+                LogControllerDiagnosticsIfNeeded();
                 return;
             }
 #endif
 
-            bool sentThisFrame = TrySendControllerToggleFromXrNode(UnityEngine.XR.XRNode.LeftHand)
-                || TrySendControllerToggleFromXrNode(UnityEngine.XR.XRNode.RightHand);
-            if (!sentThisFrame)
+            bool sentThisFrame = false;
+            bool sawXrNodeInput = TrySendControllerToggleFromXrNode(UnityEngine.XR.XRNode.LeftHand, ref sentThisFrame);
+            sawXrNodeInput |= TrySendControllerToggleFromXrNode(UnityEngine.XR.XRNode.RightHand, ref sentThisFrame);
+            if (!sawXrNodeInput)
             {
                 _controllerDevices.Clear();
                 UnityEngine.XR.InputDevices.GetDevicesWithCharacteristics(
@@ -411,10 +430,9 @@ namespace ParallelHeptics.FrontendUnity
                 {
                     if (TrySendControllerToggleFromXrDevice(
                             _controllerDevices[deviceIndex],
-                            $"characteristics:{deviceIndex}",
                             ref sentThisFrame))
                     {
-                        sentThisFrame = true;
+                        sawXrNodeInput = true;
                     }
                 }
             }
@@ -422,14 +440,13 @@ namespace ParallelHeptics.FrontendUnity
             LogControllerDiagnosticsIfNeeded();
         }
 
-        private bool TrySendControllerToggleFromXrNode(UnityEngine.XR.XRNode node)
+        private bool TrySendControllerToggleFromXrNode(UnityEngine.XR.XRNode node, ref bool sentThisFrame)
         {
             UnityEngine.XR.InputDevice device = UnityEngine.XR.InputDevices.GetDeviceAtXRNode(node);
-            bool sentThisFrame = false;
-            return TrySendControllerToggleFromXrDevice(device, $"node:{node}", ref sentThisFrame);
+            return TrySendControllerToggleFromXrDevice(device, ref sentThisFrame);
         }
 
-        private bool TrySendControllerToggleFromXrDevice(UnityEngine.XR.InputDevice device, string deviceKeyPrefix, ref bool sentThisFrame)
+        private bool TrySendControllerToggleFromXrDevice(UnityEngine.XR.InputDevice device, ref bool sentThisFrame)
         {
             if (!device.isValid)
             {
@@ -447,7 +464,7 @@ namespace ParallelHeptics.FrontendUnity
                 }
 
                 sawInput = true;
-                string key = $"xr:{deviceKeyPrefix}:{device.name}:{device.characteristics}:{usage.name}";
+                string key = BuildXrControlKey(device, usage.name);
                 _controllerButtonPressed.TryGetValue(key, out bool wasPressed);
                 if (isPressed && !wasPressed && !sentThisFrame)
                 {
@@ -469,7 +486,7 @@ namespace ParallelHeptics.FrontendUnity
 
                 sawInput = true;
                 bool isPressed = value >= ControllerAnalogPressThreshold;
-                string key = $"xr:{deviceKeyPrefix}:{device.name}:{device.characteristics}:axis:{usage.name}";
+                string key = BuildXrControlKey(device, $"axis:{usage.name}");
                 _controllerButtonPressed.TryGetValue(key, out bool wasPressed);
                 if (isPressed && !wasPressed && !sentThisFrame)
                 {
@@ -483,8 +500,20 @@ namespace ParallelHeptics.FrontendUnity
             return sawInput;
         }
 
+        private static string BuildXrControlKey(UnityEngine.XR.InputDevice device, string controlName)
+        {
+            return $"xr:{device.name}:{device.characteristics}:{controlName}";
+        }
+
         private void SendInteractionToggle(string source)
         {
+            if (Time.unscaledTime < _nextControllerToggleTime)
+            {
+                LogIfDebug($"Ignored duplicate interaction toggle from {source} during debounce window.");
+                return;
+            }
+
+            _nextControllerToggleTime = Time.unscaledTime + ControllerToggleDebounceSeconds;
             _controlClient.SendInteractionToggle();
             LogIfDebug($"Interaction toggle from {source}");
         }
@@ -512,8 +541,9 @@ namespace ParallelHeptics.FrontendUnity
             return keyboard != null && keyboard.spaceKey.wasPressedThisFrame;
         }
 
-        private bool TrySendControllerToggleFromInputSystemDevices()
+        private bool TrySendControllerToggleFromInputSystemDevices(out bool sawControllerControl)
         {
+            sawControllerControl = false;
             bool sentThisFrame = false;
             foreach (UnityEngine.InputSystem.InputDevice device in UnityEngine.InputSystem.InputSystem.devices)
             {
@@ -527,6 +557,7 @@ namespace ParallelHeptics.FrontendUnity
                     string controlName = InputSystemControllerControlNames[i];
                     if (TryReadInputSystemControlPressed(device, controlName, out bool isPressed, out float value))
                     {
+                        sawControllerControl = true;
                         string key = $"inputsystem:{device.deviceId}:{controlName}";
                         _controllerButtonPressed.TryGetValue(key, out bool wasPressed);
                         if (isPressed && !wasPressed && !sentThisFrame)

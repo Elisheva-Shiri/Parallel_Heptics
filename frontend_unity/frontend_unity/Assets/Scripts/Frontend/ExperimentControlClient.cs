@@ -14,6 +14,8 @@ namespace ParallelHeptics.FrontendUnity
     /// </summary>
     public sealed class ExperimentControlClient : MonoBehaviour
     {
+        private const string ToggleInteractionJson = "{\"moderatorAction\":\"toggle_interaction\"}";
+
         [SerializeField] private string backendHost = "localhost";
         [SerializeField] private int backendPort = 12344;
         [SerializeField] private int reconnectDelayMs = 500;
@@ -74,7 +76,7 @@ namespace ParallelHeptics.FrontendUnity
 
         public void SendInteractionToggle()
         {
-            EnqueueJson("{\"moderatorAction\":\"toggle_interaction\"}");
+            EnqueueJson(ToggleInteractionJson);
         }
 
         private void EnqueueJson(string json)
@@ -98,7 +100,10 @@ namespace ParallelHeptics.FrontendUnity
                     continue;
                 }
 
-                SendPayloadFromWorker(payload);
+                while (_running && !SendPayloadFromWorker(payload))
+                {
+                    _sendSignal.WaitOne(reconnectDelayMs);
+                }
             }
 
             while (_sendQueue.TryDequeue(out _))
@@ -107,11 +112,11 @@ namespace ParallelHeptics.FrontendUnity
             }
         }
 
-        private void SendPayloadFromWorker(byte[] payload)
+        private bool SendPayloadFromWorker(byte[] payload)
         {
             if (!EnsureConnected())
             {
-                return;
+                return false;
             }
 
             try
@@ -123,12 +128,16 @@ namespace ParallelHeptics.FrontendUnity
                 }
 
                 NetworkStream stream = client.GetStream();
+                DrainAvailableResponses(stream);
                 stream.Write(payload, 0, payload.Length);
                 stream.Flush();
+                DrainAvailableResponses(stream);
                 if (IsDebug)
                 {
                     Debug.Log($"Sent ExperimentControl: {Encoding.UTF8.GetString(payload)}");
                 }
+
+                return true;
             }
             catch (Exception ex)
             {
@@ -137,6 +146,29 @@ namespace ParallelHeptics.FrontendUnity
                     Debug.LogWarning($"Failed to send ExperimentControl; will reconnect. {ex.Message}");
                 }
                 CloseClient();
+                return false;
+            }
+        }
+
+        private void DrainAvailableResponses(NetworkStream stream)
+        {
+            var buffer = new byte[1024];
+            while (_running && stream.DataAvailable)
+            {
+                int bytesRead = stream.Read(buffer, 0, buffer.Length);
+                if (bytesRead <= 0)
+                {
+                    return;
+                }
+
+                if (IsDebug)
+                {
+                    string response = Encoding.UTF8.GetString(buffer, 0, bytesRead).Trim();
+                    if (!string.IsNullOrEmpty(response))
+                    {
+                        Debug.Log($"Backend TCP response: {response}");
+                    }
+                }
             }
         }
 

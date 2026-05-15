@@ -69,6 +69,7 @@ namespace ParallelHeptics.FrontendUnity.Editor
 
             bool assigned = XRPackageMetadataStore.AssignLoader(generalSettings.AssignedSettings, OpenXrLoaderTypeName, buildTargetGroup);
             int enabledFeatureCount = EnableQuestLinkFeatures(buildTargetGroup);
+            ConfigureQuestLinkLatency(buildTargetGroup);
             EditorUtility.SetDirty(perBuildTargetSettings);
             EditorUtility.SetDirty(generalSettings);
             EditorUtility.SetDirty(generalSettings.AssignedSettings);
@@ -116,6 +117,22 @@ namespace ParallelHeptics.FrontendUnity.Editor
 
             EditorUtility.SetDirty(settings);
             return enabledPassthroughCount + enabledControllerCount;
+        }
+
+        private static void ConfigureQuestLinkLatency(BuildTargetGroup buildTargetGroup)
+        {
+            OpenXRSettings settings = OpenXRSettings.GetSettingsForBuildTargetGroup(buildTargetGroup);
+            if (settings == null)
+            {
+                Debug.LogWarning("OpenXR settings were not available; Quest Link latency optimization could not be configured.");
+                return;
+            }
+
+            // Unity OpenXR/Meta validation recommends this mode for Meta Quest
+            // support. It places xrWaitFrame so input sampling happens closer to
+            // frame submission, reducing perceived controller/headset delay.
+            settings.latencyOptimization = OpenXRSettings.LatencyOptimization.PrioritizeInputPolling;
+            EditorUtility.SetDirty(settings);
         }
 
         private static bool SetFeatureEnabledForStandalone(OpenXRFeature feature)

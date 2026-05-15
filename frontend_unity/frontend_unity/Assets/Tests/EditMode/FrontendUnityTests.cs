@@ -1,5 +1,6 @@
 using NUnit.Framework;
 using ParallelHeptics.FrontendUnity;
+using System.Collections;
 using System.Reflection;
 using Unity.XR.CoreUtils;
 using UnityEditor;
@@ -45,6 +46,49 @@ namespace ParallelHeptics.FrontendUnity.Tests
             string json = JsonUtility.ToJson(new ExperimentControl { questionInput = (int)QuestionInput.Right });
 
             Assert.AreEqual("{\"questionInput\":1}", json);
+        }
+
+        [Test]
+        public void InteractionToggleJsonMatchesBackendModeratorAction()
+        {
+            FieldInfo toggleJsonField = typeof(ExperimentControlClient).GetField("ToggleInteractionJson", BindingFlags.Static | BindingFlags.NonPublic);
+            Assert.NotNull(toggleJsonField);
+
+            Assert.AreEqual("{\"moderatorAction\":\"toggle_interaction\"}", toggleJsonField.GetValue(null));
+        }
+
+        [Test]
+        public void InteractionToggleDebouncesDuplicateBackendMessages()
+        {
+            GameObject controllerObject = new GameObject("Controller Toggle Debounce Test");
+            controllerObject.SetActive(false);
+
+            try
+            {
+                var controller = controllerObject.AddComponent<FrontendUnityController>();
+                var controlClient = controllerObject.AddComponent<ExperimentControlClient>();
+                typeof(FrontendUnityController)
+                    .GetField("_controlClient", BindingFlags.Instance | BindingFlags.NonPublic)
+                    ?.SetValue(controller, controlClient);
+
+                MethodInfo sendInteractionToggle = typeof(FrontendUnityController)
+                    .GetMethod("SendInteractionToggle", BindingFlags.Instance | BindingFlags.NonPublic);
+                Assert.NotNull(sendInteractionToggle);
+
+                sendInteractionToggle.Invoke(controller, new object[] { "test press" });
+                sendInteractionToggle.Invoke(controller, new object[] { "duplicate backend path" });
+
+                FieldInfo queueField = typeof(ExperimentControlClient)
+                    .GetField("_sendQueue", BindingFlags.Instance | BindingFlags.NonPublic);
+                Assert.NotNull(queueField);
+                var queue = (ICollection)queueField.GetValue(controlClient);
+
+                Assert.AreEqual(1, queue.Count, "One physical press can be observed by multiple Unity input APIs; debounce must prevent double toggle messages.");
+            }
+            finally
+            {
+                Object.DestroyImmediate(controllerObject);
+            }
         }
 
         [Test]
@@ -143,6 +187,52 @@ namespace ParallelHeptics.FrontendUnity.Tests
             Assert.IsNull(serialized.FindProperty("playWhiteNoise"));
             Assert.AreEqual(0.15f, serialized.FindProperty("whiteNoiseVolume").floatValue, 0.0001f);
             Assert.AreEqual(44100, serialized.FindProperty("whiteNoiseSampleRate").intValue);
+        }
+
+        [Test]
+        public void RuntimeUsesQuestLinkSafeFramePacing()
+        {
+            bool originalRunInBackground = Application.runInBackground;
+            int originalVSync = QualitySettings.vSyncCount;
+            int originalTargetFrameRate = Application.targetFrameRate;
+
+            try
+            {
+                MethodInfo configureRuntimeFramePacing = typeof(FrontendUnityController).GetMethod("ConfigureRuntimeFramePacing", BindingFlags.Static | BindingFlags.NonPublic);
+                Assert.NotNull(configureRuntimeFramePacing);
+
+                QualitySettings.vSyncCount = 0;
+                Application.targetFrameRate = -1;
+
+                configureRuntimeFramePacing.Invoke(null, null);
+
+                Assert.IsTrue(Application.runInBackground);
+                Assert.AreEqual(1, QualitySettings.vSyncCount, "The Unity mirror must not run unbounded while Quest Link is encoding frames.");
+                Assert.AreEqual(90, Application.targetFrameRate, "Desktop preview fallback should stay near common Quest Link refresh rates.");
+            }
+            finally
+            {
+                Application.runInBackground = originalRunInBackground;
+                QualitySettings.vSyncCount = originalVSync;
+                Application.targetFrameRate = originalTargetFrameRate;
+            }
+        }
+
+        [Test]
+        public void UdpReceiverKeepsEnoughKernelBufferForLatestPacketMode()
+        {
+            GameObject receiverObject = new GameObject("UDP Buffer Test");
+            receiverObject.SetActive(false);
+            var receiver = receiverObject.AddComponent<ExperimentUdpReceiver>();
+
+            try
+            {
+                Assert.GreaterOrEqual(receiver.EffectiveReceiveBufferBytes, 65536);
+            }
+            finally
+            {
+                Object.DestroyImmediate(receiverObject);
+            }
         }
 
         [Test]
@@ -458,6 +548,7 @@ namespace ParallelHeptics.FrontendUnity.Tests
 #if ENABLE_INPUT_SYSTEM
                 var driver = rigCamera.GetComponent<TrackedPoseDriver>();
                 Assert.NotNull(driver, "The driven camera must have a TrackedPoseDriver so HMD pose updates the camera transform every frame.");
+                Assert.AreEqual(TrackedPoseDriver.UpdateType.UpdateAndBeforeRender, driver.updateType, "HMD pose must update again immediately before render to reduce visible headset delay.");
                 Assert.IsTrue(driver.positionInput.action != null && driver.positionInput.action.bindings.Count > 0, "TrackedPoseDriver position input must be bound to an XR HMD control.");
                 Assert.IsTrue(driver.rotationInput.action != null && driver.rotationInput.action.bindings.Count > 0, "TrackedPoseDriver rotation input must be bound to an XR HMD control.");
 #endif
