@@ -234,5 +234,9 @@ analysis/motor_response_experiment/responses/
 # Motor response analyzer servo generated responses
 analysis/motor_response_analizer_servo/responses/
 
+# Generated result folders anywhere in the repo
+**/[Rr]esult/
+**/[Rr]esults/
+
 # Psychophysics analysis generated outputs
 analysis/psychophysics_analysis/results/
