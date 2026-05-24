@@ -74,3 +74,24 @@ Limit: Quest/OpenXR tracking can still shift if the runtime loses tracking or re
 For headset use, set Meta Quest Link as the active OpenXR runtime in the Meta Quest PC app, then run this Unity project in Play Mode or as a Windows build.
 
 The project includes Unity's Meta OpenXR package and the menu item `Parallel Heptics > Configure OpenXR for Quest Link` enables the Standalone OpenXR loader plus Meta Quest passthrough features. Quest Link passthrough also requires Meta's PC runtime to allow passthrough over Link; in the Meta Quest Link app, enable the beta/developer runtime passthrough option if it is not already enabled.
+
+## Headset image quality and delay checklist
+
+This frontend is a **PCVR / Quest Link** app. Do not deploy/upload it as a
+standalone Android Quest build for experiments; launch the Windows player or
+Unity Play Mode through Quest Link.
+
+If the headset view becomes blocky, wavy, or delayed:
+
+1. Run `Parallel Heptics > Configure OpenXR for Quest Link` after opening the
+   project. It keeps the Standalone OpenXR loader, Meta controller/passthrough
+   features, and Quest latency option configured.
+2. Start only one frontend at a time. If pygame and Unity both listen on UDP
+   `12346`, stop pygame before running Unity.
+3. Prefer a USB 3 Link cable/port for the experiment. Air Link or a weak USB
+   connection can still create video-compression pixelation outside Unity's
+   control.
+4. Use a non-development Windows build for sessions when possible. Editor Play
+   Mode is useful for calibration/debugging but has extra CPU/GPU overhead.
+5. Leave passthrough only for calibration. After pressing Enter to save
+   calibration, the experiment panel turns opaque and passthrough is disabled.

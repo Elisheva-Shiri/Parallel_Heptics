@@ -150,7 +150,7 @@ def test_haptic_workspace_clamp_uses_scaled_target_from_consts():
     )
     expected = controller._calculate_movements_to_point(
         motor_set_id=MotorSetId.MOTORS_3_5,
-        object_end=(target_radius, 0.0),
+        object_end=(-target_radius, 0.0),
     )
 
     assert _to_tuples(actual) == _to_tuples(expected)

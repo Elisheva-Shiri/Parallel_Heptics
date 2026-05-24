@@ -292,8 +292,8 @@ class Experiment:
         self._running = True
 
         # Camera indices
-        self.TOP_CAMERA = 0
-        self.SIDE_CAMERA = 1
+        self.TOP_CAMERA = 1
+        self.SIDE_CAMERA = 0
         
         # Video writers
         self._top_writer = None

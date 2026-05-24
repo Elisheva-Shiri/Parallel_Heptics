@@ -61,6 +61,15 @@ heavy configuration is committed to the repo so it does not need to be redone.
   rebuilt. For day-to-day experiment runs, use the prebuilt Windows player at
   `frontend_unity/Build/ParallelHeptics.exe` (see step 5).
 
+- **Node.js / npm** — required when opening the Unity project because the MCP
+  Unity package builds a small local server. Install Node.js LTS, then enable
+  npm in PowerShell if Windows blocks it:
+  ```powershell
+  winget install --id OpenJS.NodeJS.LTS -e --source winget
+  Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+  npm -v
+  ```
+
 ### 2. Plug in hardware and find the COM port
 
 1. Connect the ESP32 with a **data** USB cable (not charge-only).

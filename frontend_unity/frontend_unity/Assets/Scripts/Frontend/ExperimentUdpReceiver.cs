@@ -19,6 +19,7 @@ namespace ParallelHeptics.FrontendUnity
         [SerializeField] private int receiveBufferBytes = 8192;
         [SerializeField] private bool logPacketsPerSecond;
 
+        private const int MinimumReceiveBufferBytes = 65536;
         private readonly object _latestJsonLock = new object();
         private UdpClient _udpClient;
         private Thread _receiveThread;
@@ -31,6 +32,7 @@ namespace ParallelHeptics.FrontendUnity
         private long _lastStatsPackets;
 
         public int ListenPort => listenPort;
+        public int EffectiveReceiveBufferBytes => Mathf.Max(receiveBufferBytes, MinimumReceiveBufferBytes);
         public long ReceivedPackets => Interlocked.Read(ref _receivedPackets);
         public bool IsRunning => _running;
         public bool IsDebug { get; set; } = true;
@@ -97,7 +99,7 @@ namespace ParallelHeptics.FrontendUnity
             {
                 IPAddress bindAddress = bindLoopbackOnly ? IPAddress.Loopback : IPAddress.Any;
                 _udpClient = new UdpClient(new IPEndPoint(bindAddress, listenPort));
-                _udpClient.Client.ReceiveBufferSize = receiveBufferBytes;
+                _udpClient.Client.ReceiveBufferSize = EffectiveReceiveBufferBytes;
                 _running = true;
                 _receiveThread = new Thread(ReceiveLoop)
                 {
