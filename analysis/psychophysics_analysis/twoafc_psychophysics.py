@@ -22,9 +22,11 @@ import pandas as pd
 try:
     from analysis.group_comparisons import (
         add_experiment_group_columns,
+        add_protocol_group_columns,
         add_setup_factor_columns,
         compute_analysis_scope_tables,
         compute_group_comparison_tables,
+        compute_protocol_group_comparison_tables,
         compute_setup_factor_tables,
     )
     from analysis.scope_plots import save_scope_summary_plots
@@ -34,9 +36,11 @@ except ModuleNotFoundError:  # pragma: no cover - supports running from analysis
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from analysis.group_comparisons import (
         add_experiment_group_columns,
+        add_protocol_group_columns,
         add_setup_factor_columns,
         compute_analysis_scope_tables,
         compute_group_comparison_tables,
+        compute_protocol_group_comparison_tables,
         compute_setup_factor_tables,
     )
     from analysis.scope_plots import save_scope_summary_plots
@@ -46,10 +50,15 @@ STANDARD_FALLBACK = 85.0
 STANDARD_ABS_TOLERANCE = 0.75
 MIN_TRIALS_PER_FIT = 12
 MIN_LEVELS_PER_FIT = 3
+DEFAULT_FIT_BOOTSTRAP_N = 200
+MIN_BOOTSTRAP_FOR_CI = 30
 DEFAULT_CENTER_X = 320.0
 DEFAULT_CENTER_Y = 240.0
 STIFFNESS_MAX_FOR_STRETCH_PROXY = 175.0
 IGNORED_PATH_PATTERNS = ("old", "not finish", "not_finish", "not-finish", "unfinished", "notfinished")
+PSYCHOMETRIC_DELTA_AXIS_LABEL = "G_comparison-G_standart"
+PSYCHOMETRIC_GREATER_Y_LABEL = "P(choose comparison > standard)"
+PSYCHOMETRIC_MEAN_GREATER_Y_LABEL = "Mean P(choose comparison > standard)"
 WORKSPACE_SPECS_CM = {
     "N": {"width_cm": 40.0, "height_cm": 50.0, "label": "N workspace (40x50 cm)"},
     "L": {"width_cm": 60.0, "height_cm": 60.0, "label": "L workspace (60x60 cm)"},
@@ -273,6 +282,73 @@ def motor_control_method_references() -> pd.DataFrame:
     return pd.DataFrame(MOTOR_CONTROL_METHOD_REFERENCES)
 
 
+def add_delta_and_less_response_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add signed-delta and complementary response columns.
+
+    The fitted canonical response remains ``response_comparison_greater`` so the
+    logistic fit and plotted psychometric curve are monotonic increasing on
+    ``G_comparison-G_standart``. The less-than columns are retained only as
+    transparent complements for tabular checks.
+    """
+    if df.empty:
+        return df.copy()
+    out = df.copy()
+    if {"comparison_value", "standard_value"}.issubset(out.columns):
+        comparison = pd.to_numeric(out["comparison_value"], errors="coerce")
+        standard = pd.to_numeric(out["standard_value"], errors="coerce").fillna(STANDARD_FALLBACK)
+        out["standard_value"] = standard
+        out["delta_comparison_minus_standard"] = comparison - standard
+        out["delta_standard_minus_comparison"] = -out["delta_comparison_minus_standard"]
+        out["comparison_over_standard"] = np.where(standard > 0, comparison / standard, np.nan)
+        out["signed_delta_over_standard"] = np.where(
+            standard > 0,
+            out["delta_comparison_minus_standard"] / standard,
+            np.nan,
+        )
+        out["abs_delta_over_standard"] = out["signed_delta_over_standard"].abs()
+    if "response_comparison_greater" in out.columns:
+        response = pd.to_numeric(out["response_comparison_greater"], errors="coerce")
+        out["response_comparison_less"] = np.where(response.notna(), 1.0 - response, np.nan)
+    if {"n_trials", "n_comparison_greater"}.issubset(out.columns):
+        n_trials = pd.to_numeric(out["n_trials"], errors="coerce")
+        n_greater = pd.to_numeric(out["n_comparison_greater"], errors="coerce")
+        out["n_comparison_less"] = n_trials - n_greater
+    if "p_comparison_greater" in out.columns:
+        p_greater = pd.to_numeric(out["p_comparison_greater"], errors="coerce")
+        out["p_comparison_less"] = np.where(p_greater.notna(), 1.0 - p_greater, np.nan)
+    if {"p_comparison_greater_ci95_lower", "p_comparison_greater_ci95_upper"}.issubset(out.columns):
+        lower = pd.to_numeric(out["p_comparison_greater_ci95_lower"], errors="coerce")
+        upper = pd.to_numeric(out["p_comparison_greater_ci95_upper"], errors="coerce")
+        out["p_comparison_less_ci95_lower"] = 1.0 - upper
+        out["p_comparison_less_ci95_upper"] = 1.0 - lower
+    return out
+
+
+def set_psychometric_delta_axis(ax: Any, delta_values: Any = None) -> None:
+    """Use a centered comparison-standard delta axis for psychometric plots."""
+    ax.set_xlabel(PSYCHOMETRIC_DELTA_AXIS_LABEL)
+    if delta_values is None:
+        return
+    values = pd.to_numeric(pd.Series(delta_values), errors="coerce").dropna()
+    if values.empty:
+        return
+    observed_ticks = np.sort(values.unique().astype(float))
+    if 0.0 not in observed_ticks:
+        observed_ticks = np.sort(np.append(observed_ticks, 0.0))
+    if len(observed_ticks) > 25:
+        step = int(math.ceil(len(observed_ticks) / 25))
+        observed_ticks = observed_ticks[::step]
+        if 0.0 not in observed_ticks:
+            observed_ticks = np.sort(np.append(observed_ticks, 0.0))
+    x_min, x_max = float(observed_ticks.min()), float(observed_ticks.max())
+    span = x_max - x_min
+    if not np.isfinite(span):
+        return
+    padding = max(5.0, 0.06 * span)
+    ax.set_xlim(x_min - padding, x_max + padding)
+    ax.set_xticks(observed_ticks)
+
+
 def add_psychophysics_context_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Add transparent analysis context without changing raw answer values.
 
@@ -283,7 +359,7 @@ def add_psychophysics_context_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     if df.empty:
         return df.copy()
-    out = add_setup_factor_columns(add_experiment_group_columns(df))
+    out = add_protocol_group_columns(add_setup_factor_columns(add_experiment_group_columns(df)))
     if {"comparison_value", "standard_value"}.issubset(out.columns):
         comparison = pd.to_numeric(out["comparison_value"], errors="coerce")
         standard = pd.to_numeric(out["standard_value"], errors="coerce").fillna(STANDARD_FALLBACK)
@@ -291,6 +367,8 @@ def add_psychophysics_context_columns(df: pd.DataFrame) -> pd.DataFrame:
         out["comparison_over_standard"] = np.where(standard > 0, comparison / standard, np.nan)
         if "signed_stiffness_delta" not in out:
             out["signed_stiffness_delta"] = comparison - standard
+        out["delta_comparison_minus_standard"] = out["signed_stiffness_delta"]
+        out["delta_standard_minus_comparison"] = -out["signed_stiffness_delta"]
         out["signed_delta_over_standard"] = np.where(standard > 0, out["signed_stiffness_delta"] / standard, np.nan)
         if "abs_stiffness_delta" not in out:
             out["abs_stiffness_delta"] = out["signed_stiffness_delta"].abs()
@@ -299,6 +377,8 @@ def add_psychophysics_context_columns(df: pd.DataFrame) -> pd.DataFrame:
     elif "standard_value" in out:
         standard = pd.to_numeric(out["standard_value"], errors="coerce").fillna(STANDARD_FALLBACK)
         out["standard_value"] = standard
+
+    out = add_delta_and_less_response_columns(out)
 
     if "correct_response" in out.columns:
         success = pd.to_numeric(out["correct_response"], errors="coerce")
@@ -870,11 +950,15 @@ def make_farajian_style_psychometric_input(clean: pd.DataFrame, group_cols: list
         enriched.groupby(group_cols + ["signed_stiffness_delta"], dropna=False)
         .agg(
             n_comparison_greater=("response_comparison_greater", "sum"),
+            n_comparison_less=("response_comparison_less", "sum"),
             n_trials=("response_comparison_greater", "size"),
             n_data_points=("response_comparison_greater", "size"),
             p_comparison_greater=("response_comparison_greater", "mean"),
             p_comparison_greater_ci95_lower=("response_comparison_greater", _wilson_ci95_lower),
             p_comparison_greater_ci95_upper=("response_comparison_greater", _wilson_ci95_upper),
+            p_comparison_less=("response_comparison_less", "mean"),
+            p_comparison_less_ci95_lower=("response_comparison_less", _wilson_ci95_lower),
+            p_comparison_less_ci95_upper=("response_comparison_less", _wilson_ci95_upper),
             n_correct=("correct_response", "sum"),
             success_rate=("correct_response", "mean"),
             success_rate_ci95_lower=("correct_response", _wilson_ci95_lower),
@@ -888,22 +972,29 @@ def make_farajian_style_psychometric_input(clean: pd.DataFrame, group_cols: list
             log_reaction_time_ci95_upper=("log_reaction_time", _mean_ci95_upper),
             standard_value=("standard_value", "median"),
             comparison_value=("comparison_value", "median"),
+            comparison_over_standard=("comparison_over_standard", "median"),
+            signed_delta_over_standard=("signed_delta_over_standard", "median"),
+            abs_delta_over_standard=("abs_delta_over_standard", "median"),
         )
         .reset_index()
         .sort_values(group_cols + ["signed_stiffness_delta"])
     )
-    out = _add_log_reverse_columns(out)
+    out = add_delta_and_less_response_columns(_add_log_reverse_columns(out))
     out["delta_comparison_minus_standard"] = out["signed_stiffness_delta"]
     out["delta_standard_minus_comparison"] = -out["signed_stiffness_delta"]
     preferred = group_cols + [
         "delta_comparison_minus_standard",
         "delta_standard_minus_comparison",
         "n_comparison_greater",
+        "n_comparison_less",
         "n_trials",
         "n_data_points",
         "p_comparison_greater",
         "p_comparison_greater_ci95_lower",
         "p_comparison_greater_ci95_upper",
+        "p_comparison_less",
+        "p_comparison_less_ci95_lower",
+        "p_comparison_less_ci95_upper",
         "n_correct",
         "success_rate",
         "success_rate_ci95_lower",
@@ -918,6 +1009,9 @@ def make_farajian_style_psychometric_input(clean: pd.DataFrame, group_cols: list
         "reaction_time_log_ci95_upper_backtransformed_s",
         "standard_value",
         "comparison_value",
+        "comparison_over_standard",
+        "signed_delta_over_standard",
+        "abs_delta_over_standard",
     ]
     return out[[c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]]
 
@@ -925,16 +1019,24 @@ def make_farajian_style_psychometric_input(clean: pd.DataFrame, group_cols: list
 def make_psychometric_input(clean: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     if clean.empty:
         return pd.DataFrame()
-    enriched = add_success_and_time_columns(clean) if "log_reaction_time" not in clean.columns else clean.copy()
+    enriched = (
+        add_success_and_time_columns(clean)
+        if "log_reaction_time" not in clean.columns
+        else add_delta_and_less_response_columns(clean.copy())
+    )
     out = (
         enriched.groupby(group_cols + ["comparison_value"], dropna=False)
         .agg(
             n_trials=("response_comparison_greater", "size"),
             n_data_points=("response_comparison_greater", "size"),
             n_comparison_greater=("response_comparison_greater", "sum"),
+            n_comparison_less=("response_comparison_less", "sum"),
             p_comparison_greater=("response_comparison_greater", "mean"),
             p_comparison_greater_ci95_lower=("response_comparison_greater", _wilson_ci95_lower),
             p_comparison_greater_ci95_upper=("response_comparison_greater", _wilson_ci95_upper),
+            p_comparison_less=("response_comparison_less", "mean"),
+            p_comparison_less_ci95_lower=("response_comparison_less", _wilson_ci95_lower),
+            p_comparison_less_ci95_upper=("response_comparison_less", _wilson_ci95_upper),
             mean_rt=("reaction_time", "mean"),
             median_rt=("reaction_time", "median"),
             rt_ci95_lower=("reaction_time", _mean_ci95_lower),
@@ -943,11 +1045,15 @@ def make_psychometric_input(clean: pd.DataFrame, group_cols: list[str]) -> pd.Da
             log_reaction_time_ci95_lower=("log_reaction_time", _mean_ci95_lower),
             log_reaction_time_ci95_upper=("log_reaction_time", _mean_ci95_upper),
             standard_value=("standard_value", "median"),
+            comparison_over_standard=("comparison_over_standard", "median"),
+            signed_delta_over_standard=("signed_delta_over_standard", "median"),
+            abs_delta_over_standard=("abs_delta_over_standard", "median"),
         )
         .reset_index()
         .sort_values(group_cols + ["comparison_value"])
     )
-    return _add_log_reverse_columns(out)
+    out = add_delta_and_less_response_columns(_add_log_reverse_columns(out))
+    return out.sort_values(group_cols + ["delta_comparison_minus_standard"]).reset_index(drop=True)
 
 
 def _safe_spearman(x: pd.Series, y: pd.Series) -> tuple[float, float]:
@@ -1676,6 +1782,24 @@ def x_at_probability(q: float, mu: float, scale: float, lapse_low: float, lapse_
     return float(mu + scale * math.log(y / (1 - y)))
 
 
+def _psignifit_param_ci(result: Any, key_candidates: tuple[str, ...]) -> tuple[float, float]:
+    """Try to read a 95% CI from a psignifit result dict for a parameter."""
+    if not isinstance(result, dict):
+        return np.nan, np.nan
+    for key in key_candidates:
+        if key in result:
+            arr = np.asarray(result[key])
+            if arr.size == 0:
+                continue
+            try:
+                flat = np.ravel(arr)
+                if flat.size >= 2 and np.all(np.isfinite(flat[:2])):
+                    return float(flat[0]), float(flat[1])
+            except Exception:
+                continue
+    return np.nan, np.nan
+
+
 def fit_with_psignifit_if_possible(agg: pd.DataFrame, psignifit_available: bool) -> tuple[Optional[dict[str, Any]], str]:
     if not psignifit_available:
         return None, "psignifit_not_installed"
@@ -1687,11 +1811,38 @@ def fit_with_psignifit_if_possible(agg: pd.DataFrame, psignifit_available: bool)
             pse = np.nan
             x25 = np.nan
             x75 = np.nan
+            pse_ci_lower = np.nan
+            pse_ci_upper = np.nan
+            x25_ci_lower = np.nan
+            x25_ci_upper = np.nan
+            x75_ci_lower = np.nan
+            x75_ci_upper = np.nan
             if hasattr(psignifit, "getThreshold"):
                 try:
-                    pse = float(np.ravel(psignifit.getThreshold(result, 0.5))[0])  # type: ignore[attr-defined]
-                    x25 = float(np.ravel(psignifit.getThreshold(result, 0.25))[0])  # type: ignore[attr-defined]
-                    x75 = float(np.ravel(psignifit.getThreshold(result, 0.75))[0])  # type: ignore[attr-defined]
+                    pse_pair = psignifit.getThreshold(result, 0.5)  # type: ignore[attr-defined]
+                    pse_arr = np.ravel(pse_pair)
+                    pse = float(pse_arr[0])
+                    if pse_arr.size >= 3:
+                        pse_ci_lower = float(pse_arr[1])
+                        pse_ci_upper = float(pse_arr[2])
+                except Exception:
+                    pass
+                try:
+                    x25_pair = psignifit.getThreshold(result, 0.25)  # type: ignore[attr-defined]
+                    x25_arr = np.ravel(x25_pair)
+                    x25 = float(x25_arr[0])
+                    if x25_arr.size >= 3:
+                        x25_ci_lower = float(x25_arr[1])
+                        x25_ci_upper = float(x25_arr[2])
+                except Exception:
+                    pass
+                try:
+                    x75_pair = psignifit.getThreshold(result, 0.75)  # type: ignore[attr-defined]
+                    x75_arr = np.ravel(x75_pair)
+                    x75 = float(x75_arr[0])
+                    if x75_arr.size >= 3:
+                        x75_ci_lower = float(x75_arr[1])
+                        x75_ci_upper = float(x75_arr[2])
                 except Exception:
                     pass
             lapse = np.nan
@@ -1701,14 +1852,33 @@ def fit_with_psignifit_if_possible(agg: pd.DataFrame, psignifit_available: bool)
                     pse = float(fit[0])
                 if len(fit) >= 3:
                     lapse = float(fit[2])
+            if np.isnan(pse_ci_lower) or np.isnan(pse_ci_upper):
+                pse_ci_lower, pse_ci_upper = _psignifit_param_ci(
+                    result, ("conf_Intervals_threshold", "conf_Intervals", "confIntervals", "CI", "ci"),
+                )
             if np.isfinite(pse):
+                jnd = float((x75 - x25) / 2) if np.isfinite(x25) and np.isfinite(x75) else np.nan
+                jnd_ci_lower = np.nan
+                jnd_ci_upper = np.nan
+                if all(np.isfinite([x25_ci_lower, x25_ci_upper, x75_ci_lower, x75_ci_upper])):
+                    jnd_ci_lower = float((x75_ci_lower - x25_ci_upper) / 2)
+                    jnd_ci_upper = float((x75_ci_upper - x25_ci_lower) / 2)
+                pse_se = float((pse_ci_upper - pse_ci_lower) / (2 * 1.96)) if np.isfinite(pse_ci_lower) and np.isfinite(pse_ci_upper) else np.nan
+                jnd_se = float((jnd_ci_upper - jnd_ci_lower) / (2 * 1.96)) if np.isfinite(jnd_ci_lower) and np.isfinite(jnd_ci_upper) else np.nan
                 return {
                     "fit_method": "psignifit",
                     "pse": pse,
-                    "jnd": float((x75 - x25) / 2) if np.isfinite(x25) and np.isfinite(x75) else np.nan,
+                    "jnd": jnd,
                     "x25": x25,
                     "x75": x75,
                     "lapse_rate": lapse,
+                    "pse_ci95_lower": pse_ci_lower,
+                    "pse_ci95_upper": pse_ci_upper,
+                    "pse_se": pse_se,
+                    "jnd_ci95_lower": jnd_ci_lower,
+                    "jnd_ci95_upper": jnd_ci_upper,
+                    "jnd_se": jnd_se,
+                    "bootstrap_method": "psignifit_bayesian_ci",
                     "fit_warning": "psignifit_api_threshold_extraction_partial" if not (np.isfinite(x25) and np.isfinite(x75)) else "",
                     "psignifit_result_repr": repr(result)[:1000],
                 }, "psignifit_success"
@@ -1717,7 +1887,102 @@ def fit_with_psignifit_if_possible(agg: pd.DataFrame, psignifit_available: bool)
         return None, f"psignifit_failed: {exc}"
 
 
-def fit_with_scipy_logistic(agg: pd.DataFrame) -> dict[str, Any]:
+def _logistic_nll(params: np.ndarray, x: np.ndarray, k: np.ndarray, n: np.ndarray, eps: float = 1e-9) -> float:
+    mu, log_scale, lapse_low, lapse_high = params
+    scale = float(np.exp(log_scale))
+    lapse_low = float(lapse_low)
+    lapse_high = float(lapse_high)
+    if lapse_low + lapse_high >= 0.45:
+        return 1e9
+    p = np.clip(logistic4(x, float(mu), scale, lapse_low, lapse_high), eps, 1 - eps)
+    return -float(np.sum(k * np.log(p) + (n - k) * np.log(1 - p)))
+
+
+def _fit_logistic_mle_from_starts(
+    x: np.ndarray,
+    k: np.ndarray,
+    n: np.ndarray,
+    starts: list[list[float]],
+    bounds: list[tuple[float, float]],
+    eps: float = 1e-9,
+) -> Optional[Any]:
+    """Run scipy L-BFGS-B from multiple starts and return the best OptimizeResult."""
+    try:
+        from scipy.optimize import minimize
+    except Exception:
+        return None
+    best = None
+    for start in starts:
+        result = minimize(_logistic_nll, start, args=(x, k, n, eps), method="L-BFGS-B", bounds=bounds)
+        if best is None or result.fun < best.fun:
+            best = result
+    return best
+
+
+def _parametric_bootstrap_logistic_pse_jnd(
+    x: np.ndarray,
+    n: np.ndarray,
+    mle_params: tuple[float, float, float, float],
+    starts: list[list[float]],
+    bounds: list[tuple[float, float]],
+    *,
+    n_bootstrap: int = DEFAULT_FIT_BOOTSTRAP_N,
+    seed: int = 12345,
+    eps: float = 1e-9,
+) -> dict[str, np.ndarray]:
+    """Parametric binomial bootstrap of PSE / JND / lapse for a 4-parameter logistic.
+
+    For each iteration the per-level success counts are resampled from
+    ``Binomial(n_i, p_hat_i)`` where ``p_hat_i`` comes from the MLE.  The fit is
+    re-run warm-started from the MLE and the resulting PSE/JND values are
+    accumulated.  Returns NaN-padded arrays so callers can compute SEs and
+    percentile CIs.
+    """
+    rng = np.random.default_rng(seed)
+    mu_hat, scale_hat, lapse_low_hat, lapse_high_hat = mle_params
+    p_hat = np.clip(logistic4(x, mu_hat, scale_hat, lapse_low_hat, lapse_high_hat), eps, 1 - eps)
+    n_int = np.maximum(n.astype(int), 0)
+    warm_start = [float(mu_hat), float(math.log(max(scale_hat, 1e-9))), float(lapse_low_hat), float(lapse_high_hat)]
+    boot_starts = [warm_start] + list(starts)[:1]
+    pse_samples = np.full(n_bootstrap, np.nan, dtype=float)
+    jnd_samples = np.full(n_bootstrap, np.nan, dtype=float)
+    lapse_samples = np.full(n_bootstrap, np.nan, dtype=float)
+    if n_int.sum() <= 0 or n_bootstrap <= 0:
+        return {"pse": pse_samples, "jnd": jnd_samples, "lapse_rate": lapse_samples}
+    for b in range(n_bootstrap):
+        k_b = rng.binomial(n_int, p_hat).astype(float)
+        res = _fit_logistic_mle_from_starts(x, k_b, n.astype(float), boot_starts, bounds, eps)
+        if res is None:
+            continue
+        mu_b = float(res.x[0])
+        scale_b = float(np.exp(res.x[1]))
+        lapse_low_b = float(res.x[2])
+        lapse_high_b = float(res.x[3])
+        pse_b = x_at_probability(0.5, mu_b, scale_b, lapse_low_b, lapse_high_b)
+        x25_b = x_at_probability(0.25, mu_b, scale_b, lapse_low_b, lapse_high_b)
+        x75_b = x_at_probability(0.75, mu_b, scale_b, lapse_low_b, lapse_high_b)
+        pse_samples[b] = pse_b
+        if np.isfinite(x25_b) and np.isfinite(x75_b):
+            jnd_samples[b] = (x75_b - x25_b) / 2.0
+        lapse_samples[b] = lapse_low_b + lapse_high_b
+    return {"pse": pse_samples, "jnd": jnd_samples, "lapse_rate": lapse_samples}
+
+
+def _bootstrap_summary(samples: np.ndarray) -> dict[str, float]:
+    """Return SE and 95% percentile CI summary for a 1-D bootstrap array."""
+    values = np.asarray(samples, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size < MIN_BOOTSTRAP_FOR_CI:
+        return {"se": np.nan, "ci95_lower": np.nan, "ci95_upper": np.nan, "n_effective": int(values.size)}
+    return {
+        "se": float(values.std(ddof=1)),
+        "ci95_lower": float(np.percentile(values, 2.5)),
+        "ci95_upper": float(np.percentile(values, 97.5)),
+        "n_effective": int(values.size),
+    }
+
+
+def fit_with_scipy_logistic(agg: pd.DataFrame, n_bootstrap: int = DEFAULT_FIT_BOOTSTRAP_N) -> dict[str, Any]:
     x = agg["comparison_value"].to_numpy(dtype=float)
     k = agg["n_comparison_greater"].to_numpy(dtype=float)
     n = agg["n_trials"].to_numpy(dtype=float)
@@ -1736,6 +2001,19 @@ def fit_with_scipy_logistic(agg: pd.DataFrame) -> dict[str, Any]:
         "neg_log_likelihood": np.nan,
         "deviance": np.nan,
         "aic": np.nan,
+        "pse_se": np.nan,
+        "pse_ci95_lower": np.nan,
+        "pse_ci95_upper": np.nan,
+        "jnd_se": np.nan,
+        "jnd_ci95_lower": np.nan,
+        "jnd_ci95_upper": np.nan,
+        "lapse_rate_se": np.nan,
+        "lapse_rate_ci95_lower": np.nan,
+        "lapse_rate_ci95_upper": np.nan,
+        "n_bootstrap": 0,
+        "n_bootstrap_effective_pse": 0,
+        "n_bootstrap_effective_jnd": 0,
+        "bootstrap_method": "parametric_binomial",
         "fit_quality": "not_fit",
         "fit_warning": "",
     }
@@ -1748,7 +2026,7 @@ def fit_with_scipy_logistic(agg: pd.DataFrame) -> dict[str, Any]:
         out["fit_warning"] = ";".join(warnings + ["insufficient_data"])
         return out
     try:
-        from scipy.optimize import minimize
+        import scipy.optimize  # noqa: F401
     except Exception as exc:
         out["fit_warning"] = ";".join(warnings + [f"scipy_unavailable: {exc}"])
         out["fit_quality"] = "failed"
@@ -1758,17 +2036,6 @@ def fit_with_scipy_logistic(agg: pd.DataFrame) -> dict[str, Any]:
     x_range = max(float(x_max - x_min), 1.0)
     y_obs = np.divide(k, n, out=np.full_like(k, np.nan), where=n > 0)
     mu_guess = float(x[int(np.nanargmin(np.abs(y_obs - 0.5)))]) if np.all(np.isfinite(y_obs)) else float(np.median(x))
-
-    def unpack(params):
-        mu, log_scale, lapse_low, lapse_high = params
-        return float(mu), float(np.exp(log_scale)), float(lapse_low), float(lapse_high)
-
-    def nll(params):
-        mu, scale, lapse_low, lapse_high = unpack(params)
-        if lapse_low + lapse_high >= 0.45:
-            return 1e9
-        p = np.clip(logistic4(x, mu, scale, lapse_low, lapse_high), eps, 1 - eps)
-        return -float(np.sum(k * np.log(p) + (n - k) * np.log(1 - p)))
 
     bounds = [
         (x_min - x_range, x_max + x_range),
@@ -1782,14 +2049,13 @@ def fit_with_scipy_logistic(agg: pd.DataFrame) -> dict[str, Any]:
         [STANDARD_FALLBACK, math.log(max(x_range / 5, 1e-3)), 0.03, 0.03],
         [mu_guess, math.log(max(x_range / 10, 1e-3)), 0.05, 0.05],
     ]
-    best = None
-    for start in starts:
-        result = minimize(nll, start, method="L-BFGS-B", bounds=bounds)
-        if best is None or result.fun < best.fun:
-            best = result
+    best = _fit_logistic_mle_from_starts(x, k, n, starts, bounds, eps)
     if best is None or not best.success:
         warnings.append("optimizer_failed" if best is None else f"optimizer_warning:{best.message}")
-    mu, scale, lapse_low, lapse_high = unpack(best.x)
+    mu = float(best.x[0])
+    scale = float(np.exp(best.x[1]))
+    lapse_low = float(best.x[2])
+    lapse_high = float(best.x[3])
     pse = x_at_probability(0.5, mu, scale, lapse_low, lapse_high)
     x25 = x_at_probability(0.25, mu, scale, lapse_low, lapse_high)
     x75 = x_at_probability(0.75, mu, scale, lapse_low, lapse_high)
@@ -1798,7 +2064,7 @@ def fit_with_scipy_logistic(agg: pd.DataFrame) -> dict[str, Any]:
     slope = amp * y_pse * (1 - y_pse) / scale if np.isfinite(y_pse) and scale > 0 else np.nan
     p_sat = np.clip(y_obs, eps, 1 - eps)
     saturated_nll = -float(np.sum(k * np.log(p_sat) + (n - k) * np.log(1 - p_sat)))
-    nll_value = nll(best.x)
+    nll_value = _logistic_nll(best.x, x, k, n, eps)
     if not np.isfinite(pse):
         warnings.append("pse_outside_lapse_range")
     if not np.isfinite(x25) or not np.isfinite(x75):
@@ -1807,6 +2073,36 @@ def fit_with_scipy_logistic(agg: pd.DataFrame) -> dict[str, Any]:
         warnings.append("very_shallow_fit")
     if lapse_low > 0.15 or lapse_high > 0.15:
         warnings.append("high_lapse_estimate")
+
+    bootstrap_warnings: list[str] = []
+    if n_bootstrap and n_bootstrap > 0:
+        try:
+            samples = _parametric_bootstrap_logistic_pse_jnd(
+                x, n, (mu, scale, lapse_low, lapse_high), starts, bounds,
+                n_bootstrap=n_bootstrap, eps=eps,
+            )
+            pse_summary = _bootstrap_summary(samples["pse"])
+            jnd_summary = _bootstrap_summary(samples["jnd"])
+            lapse_summary = _bootstrap_summary(samples["lapse_rate"])
+            out["pse_se"] = pse_summary["se"]
+            out["pse_ci95_lower"] = pse_summary["ci95_lower"]
+            out["pse_ci95_upper"] = pse_summary["ci95_upper"]
+            out["jnd_se"] = jnd_summary["se"]
+            out["jnd_ci95_lower"] = jnd_summary["ci95_lower"]
+            out["jnd_ci95_upper"] = jnd_summary["ci95_upper"]
+            out["lapse_rate_se"] = lapse_summary["se"]
+            out["lapse_rate_ci95_lower"] = lapse_summary["ci95_lower"]
+            out["lapse_rate_ci95_upper"] = lapse_summary["ci95_upper"]
+            out["n_bootstrap"] = int(n_bootstrap)
+            out["n_bootstrap_effective_pse"] = int(pse_summary["n_effective"])
+            out["n_bootstrap_effective_jnd"] = int(jnd_summary["n_effective"])
+            if pse_summary["n_effective"] < MIN_BOOTSTRAP_FOR_CI:
+                bootstrap_warnings.append("bootstrap_pse_unstable")
+            if jnd_summary["n_effective"] < MIN_BOOTSTRAP_FOR_CI:
+                bootstrap_warnings.append("bootstrap_jnd_unstable")
+        except Exception as exc:  # pragma: no cover - bootstrap is best-effort
+            bootstrap_warnings.append(f"bootstrap_failed: {exc}")
+
     out.update(
         {
             "mu": mu,
@@ -1823,31 +2119,45 @@ def fit_with_scipy_logistic(agg: pd.DataFrame) -> dict[str, Any]:
             "deviance": max(0.0, 2 * (nll_value - saturated_nll)),
             "aic": 8 + 2 * nll_value,
             "fit_quality": "ok" if not warnings else "warning",
-            "fit_warning": ";".join(warnings),
+            "fit_warning": ";".join(warnings + bootstrap_warnings),
         }
     )
     return out
 
 
-def fit_one_condition(agg: pd.DataFrame, psignifit_available: bool) -> dict[str, Any]:
-    scipy_fit = fit_with_scipy_logistic(agg)
+def fit_one_condition(
+    agg: pd.DataFrame,
+    psignifit_available: bool,
+    n_bootstrap: int = DEFAULT_FIT_BOOTSTRAP_N,
+) -> dict[str, Any]:
+    scipy_fit = fit_with_scipy_logistic(agg, n_bootstrap=n_bootstrap)
     psig_fit, psig_status = fit_with_psignifit_if_possible(agg, psignifit_available)
     if psig_fit is not None and np.isfinite(psig_fit.get("pse", np.nan)):
         out = {**scipy_fit, **psig_fit}
         for key in ["mu", "scale", "lapse_low", "lapse_high"]:
             out[f"scipy_{key}"] = scipy_fit.get(key, np.nan)
+        for ci_key in ("pse_se", "pse_ci95_lower", "pse_ci95_upper", "jnd_se", "jnd_ci95_lower", "jnd_ci95_upper"):
+            scipy_value = scipy_fit.get(ci_key, np.nan)
+            if np.isfinite(scipy_value):
+                out[f"scipy_{ci_key}"] = scipy_value
         out["psignifit_status"] = psig_status
         return out
     scipy_fit["psignifit_status"] = psig_status
     return scipy_fit
 
 
-def fit_conditions(agg: pd.DataFrame, group_cols: list[str], psignifit_available: bool = False) -> pd.DataFrame:
+def fit_conditions(
+    agg: pd.DataFrame,
+    group_cols: list[str],
+    psignifit_available: bool = False,
+    *,
+    n_bootstrap: int = DEFAULT_FIT_BOOTSTRAP_N,
+) -> pd.DataFrame:
     rows = []
     for keys, g in agg.groupby(group_cols, dropna=False):
         if not isinstance(keys, tuple):
             keys = (keys,)
-        fit = fit_one_condition(g, psignifit_available)
+        fit = fit_one_condition(g, psignifit_available, n_bootstrap=n_bootstrap)
         for key, value in zip(group_cols, keys):
             fit[key] = value
         fit["n_trials"] = int(g["n_trials"].sum())
@@ -1861,7 +2171,41 @@ def fit_conditions(agg: pd.DataFrame, group_cols: list[str], psignifit_available
     if out.empty:
         return out
     out = add_fit_delta_columns(out)
-    preferred = group_cols + ["fit_method", "pse", "jnd", "pse_delta_from_standard", "weber_fraction", "jnd_over_standard", "x25", "x75", "slope_at_pse", "lapse_rate", "lapse_low", "lapse_high", "fit_quality", "fit_warning", "n_trials", "n_stimulus_levels", "deviance", "aic", "psignifit_status"]
+    preferred = group_cols + [
+        "fit_method",
+        "pse",
+        "pse_se",
+        "pse_ci95_lower",
+        "pse_ci95_upper",
+        "pse_delta_from_standard",
+        "pse_delta_ci95_lower",
+        "pse_delta_ci95_upper",
+        "standard_inside_pse_ci95",
+        "pse_bias_p_value",
+        "jnd",
+        "jnd_se",
+        "jnd_ci95_lower",
+        "jnd_ci95_upper",
+        "weber_fraction",
+        "jnd_over_standard",
+        "x25",
+        "x75",
+        "slope_at_pse",
+        "lapse_rate",
+        "lapse_rate_ci95_lower",
+        "lapse_rate_ci95_upper",
+        "lapse_low",
+        "lapse_high",
+        "fit_quality",
+        "fit_warning",
+        "n_trials",
+        "n_stimulus_levels",
+        "n_bootstrap",
+        "bootstrap_method",
+        "deviance",
+        "aic",
+        "psignifit_status",
+    ]
     return out[[c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]]
 
 
@@ -1875,10 +2219,15 @@ def subject_average_psychometric(clean: pd.DataFrame, group_cols: list[str]) -> 
             n_subjects=("subject_id", "nunique"),
             n_data_points=("n_trials", "sum"),
             mean_p_comparison_greater=("p_comparison_greater", "mean"),
+            mean_p_comparison_less=("p_comparison_less", "mean"),
             median_p_comparison_greater=("p_comparison_greater", "median"),
+            median_p_comparison_less=("p_comparison_less", "median"),
             sem_p_comparison_greater=("p_comparison_greater", lambda x: float(pd.Series(x).std(ddof=1) / math.sqrt(len(x))) if len(x) > 1 else np.nan),
+            sem_p_comparison_less=("p_comparison_less", lambda x: float(pd.Series(x).std(ddof=1) / math.sqrt(len(x))) if len(x) > 1 else np.nan),
             p_comparison_greater_ci95_lower=("p_comparison_greater", _mean_ci95_lower),
             p_comparison_greater_ci95_upper=("p_comparison_greater", _mean_ci95_upper),
+            p_comparison_less_ci95_lower=("p_comparison_less", _mean_ci95_lower),
+            p_comparison_less_ci95_upper=("p_comparison_less", _mean_ci95_upper),
             total_trials=("n_trials", "sum"),
             median_rt=("median_rt", "median"),
             mean_rt=("mean_rt", "mean"),
@@ -1888,11 +2237,15 @@ def subject_average_psychometric(clean: pd.DataFrame, group_cols: list[str]) -> 
             log_reaction_time_ci95_lower=("mean_log_reaction_time", _mean_ci95_lower),
             log_reaction_time_ci95_upper=("mean_log_reaction_time", _mean_ci95_upper),
             standard_value=("standard_value", "median"),
+            comparison_over_standard=("comparison_over_standard", "median"),
+            signed_delta_over_standard=("signed_delta_over_standard", "median"),
+            abs_delta_over_standard=("abs_delta_over_standard", "median"),
         )
         .reset_index()
         .sort_values(group_cols + ["comparison_value"])
     )
-    return _add_log_reverse_columns(out)
+    out = add_delta_and_less_response_columns(_add_log_reverse_columns(out))
+    return out.sort_values(group_cols + ["delta_comparison_minus_standard"]).reset_index(drop=True)
 
 
 def compute_order_effects(clean: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -2045,7 +2398,13 @@ def _subject_sort_key(value: Any) -> tuple[int, int, str]:
 
 
 def add_fit_delta_columns(fits: pd.DataFrame) -> pd.DataFrame:
-    """Add PSE/JND columns expressed as comparison-standard deltas."""
+    """Add PSE/JND columns expressed as comparison-standard deltas.
+
+    Also propagates the per-fit standard error / 95% CI on the PSE to the
+    delta-from-standard scale and adds a ``standard_inside_pse_ci95`` boolean
+    plus a Wald-style ``pse_bias_p_value`` so callers can immediately tell
+    whether each fit's PSE is statistically distinguishable from the standard.
+    """
     if fits.empty:
         return fits.copy()
     out = add_psychophysics_context_columns(fits)
@@ -2059,16 +2418,99 @@ def add_fit_delta_columns(fits: pd.DataFrame) -> pd.DataFrame:
         out["pse_delta_standard_minus_comparison"] = -out["pse_delta_comparison_minus_standard"]
         out["pse_delta_from_standard"] = out["pse_delta_comparison_minus_standard"]
         out["abs_pse_delta_from_standard"] = out["pse_delta_from_standard"].abs()
+        if "pse_ci95_lower" in out and "pse_ci95_upper" in out:
+            pse_ci_lower = pd.to_numeric(out["pse_ci95_lower"], errors="coerce")
+            pse_ci_upper = pd.to_numeric(out["pse_ci95_upper"], errors="coerce")
+            out["pse_delta_ci95_lower"] = pse_ci_lower - standard
+            out["pse_delta_ci95_upper"] = pse_ci_upper - standard
+            inside = (pse_ci_lower <= standard) & (pse_ci_upper >= standard)
+            inside_mask = pse_ci_lower.notna() & pse_ci_upper.notna()
+            out["standard_inside_pse_ci95"] = pd.Series(
+                np.where(inside_mask, inside, np.nan), index=out.index, dtype="object"
+            )
+        if "pse_se" in out:
+            pse_se = pd.to_numeric(out["pse_se"], errors="coerce")
+            out["pse_delta_se"] = pse_se
+            with np.errstate(divide="ignore", invalid="ignore"):
+                z = np.where(pse_se > 0, (pse - standard) / pse_se, np.nan)
+            try:
+                from scipy.stats import norm  # type: ignore
+                p_value = 2.0 * (1.0 - norm.cdf(np.abs(z)))
+            except Exception:
+                p_value = np.where(np.isfinite(z), np.exp(-0.717 * np.abs(z) - 0.416 * z * z), np.nan)
+            out["pse_bias_p_value"] = pd.Series(p_value, index=out.index)
     if "jnd" in out:
         jnd = pd.to_numeric(out["jnd"], errors="coerce")
         out["jnd_over_standard"] = np.where(standard > 0, jnd / standard, np.nan)
         out["weber_fraction"] = out["jnd_over_standard"]
+        if "jnd_ci95_lower" in out and "jnd_ci95_upper" in out:
+            jnd_ci_lower = pd.to_numeric(out["jnd_ci95_lower"], errors="coerce")
+            jnd_ci_upper = pd.to_numeric(out["jnd_ci95_upper"], errors="coerce")
+            out["jnd_over_standard_ci95_lower"] = np.where(standard > 0, jnd_ci_lower / standard, np.nan)
+            out["jnd_over_standard_ci95_upper"] = np.where(standard > 0, jnd_ci_upper / standard, np.nan)
     return out
 
 
 def _fit_row_to_delta_predictions(fit_row: pd.Series, standard_value: float, delta_grid: np.ndarray) -> np.ndarray:
     comparison_grid = standard_value + delta_grid
     return predictions_from_fit_row(fit_row, comparison_grid)
+
+
+def pse_bias_summary(fits: pd.DataFrame, group_cols: Optional[list[str]] = None) -> pd.DataFrame:
+    """Return a compact bias sanity-check table for PSE fits.
+
+    Columns mirror what a reviewer expects to see next to every psychometric
+    fit: PSE, SE, 95% CI on the original stimulus axis, the same on the
+    comparison-minus-standard axis, a boolean flag telling whether the
+    standard value sits inside the CI (no significant bias), and the Wald
+    p-value for the bias.
+    """
+    if fits is None or fits.empty:
+        return pd.DataFrame()
+    enriched = add_fit_delta_columns(fits)
+    keep = []
+    if group_cols:
+        for col in group_cols:
+            if col in enriched.columns:
+                keep.append(col)
+    elif "subject_id" in enriched.columns:
+        keep.append("subject_id")
+    if "finger_condition" in enriched.columns and "finger_condition" not in keep:
+        keep.append("finger_condition")
+    columns = keep + [
+        "n_trials",
+        "n_stimulus_levels",
+        "fit_method",
+        "standard_value",
+        "pse",
+        "pse_se",
+        "pse_ci95_lower",
+        "pse_ci95_upper",
+        "pse_delta_from_standard",
+        "pse_delta_ci95_lower",
+        "pse_delta_ci95_upper",
+        "standard_inside_pse_ci95",
+        "pse_bias_p_value",
+        "jnd",
+        "jnd_ci95_lower",
+        "jnd_ci95_upper",
+        "lapse_rate",
+        "fit_warning",
+    ]
+    present = [c for c in columns if c in enriched.columns]
+    out = enriched[present].copy()
+    if "standard_inside_pse_ci95" in out.columns:
+        flag = out["standard_inside_pse_ci95"]
+        out["bias_verdict"] = np.where(
+            flag.isna(),
+            "no_ci",
+            np.where(
+                flag.astype(bool),
+                "standard within 95% CI (no significant bias)",
+                "standard OUTSIDE 95% CI (significant bias)",
+            ),
+        )
+    return out
 
 
 def _select_typical_subject_for_psychometric_overlay(
@@ -2096,6 +2538,31 @@ def _select_typical_subject_for_psychometric_overlay(
     summary["distance_from_group_median"] = (summary["median_abs_pse_delta"] - group_median).abs()
     summary = summary.sort_values(["distance_from_group_median", "median_jnd", "subject_id"])
     return str(summary.iloc[0]["subject_id"])
+
+
+_METRIC_CI_COLUMN_HINTS: dict[str, tuple[str, str]] = {
+    "pse": ("pse_ci95_lower", "pse_ci95_upper"),
+    "pse_delta_comparison_minus_standard": ("pse_delta_ci95_lower", "pse_delta_ci95_upper"),
+    "pse_delta_from_standard": ("pse_delta_ci95_lower", "pse_delta_ci95_upper"),
+    "jnd": ("jnd_ci95_lower", "jnd_ci95_upper"),
+    "jnd_over_standard": ("jnd_over_standard_ci95_lower", "jnd_over_standard_ci95_upper"),
+    "weber_fraction": ("jnd_over_standard_ci95_lower", "jnd_over_standard_ci95_upper"),
+}
+
+
+def _metric_error_bars(plot_df: pd.DataFrame, metric_col: str) -> Optional[tuple[pd.Series, pd.Series]]:
+    """Return ``(lower_err, upper_err)`` for ``metric_col`` if CI columns exist."""
+    lower_col, upper_col = _METRIC_CI_COLUMN_HINTS.get(metric_col, (None, None))
+    if not lower_col or lower_col not in plot_df.columns or upper_col not in plot_df.columns:
+        return None
+    metric = pd.to_numeric(plot_df[metric_col], errors="coerce")
+    lower = pd.to_numeric(plot_df[lower_col], errors="coerce")
+    upper = pd.to_numeric(plot_df[upper_col], errors="coerce")
+    if lower.isna().all() or upper.isna().all():
+        return None
+    lower_err = (metric - lower).clip(lower=0)
+    upper_err = (upper - metric).clip(lower=0)
+    return lower_err, upper_err
 
 
 def _plot_article_style_metric_lines(
@@ -2132,6 +2599,8 @@ def _plot_article_style_metric_lines(
     if plot_df.empty:
         return None
 
+    error_bars = _metric_error_bars(plot_df, metric_col)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(6.8, 4.8))
     style_palette = _subject_palette(plot_df["subject_id"]) if style_col == "subject_id" and "subject_id" in plot_df else None
@@ -2139,6 +2608,21 @@ def _plot_article_style_metric_lines(
         g = g.sort_values("_x_num")
         line_color = style_palette.get(str(subject), "0.70") if style_palette is not None else "0.70"
         ax.plot(g["_x_num"], g[metric_col], color=line_color, linewidth=1.1, alpha=0.70, zorder=1)
+        if error_bars is not None:
+            lower_err, upper_err = error_bars
+            err = np.vstack([lower_err.loc[g.index].fillna(0).to_numpy(), upper_err.loc[g.index].fillna(0).to_numpy()])
+            if np.any(err > 0):
+                ax.errorbar(
+                    g["_x_num"],
+                    g[metric_col],
+                    yerr=err,
+                    fmt="none",
+                    ecolor=line_color,
+                    alpha=0.45,
+                    elinewidth=0.8,
+                    capsize=2,
+                    zorder=1,
+                )
         if style_col and style_col in g:
             for _, row in g.iterrows():
                 style = FINGER_STYLE.get(str(row.get(style_col)), {})
@@ -2156,17 +2640,23 @@ def _plot_article_style_metric_lines(
                 )
         else:
             ax.scatter(g["_x_num"], g[metric_col], color="0.35", s=35, alpha=0.8, zorder=2)
-    group = plot_df.groupby("_x_num", dropna=False)[metric_col].agg(["mean", "sem"]).reset_index()
+    group = (
+        plot_df.groupby("_x_num", dropna=False)[metric_col]
+        .agg(["mean", "std", "count", "sem"])
+        .reset_index()
+    )
+    group["sem"] = group["sem"].fillna(group["std"])
+    group["ci95"] = np.where(group["count"] > 1, 1.96 * group["sem"], 0.0)
     ax.errorbar(
         group["_x_num"],
         group["mean"],
-        yerr=group["sem"],
+        yerr=group["ci95"],
         color="black",
         linestyle=":",
         marker="o",
         linewidth=2.5,
         capsize=4,
-        label="Group mean",
+        label="Group mean (95% CI across subjects)",
         zorder=3,
     )
     ax.axhline(0, color="0.35", linestyle="--", linewidth=1) if "PSE" in ylabel or "slope" in ylabel.lower() else None
@@ -2175,6 +2665,17 @@ def _plot_article_style_metric_lines(
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
+    if error_bars is not None and ("PSE" in ylabel or "JND" in ylabel):
+        ax.text(
+            0.02,
+            0.02,
+            "Subject error bars: per-fit 95% CI (parametric bootstrap)",
+            transform=ax.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=7,
+            color="0.35",
+        )
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=fig_dpi)
@@ -2222,7 +2723,8 @@ def save_article_style_psychophysics_figures(
                 fit_rows = sub_fits[sub_fits["finger_condition"] == finger]
                 if g.empty:
                     continue
-                g["delta"] = pd.to_numeric(g["comparison_value"], errors="coerce") - pd.to_numeric(g["standard_value"], errors="coerce")
+                g = add_delta_and_less_response_columns(g)
+                g["delta"] = g["delta_comparison_minus_standard"]
                 g = g.sort_values("delta")
                 ax.scatter(
                     g["delta"],
@@ -2248,8 +2750,12 @@ def save_article_style_psychophysics_figures(
             ax.axhline(0.5, color="0.35", linestyle=":", linewidth=1)
             ax.axvline(0, color="black", linestyle=":", linewidth=1)
             ax.set_ylim(-0.05, 1.05)
-            ax.set_xlabel("Comparison stiffness - standard stiffness")
-            ax.set_ylabel("P(response comparison felt stiffer)")
+            set_psychometric_delta_axis(
+                ax,
+                pd.to_numeric(sub_agg["comparison_value"], errors="coerce")
+                - pd.to_numeric(sub_agg["standard_value"], errors="coerce"),
+            )
+            ax.set_ylabel(PSYCHOMETRIC_GREATER_Y_LABEL)
             ax.set_title(f"Article-style psychometric curves, participant {selected_subject}")
             ax.legend(loc="best", fontsize=8)
             fig.tight_layout()
@@ -2259,10 +2765,9 @@ def save_article_style_psychophysics_figures(
             paths.append(out)
 
     if not psychometric_input_by_subject_finger.empty and not fits.empty:
-        subject_agg = psychometric_input_by_subject_finger.copy()
-        subject_agg["delta"] = pd.to_numeric(subject_agg["comparison_value"], errors="coerce") - pd.to_numeric(subject_agg["standard_value"], errors="coerce")
+        subject_agg = add_delta_and_less_response_columns(psychometric_input_by_subject_finger)
+        subject_agg["delta"] = subject_agg["delta_comparison_minus_standard"]
         group_agg = subject_agg.copy()
-        group_agg["delta"] = pd.to_numeric(group_agg["comparison_value"], errors="coerce") - pd.to_numeric(group_agg["standard_value"], errors="coerce")
         group_agg = (
             group_agg.groupby(["finger_condition", "delta"], dropna=False)
             .agg(
@@ -2306,8 +2811,8 @@ def save_article_style_psychophysics_figures(
         ax.axhline(0.5, color="0.35", linestyle=":", linewidth=1)
         ax.axvline(0, color="black", linestyle=":", linewidth=1)
         ax.set_ylim(-0.05, 1.05)
-        ax.set_xlabel("Comparison stiffness - standard stiffness")
-        ax.set_ylabel("Mean P(response comparison felt stiffer)")
+        set_psychometric_delta_axis(ax, group_agg["delta"])
+        ax.set_ylabel(PSYCHOMETRIC_MEAN_GREATER_Y_LABEL)
         ax.set_title("Group psychometric data by finger")
         ax.legend(loc="best", fontsize=8)
         fig.tight_layout()
@@ -2364,9 +2869,9 @@ def save_article_style_psychophysics_figures(
                 ax.axhline(0.5, color="0.35", linestyle=":", linewidth=1)
                 ax.axvline(0, color="black", linestyle=":", linewidth=1)
                 ax.set_ylim(-0.05, 1.05)
-                ax.set_xlabel("Comparison stiffness - standard stiffness")
+                set_psychometric_delta_axis(ax, subj_panel["delta"])
                 ax.set_title(f"{setup} group")
-            axes[0].set_ylabel("Mean P(response comparison felt stiffer)")
+            axes[0].set_ylabel(PSYCHOMETRIC_MEAN_GREATER_Y_LABEL)
             axes[1].legend(loc="best", fontsize=8)
             fig.suptitle("Psychometric curves by group (individual fits faded)")
             fig.tight_layout()
@@ -2786,7 +3291,12 @@ def save_xy_probing_skin_stretch_figures(
 
 
 # ---------------------------------------------------------------------------
-# Experiment-group comparison section (N_E, L_E, L_P)
+# Experiment-group comparison section.
+#
+# Main experiment-group analyses intentionally contain only *_E subjects
+# (N_E/L_E). Protocol/pilot subjects (*_P, currently N_P/L_P in the data) are
+# summarized separately because their comparison-stiffness values differ and
+# would otherwise make psychometric axes/group summaries misleading.
 
 PSYCHOPHYSICS_GROUP_METRICS = [
     "correct_response",
@@ -2808,13 +3318,25 @@ PSYCHOPHYSICS_GROUP_METRICS = [
 
 PSYCHOPHYSICS_FIT_GROUP_METRICS = [
     "pse",
+    "pse_se",
+    "pse_ci95_lower",
+    "pse_ci95_upper",
     "jnd",
+    "jnd_se",
+    "jnd_ci95_lower",
+    "jnd_ci95_upper",
     "pse_delta_from_standard",
+    "pse_delta_se",
+    "pse_delta_ci95_lower",
+    "pse_delta_ci95_upper",
+    "pse_bias_p_value",
     "jnd_over_standard",
     "weber_fraction",
     "abs_pse_delta_from_standard",
     "slope_at_pse",
     "lapse_rate",
+    "lapse_rate_ci95_lower",
+    "lapse_rate_ci95_upper",
     "n_trials",
 ]
 
@@ -2855,6 +3377,20 @@ def _psychophysics_fit_condition_columns(df: pd.DataFrame, base: list[str]) -> l
         df,
         [*base, "workspace_setup", "protocol_factor", "sex_factor", "age_group"],
     )
+
+
+def _experiment_only_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    prepared = add_experiment_group_columns(df)
+    return prepared[prepared["experiment_group"].notna()].copy()
+
+
+def _protocol_only_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    prepared = add_protocol_group_columns(df)
+    return prepared[prepared["protocol_group"].notna()].copy()
 
 
 def _subject_level_trial_table(trial_data: pd.DataFrame) -> pd.DataFrame:
@@ -3054,6 +3590,7 @@ def compute_psychophysics_factor_statistics(
 
     factor_candidates = [
         "experiment_group",
+        "protocol_group",
         "subject_group",
         "setup_factor",
         "workspace_setup",
@@ -3071,6 +3608,8 @@ def compute_psychophysics_factor_statistics(
         ("experiment_group", "finger_condition"),
         ("experiment_group", "comparison_value"),
         ("experiment_group", "success_label"),
+        ("protocol_group", "finger_condition"),
+        ("protocol_group", "comparison_value"),
         ("workspace_setup", "finger_condition"),
         ("workspace_setup", "comparison_value"),
         ("sex_factor", "finger_condition"),
@@ -3119,34 +3658,44 @@ def compute_experiment_group_comparisons(
         trial_data = add_success_and_time_columns(trial_data)
     elif not trial_data.empty:
         trial_data = add_psychophysics_context_columns(trial_data)
-    trial_condition_cols = _psychophysics_trial_condition_columns(trial_data)
+    trial_experiment = _experiment_only_rows(trial_data)
+    trial_protocol = _protocol_only_rows(trial_data)
 
     tables: dict[str, pd.DataFrame] = {}
     _add_prefixed_tables(
         tables,
         "psychophysics_trial",
         compute_group_comparison_tables(
-            trial_data,
+            trial_experiment,
             metric_columns=PSYCHOPHYSICS_GROUP_METRICS,
-            condition_cols=trial_condition_cols,
+            condition_cols=_psychophysics_trial_condition_columns(trial_experiment),
         ),
     )
     _add_prefixed_tables(
         tables,
         "psychophysics_trial",
         compute_analysis_scope_tables(
-            trial_data,
+            trial_experiment,
             metric_columns=PSYCHOPHYSICS_GROUP_METRICS,
-            condition_cols=trial_condition_cols,
+            condition_cols=_psychophysics_trial_condition_columns(trial_experiment),
         ),
     )
     _add_prefixed_tables(
         tables,
         "psychophysics_trial",
         compute_setup_factor_tables(
-            trial_data,
+            trial_experiment,
             metric_columns=PSYCHOPHYSICS_GROUP_METRICS,
-            condition_cols=trial_condition_cols,
+            condition_cols=_psychophysics_trial_condition_columns(trial_experiment),
+        ),
+    )
+    _add_prefixed_tables(
+        tables,
+        "psychophysics_trial",
+        compute_protocol_group_comparison_tables(
+            trial_protocol,
+            metric_columns=PSYCHOPHYSICS_GROUP_METRICS,
+            condition_cols=_psychophysics_trial_condition_columns(trial_protocol),
         ),
     )
 
@@ -3154,45 +3703,68 @@ def compute_experiment_group_comparisons(
         ("psychophysics_fit_by_subject_finger", pse_jnd_by_subject_finger, ["finger_condition"]),
         ("psychophysics_fit_subject_pooled", pse_jnd_subject_pooled, []),
     ]
+    fit_experiment_sources: dict[str, pd.DataFrame] = {}
+    fit_protocol_sources: dict[str, pd.DataFrame] = {}
     for prefix, fit_df, condition_cols in fit_sources:
         source = fit_df if fit_df is not None else pd.DataFrame()
         if not source.empty:
             source = add_fit_delta_columns(source)
-            condition_cols = _psychophysics_fit_condition_columns(source, condition_cols)
+        source_experiment = _experiment_only_rows(source)
+        source_protocol = _protocol_only_rows(source)
+        fit_experiment_sources[prefix] = source_experiment
+        fit_protocol_sources[prefix] = source_protocol
         _add_prefixed_tables(
             tables,
             prefix,
             compute_group_comparison_tables(
-                source,
+                source_experiment,
                 metric_columns=PSYCHOPHYSICS_FIT_GROUP_METRICS,
-                condition_cols=condition_cols,
+                condition_cols=_psychophysics_fit_condition_columns(source_experiment, condition_cols),
             ),
         )
         _add_prefixed_tables(
             tables,
             prefix,
             compute_analysis_scope_tables(
-                source,
+                source_experiment,
                 metric_columns=PSYCHOPHYSICS_FIT_GROUP_METRICS,
-                condition_cols=condition_cols,
+                condition_cols=_psychophysics_fit_condition_columns(source_experiment, condition_cols),
             ),
         )
         _add_prefixed_tables(
             tables,
             prefix,
             compute_setup_factor_tables(
-                source,
+                source_experiment,
                 metric_columns=PSYCHOPHYSICS_FIT_GROUP_METRICS,
-                condition_cols=condition_cols,
+                condition_cols=_psychophysics_fit_condition_columns(source_experiment, condition_cols),
+            ),
+        )
+        _add_prefixed_tables(
+            tables,
+            prefix,
+            compute_protocol_group_comparison_tables(
+                source_protocol,
+                metric_columns=PSYCHOPHYSICS_FIT_GROUP_METRICS,
+                condition_cols=_psychophysics_fit_condition_columns(source_protocol, condition_cols),
             ),
         )
     tables.update(
         compute_psychophysics_factor_statistics(
-            clean,
-            pse_jnd_by_subject_finger=pse_jnd_by_subject_finger,
-            pse_jnd_subject_pooled=pse_jnd_subject_pooled,
+            trial_experiment,
+            pse_jnd_by_subject_finger=fit_experiment_sources.get("psychophysics_fit_by_subject_finger"),
+            pse_jnd_subject_pooled=fit_experiment_sources.get("psychophysics_fit_subject_pooled"),
         )
     )
+    protocol_factor_tables = compute_psychophysics_factor_statistics(
+        trial_protocol,
+        pse_jnd_by_subject_finger=fit_protocol_sources.get("psychophysics_fit_by_subject_finger"),
+        pse_jnd_subject_pooled=fit_protocol_sources.get("psychophysics_fit_subject_pooled"),
+    )
+    if "psychophysics_factor_statistics" in protocol_factor_tables:
+        tables["psychophysics_protocol_factor_statistics"] = protocol_factor_tables["psychophysics_factor_statistics"]
+    if "psychophysics_factor_statistics_status" in protocol_factor_tables:
+        tables["psychophysics_protocol_factor_statistics_status"] = protocol_factor_tables["psychophysics_factor_statistics_status"]
     return tables
 
 
@@ -3250,6 +3822,10 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
         "pse_jnd_subject_pooled.csv",
         "pse_jnd_group_by_finger.csv",
         "pse_jnd_group_all_pooled.csv",
+        "pse_bias_by_subject_finger.csv",
+        "pse_bias_subject_pooled.csv",
+        "pse_bias_group_by_finger.csv",
+        "pse_bias_group_all_pooled.csv",
         "order_effects_summary.csv",
         "success_summary_by_subject.csv",
         "success_summary_by_subject_finger.csv",
@@ -3333,32 +3909,33 @@ def plot_fit_curve(
 
     if background_agg is not None and background_fits is not None and not background_agg.empty and not background_fits.empty:
         for _, bg_fit in background_fits.iterrows():
-            bg = background_agg.copy()
+            bg = add_delta_and_less_response_columns(background_agg)
             if "subject_id" in bg and "subject_id" in bg_fit:
                 bg = bg[bg["subject_id"].astype(str) == str(bg_fit["subject_id"])]
             if "finger_condition" in bg and "finger_condition" in bg_fit:
                 bg = bg[bg["finger_condition"].astype(str) == str(bg_fit["finger_condition"])]
-            bg = bg.dropna(subset=["comparison_value", "p_comparison_greater"])
+            bg = bg.dropna(subset=["delta_comparison_minus_standard", "p_comparison_greater"])
             if len(bg) < 2:
                 continue
-            x_bg = np.linspace(float(bg["comparison_value"].min()), float(bg["comparison_value"].max()), 200)
-            y_bg = predictions_from_fit_row(bg_fit, x_bg)
+            x_bg = np.linspace(float(bg["delta_comparison_minus_standard"].min()), float(bg["delta_comparison_minus_standard"].max()), 200)
+            std_bg = float(pd.to_numeric(bg["standard_value"], errors="coerce").median())
+            y_bg = _fit_row_to_delta_predictions(bg_fit, std_bg, x_bg)
             if np.isfinite(y_bg).any():
                 ax.plot(x_bg, y_bg, color=_finger_color(bg_fit.get("finger_condition", finger), "0.45"), alpha=0.12, linewidth=0.9, zorder=1)
 
-    agg = agg.sort_values("comparison_value").copy()
+    agg = add_delta_and_less_response_columns(agg).sort_values("delta_comparison_minus_standard").copy()
     if {"p_comparison_greater_ci95_lower", "p_comparison_greater_ci95_upper"}.issubset(agg.columns):
         yerr = np.vstack([
             agg["p_comparison_greater"] - agg["p_comparison_greater_ci95_lower"],
             agg["p_comparison_greater_ci95_upper"] - agg["p_comparison_greater"],
         ])
-        ax.errorbar(agg["comparison_value"], agg["p_comparison_greater"], yerr=yerr, fmt="none", ecolor="0.35", alpha=0.65, capsize=3, zorder=2)
+        ax.errorbar(agg["delta_comparison_minus_standard"], agg["p_comparison_greater"], yerr=yerr, fmt="none", ecolor="0.35", alpha=0.65, capsize=3, zorder=2)
 
-    comparison_values = pd.to_numeric(agg["comparison_value"], errors="coerce")
+    delta_values = pd.to_numeric(agg["delta_comparison_minus_standard"], errors="coerce")
     scatter = ax.scatter(
-        agg["comparison_value"],
+        agg["delta_comparison_minus_standard"],
         agg["p_comparison_greater"],
-        c=comparison_values,
+        c=delta_values,
         cmap=STIFFNESS_CMAP,
         s=42,
         edgecolor="black",
@@ -3367,25 +3944,71 @@ def plot_fit_curve(
         label="Observed mean",
         zorder=3,
     )
-    if comparison_values.nunique(dropna=True) > 1:
+    if delta_values.nunique(dropna=True) > 1:
         cbar = fig.colorbar(scatter, ax=ax, pad=0.02)
-        cbar.set_label("Comparison stiffness")
+        cbar.set_label(PSYCHOMETRIC_DELTA_AXIS_LABEL)
 
     if len(agg) >= 2:
-        x_grid = np.linspace(float(agg["comparison_value"].min()), float(agg["comparison_value"].max()), 300)
-        y_grid = predictions_from_fit_row(fit_row, x_grid)
+        x_grid = np.linspace(float(agg["delta_comparison_minus_standard"].min()), float(agg["delta_comparison_minus_standard"].max()), 300)
+        std = float(pd.to_numeric(agg["standard_value"], errors="coerce").median())
+        y_grid = _fit_row_to_delta_predictions(fit_row, std, x_grid)
         if np.isfinite(y_grid).any():
             ax.plot(x_grid, y_grid, color=curve_color, linewidth=2.2, label="Fit", zorder=4)
-    pse = fit_row.get("pse", np.nan)
+    pse = pd.to_numeric(pd.Series([fit_row.get("pse_delta_comparison_minus_standard", np.nan)]), errors="coerce").iloc[0]
+    if not np.isfinite(pse) and "pse" in fit_row and "standard_value" in agg and agg["standard_value"].notna().any():
+        fit_pse = pd.to_numeric(pd.Series([fit_row.get("pse")]), errors="coerce").iloc[0]
+        pse = fit_pse - float(pd.to_numeric(agg["standard_value"], errors="coerce").median())
+    pse_ci_lower_delta = pd.to_numeric(pd.Series([fit_row.get("pse_delta_ci95_lower", np.nan)]), errors="coerce").iloc[0]
+    pse_ci_upper_delta = pd.to_numeric(pd.Series([fit_row.get("pse_delta_ci95_upper", np.nan)]), errors="coerce").iloc[0]
+    if (not (np.isfinite(pse_ci_lower_delta) and np.isfinite(pse_ci_upper_delta))) and "standard_value" in agg and agg["standard_value"].notna().any():
+        std_for_ci = float(pd.to_numeric(agg["standard_value"], errors="coerce").median())
+        pse_ci_lower_raw = pd.to_numeric(pd.Series([fit_row.get("pse_ci95_lower", np.nan)]), errors="coerce").iloc[0]
+        pse_ci_upper_raw = pd.to_numeric(pd.Series([fit_row.get("pse_ci95_upper", np.nan)]), errors="coerce").iloc[0]
+        if np.isfinite(pse_ci_lower_raw):
+            pse_ci_lower_delta = pse_ci_lower_raw - std_for_ci
+        if np.isfinite(pse_ci_upper_raw):
+            pse_ci_upper_delta = pse_ci_upper_raw - std_for_ci
+    standard_inside_ci = bool(np.isfinite(pse_ci_lower_delta) and np.isfinite(pse_ci_upper_delta) and pse_ci_lower_delta <= 0 <= pse_ci_upper_delta)
     if np.isfinite(pse):
-        ax.axvline(float(pse), color=curve_color, linestyle="--", linewidth=1.5, label=f"PSE={pse:.2f}")
-    if "standard_value" in agg and agg["standard_value"].notna().any():
-        std = float(agg["standard_value"].median())
-        ax.axvline(std, color="black", linestyle=":", linewidth=1, label=f"standard={std:g}")
+        pse_label = f"PSE shift={pse:.2f}"
+        if np.isfinite(pse_ci_lower_delta) and np.isfinite(pse_ci_upper_delta):
+            pse_label += f" [{pse_ci_lower_delta:.2f}, {pse_ci_upper_delta:.2f}]"
+        ax.axvline(float(pse), color=curve_color, linestyle="--", linewidth=1.5, label=pse_label)
+        if np.isfinite(pse_ci_lower_delta) and np.isfinite(pse_ci_upper_delta):
+            ax.axvspan(float(pse_ci_lower_delta), float(pse_ci_upper_delta), color=curve_color, alpha=0.10, zorder=0)
+            ax.errorbar(
+                [float(pse)],
+                [0.5],
+                xerr=[[max(0.0, float(pse) - float(pse_ci_lower_delta))], [max(0.0, float(pse_ci_upper_delta) - float(pse))]],
+                fmt="o",
+                color=curve_color,
+                ecolor=curve_color,
+                elinewidth=1.6,
+                capsize=4,
+                markersize=5,
+                zorder=5,
+                label="95% CI on PSE",
+            )
+        bias_p = pd.to_numeric(pd.Series([fit_row.get("pse_bias_p_value", np.nan)]), errors="coerce").iloc[0]
+        bias_text_lines = [f"standard {'INSIDE' if standard_inside_ci else 'OUTSIDE'} 95% CI"]
+        if np.isfinite(bias_p):
+            bias_text_lines.append(f"Wald p={bias_p:.3g}")
+        ax.text(
+            0.02,
+            0.98,
+            "\n".join(bias_text_lines),
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+            color="black",
+            bbox=dict(facecolor="white", alpha=0.7, edgecolor="0.6", linewidth=0.5),
+        )
+    ax.axvline(0, color="black", linestyle=":", linewidth=1, label="standard (delta=0)")
     ax.axhline(0.5, color="gray", linestyle=":", linewidth=1)
     ax.set_ylim(-0.05, 1.05)
-    ax.set_xlabel("Comparison stimulus value (physical units)")
-    ax.set_ylabel("P(response comparison greater)")
+    set_psychometric_delta_axis(ax, agg["delta_comparison_minus_standard"])
+    ax.set_ylabel(PSYCHOMETRIC_GREATER_Y_LABEL)
     ax.set_title(title)
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
@@ -3529,7 +4152,7 @@ def save_all_figures(
             ax.set_ylim(-0.05, 1.05)
             ax.set_ylabel(_finger_label(finger))
         axes[-1].set_xlabel("Global trial order")
-        fig.supylabel("P(response comparison greater)")
+        fig.supylabel(PSYCHOMETRIC_GREATER_Y_LABEL)
         fig.suptitle("Order/fatigue trend by finger (individuals faded, mean bold)")
         fig.tight_layout()
         out = fig_root / "order_effects.png"

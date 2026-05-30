@@ -31,9 +31,9 @@ block do not affect the comparison).
 
 Run with::
 
-    python -m analysis.motor_response_experiment.analyze <run_dir>
+    python -m analysis.motor_response_analizer_servo.analyze <run_dir>
     # or
-    python analysis/motor_response_experiment/analyze.py <run_dir>
+    python analysis/motor_response_analizer_servo/analyze.py <run_dir>
 """
 
 from __future__ import annotations
@@ -525,7 +525,7 @@ def main() -> None:
         nargs="?",
         default=None,
         help="Folder ``motor_response_<timestamp>``. If omitted, uses newest run "
-             "under ``motor_response_experiment/responses/`` then under ``analysis/``.",
+             "under ``motor_response_analizer_servo/responses/`` then under ``analysis/``.",
     )
     args = p.parse_args()
 
@@ -533,7 +533,7 @@ def main() -> None:
         run_dir = _latest_motor_run_dir()
         if run_dir is None:
             raise SystemExit(
-                "No motor_response_* run found. Expected under motor_response_experiment/responses/ "
+                "No motor_response_* run found. Expected under motor_response_analizer_servo/responses/ "
                 "or analysis/. Pass the run folder explicitly."
             )
         print(f"[analyze] using most recent run: {run_dir}")

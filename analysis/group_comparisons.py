@@ -1,14 +1,12 @@
 """Shared comparison helpers for analysis modules.
 
-The study-level groups are:
+The main study-level experiment groups are:
 - ``N_E``: natural experiment
 - ``L_E``: lab experiment
-- ``L_P``: lab protocol
 
-The helpers intentionally stay dependency-light and return CSV-friendly
-``pandas.DataFrame`` tables. They summarize exact experiment groups, compare
-conditions inside each group, compare groups with one another, and provide
-scope-expanded tables for all participants, subgroups, and single participants.
+Protocol/pilot groups (``*_P`` such as ``N_P`` and ``L_P``) are intentionally
+kept out of the main experiment-group analyses because they can use different
+stimulus values. Use the protocol-group helpers for their separate summaries.
 """
 from __future__ import annotations
 
@@ -23,21 +21,27 @@ import pandas as pd
 
 EXPERIMENT_GROUP_COLUMN = "experiment_group"
 EXPERIMENT_GROUP_LABEL_COLUMN = "experiment_group_label"
+PROTOCOL_GROUP_COLUMN = "protocol_group"
+PROTOCOL_GROUP_LABEL_COLUMN = "protocol_group_label"
 ANALYSIS_SCOPE_COLUMN = "analysis_scope"
 ANALYSIS_SCOPE_VALUE_COLUMN = "analysis_scope_value"
 SETUP_FACTOR_COLUMN = "setup_factor"
 SETUP_LABEL_COLUMN = "setup_label"
-EXPERIMENT_GROUP_ORDER = ["N_E", "L_E", "L_P"]
+EXPERIMENT_GROUP_ORDER = ["N_E", "L_E"]
+PROTOCOL_GROUP_ORDER = ["N_P", "L_P", "E_P"]
 SUBGROUP_ORDER = ["N", "L", "P", "E"]
 SETUP_FACTOR_ORDER = ["no_airsled", "airsled"]
 SETUP_FACTOR_LABELS = {
     "airsled": "with_airsled_L",
     "no_airsled": "without_airsled_N",
 }
+MAX_SUMMARY_RAW_VALUES = 80
 EXPERIMENT_GROUP_LABELS = {
     "N_E": "natural_experiment",
     "L_E": "lab_experiment",
+    "N_P": "natural_protocol",
     "L_P": "lab_protocol",
+    "E_P": "experiment_protocol",
     "N": "natural",
     "L": "lab",
     "P": "protocol",
@@ -58,11 +62,19 @@ _GROUP_ALIASES = {
     "LAB_EXPIRIMENT": "L_E",
     "LAB_EXP": "L_E",
     "P": "P",
+    "N_P": "N_P",
+    "NP": "N_P",
+    "NATURAL_PROTOCOL": "N_P",
+    "NATURAL_PROTO": "N_P",
     "L_P": "L_P",
     "LP": "L_P",
     "LAB_PROTOCOL": "L_P",
     "LAB_PROTO": "L_P",
     "PROTOCOL": "L_P",
+    "E_P": "E_P",
+    "EP": "E_P",
+    "EXPERIMENT_PROTOCOL": "E_P",
+    "EXPERIMENT_PROTO": "E_P",
 }
 _GROUP_SOURCE_COLUMNS = [
     EXPERIMENT_GROUP_COLUMN,
@@ -113,6 +125,15 @@ def _normalize_exact_experiment_group(value: Any) -> str | float:
     return group if group in EXPERIMENT_GROUP_ORDER else np.nan
 
 
+def _normalize_exact_protocol_group(value: Any) -> str | float:
+    token = _tokenize_group_text(value)
+    compact = token.replace("_", "")
+    if re.match(r"^P\d+$", compact):
+        return "L_P"
+    group = normalize_experiment_group(value)
+    return group if group in PROTOCOL_GROUP_ORDER else np.nan
+
+
 def infer_subgroups_from_value(value: Any) -> list[str]:
     """Infer broad subgroup labels (``N``, ``L``, ``P``, ``E``) from one value.
 
@@ -130,8 +151,12 @@ def infer_subgroups_from_value(value: Any) -> list[str]:
         subgroups.extend(["N", "E"])
     elif canonical == "L_E":
         subgroups.extend(["L", "E"])
+    elif canonical == "N_P":
+        subgroups.extend(["N", "P"])
     elif canonical == "L_P":
         subgroups.extend(["L", "P"])
+    elif canonical == "E_P":
+        subgroups.extend(["E", "P"])
     elif canonical in set(SUBGROUP_ORDER):
         subgroups.append(str(canonical))
 
@@ -174,7 +199,7 @@ def setup_factor_from_value(value: Any) -> str | float:
     canonical = normalize_experiment_group(value)
     if canonical in {"L", "L_E", "L_P", "P"}:
         return "airsled"
-    if canonical in {"N", "N_E"}:
+    if canonical in {"N", "N_E", "N_P", "E_P"}:
         return "no_airsled"
     subgroups = infer_subgroups_from_value(value)
     if "L" in subgroups or "P" in subgroups:
@@ -315,6 +340,22 @@ def infer_experiment_group(df: pd.DataFrame, *, subject_col: str = "subject_id")
     return out
 
 
+def infer_protocol_group(df: pd.DataFrame, *, subject_col: str = "subject_id") -> pd.Series:
+    """Infer canonical protocol/pilot groups (``N_P``, ``L_P``, ``E_P``)."""
+    if df.empty:
+        return pd.Series(dtype="object", index=df.index, name=PROTOCOL_GROUP_COLUMN)
+    out = pd.Series(np.nan, index=df.index, dtype="object", name=PROTOCOL_GROUP_COLUMN)
+    for col in [PROTOCOL_GROUP_COLUMN, *_GROUP_SOURCE_COLUMNS]:
+        if col not in df.columns:
+            continue
+        inferred = df[col].map(_normalize_exact_protocol_group)
+        out = out.where(out.notna(), inferred)
+    if subject_col in df.columns:
+        inferred = df[subject_col].map(_normalize_exact_protocol_group)
+        out = out.where(out.notna(), inferred)
+    return out
+
+
 def infer_analysis_subgroups(df: pd.DataFrame, *, subject_col: str = "subject_id") -> pd.Series:
     """Return broad subgroup memberships as tuples for each row."""
     if df.empty:
@@ -337,6 +378,14 @@ def add_experiment_group_columns(df: pd.DataFrame, *, subject_col: str = "subjec
     out = df.copy()
     out[EXPERIMENT_GROUP_COLUMN] = infer_experiment_group(out, subject_col=subject_col)
     out[EXPERIMENT_GROUP_LABEL_COLUMN] = out[EXPERIMENT_GROUP_COLUMN].map(EXPERIMENT_GROUP_LABELS).fillna("other")
+    return out
+
+
+def add_protocol_group_columns(df: pd.DataFrame, *, subject_col: str = "subject_id") -> pd.DataFrame:
+    """Return a copy with canonical protocol/pilot group and readable label columns."""
+    out = df.copy()
+    out[PROTOCOL_GROUP_COLUMN] = infer_protocol_group(out, subject_col=subject_col)
+    out[PROTOCOL_GROUP_LABEL_COLUMN] = out[PROTOCOL_GROUP_COLUMN].map(EXPERIMENT_GROUP_LABELS).fillna("other")
     return out
 
 
@@ -421,6 +470,11 @@ def _summary_rows(df: pd.DataFrame, group_cols: list[str], metrics: list[str], s
         base = dict(zip(group_cols, keys))
         for metric in metrics:
             values = pd.to_numeric(g[metric], errors="coerce").dropna()
+            raw_values = [float(v) for v in values]
+            raw_values_truncated = len(raw_values) > MAX_SUMMARY_RAW_VALUES
+            if raw_values_truncated:
+                sample_idx = np.linspace(0, len(raw_values) - 1, MAX_SUMMARY_RAW_VALUES, dtype=int)
+                raw_values = [raw_values[i] for i in sample_idx]
             row = {
                 **base,
                 "metric": metric,
@@ -431,7 +485,9 @@ def _summary_rows(df: pd.DataFrame, group_cols: list[str], metrics: list[str], s
                 "sem": _sem(values),
                 "ci95_lower": _ci95_lower(values),
                 "ci95_upper": _ci95_upper(values),
-                "raw_values_json": json.dumps([float(v) for v in values]),
+                "raw_values_json": json.dumps(raw_values),
+                "raw_values_count": int(values.size),
+                "raw_values_truncated": raw_values_truncated,
             }
             row["n_subjects"] = int(g[subject_col].nunique()) if subject_col in g.columns else np.nan
             rows.append(row)
@@ -613,6 +669,53 @@ def compute_group_comparison_tables(
             present_conditions,
             category_col=EXPERIMENT_GROUP_COLUMN,
             order=EXPERIMENT_GROUP_ORDER,
+        ),
+    }
+
+
+def compute_protocol_group_comparison_tables(
+    df: pd.DataFrame,
+    *,
+    metric_columns: Iterable[str],
+    subject_col: str = "subject_id",
+    condition_cols: Iterable[str] = (),
+) -> dict[str, pd.DataFrame]:
+    """Compute separate protocol/pilot-group tables for ``*_P`` participants."""
+    empty = {
+        "protocol_group_metric_summary": pd.DataFrame(),
+        "protocol_group_condition_metric_summary": pd.DataFrame(),
+        "within_protocol_group_condition_comparisons": pd.DataFrame(),
+        "between_protocol_group_metric_comparisons": pd.DataFrame(),
+    }
+    if df.empty:
+        return empty
+    prepared = add_protocol_group_columns(df, subject_col=subject_col)
+    prepared = prepared[prepared[PROTOCOL_GROUP_COLUMN].notna()].copy()
+    if prepared.empty:
+        return empty
+    metrics = available_numeric_metrics(prepared, metric_columns)
+    if not metrics:
+        return empty
+    present_conditions = [c for c in condition_cols if c in prepared.columns]
+    return {
+        "protocol_group_metric_summary": _summary_rows(prepared, [PROTOCOL_GROUP_COLUMN], metrics, subject_col),
+        "protocol_group_condition_metric_summary": _summary_rows(prepared, [PROTOCOL_GROUP_COLUMN] + present_conditions, metrics, subject_col)
+        if present_conditions
+        else pd.DataFrame(),
+        "within_protocol_group_condition_comparisons": _within_category_condition_pairs(
+            prepared,
+            metrics,
+            subject_col,
+            present_conditions,
+            category_cols=[PROTOCOL_GROUP_COLUMN],
+        ),
+        "between_protocol_group_metric_comparisons": _pairwise_between_categories(
+            prepared,
+            metrics,
+            subject_col,
+            present_conditions,
+            category_col=PROTOCOL_GROUP_COLUMN,
+            order=PROTOCOL_GROUP_ORDER,
         ),
     }
 

@@ -15,7 +15,7 @@ End-to-end pipeline that:
 ## Layout
 
 ```
-analysis/motor_response_experiment/
+analysis/motor_response_analizer_servo/
     protocol.py          # generates the protocol (deltas through +/-1000, A/B, drift)
     motor_io.py          # ESP32 serial I/O (ZM0P<n>F  ->  OK:M0P<actual>)
     camera_recorder.py   # threaded camera capture + MP4 recording
@@ -43,17 +43,17 @@ Total (default): **8** delta blocks x (6 trials x 5 + 20 drift) = **50 commands 
 
 ```powershell
 # Real experiment (camera idx 1, default ESP32 on COM13):
-python -m analysis.motor_response_experiment.run_experiment
+python -m analysis.motor_response_analizer_servo.run_experiment
 
 # Different port, longer settle/even wider gap between steps:
-python -m analysis.motor_response_experiment.run_experiment `
+python -m analysis.motor_response_analizer_servo.run_experiment `
     --port COM5 --settle-ms 1800 --inter-command-ms 400 --no-frames
 
 # Always click the spool ROI manually (no auto-detection):
-python -m analysis.motor_response_experiment.run_experiment --roi-mode manual
+python -m analysis.motor_response_analizer_servo.run_experiment --roi-mode manual
 
 # Dry run on a laptop (no ESP32, no camera) for sanity check:
-python -m analysis.motor_response_experiment.run_experiment `
+python -m analysis.motor_response_analizer_servo.run_experiment `
     --dry-run --no-camera --settle-ms 0 --inter-command-ms 0
 ```
 
@@ -80,7 +80,7 @@ CLI flags:
 | `--output-root`         | *(package)* `responses/` | parent folder for timestamped runs |
 
 After each successful **single command**, outputs and **plots** are written under
-``motor_response_experiment/responses/`` (next to the Python files), unless you pass **`--no-plots`** or **`--output-root`**.
+``motor_response_analizer_servo/responses/`` (next to the Python files), unless you pass **`--no-plots`** or **`--output-root`**.
 
 **Timing (important for correct target vs angle):** after each command the runner waits
 ``settle-ms``, then takes a frame whose capture time is **strictly after** that wait
@@ -90,7 +90,7 @@ After each successful **single command**, outputs and **plots** are written unde
 
 ```powershell
 # Skip plots (only logs + video + frames):
-python -m analysis.motor_response_experiment.run_experiment --no-plots
+python -m analysis.motor_response_analizer_servo.run_experiment --no-plots
 ```
 
 ## Output (default location)
@@ -98,7 +98,7 @@ python -m analysis.motor_response_experiment.run_experiment --no-plots
 Each run creates one folder **next to this code**:
 
 ```
-analysis/motor_response_experiment/responses/motor_response_<YYYY_MM_DD_HH_MM_SS>/
+analysis/motor_response_analizer_servo/responses/motor_response_<YYYY_MM_DD_HH_MM_SS>/
     protocol_log.xlsx         # full log, mirrors the template + extra columns
     protocol_log.csv          # same data, plain CSV
     recording.mp4             # full camera recording
@@ -122,14 +122,14 @@ To regenerate from an existing run, or if you used `--no-plots` earlier:
 
 ```powershell
 # Most recent run under analysis/:
-python -m analysis.motor_response_experiment.analyze
+python -m analysis.motor_response_analizer_servo.analyze
 
 # Or a specific folder:
-python -m analysis.motor_response_experiment.analyze
+python -m analysis.motor_response_analizer_servo.analyze
 
 # Or a specific run folder:
-python -m analysis.motor_response_experiment.analyze `
-    analysis/motor_response_experiment/responses/motor_response_2026_04_28_13_53_58
+python -m analysis.motor_response_analizer_servo.analyze `
+    analysis/motor_response_analizer_servo/responses/motor_response_2026_04_28_13_53_58
 ```
 
 Generated plots:
@@ -149,6 +149,27 @@ Generated plots:
   * (a) box-plot of `(angle - mean)` per delta - smaller box = more repeatable,
   * (b) mean +/- std angle change for `+delta` and `-delta` separately,
   * (c) ESP32 encoder relative error per delta (`(actual - target) / target * 100`).
+
+## Generate the verified PDF report
+
+The repository now includes a reproducible report generator for the motor-response
+results. It recomputes the per-delta statistics from `protocol_log.csv`, compares
+them with the saved `per_delta_summary.csv`, writes verification CSV/JSON files,
+and creates `output/pdf/motor_response_analysis_report.pdf`.
+
+```powershell
+# Latest complete real-camera run, with automatic comparison to the previous run:
+python -m analysis.motor_response_analizer_servo.generate_report
+
+# Specific run:
+python -m analysis.motor_response_analizer_servo.generate_report `
+    analysis/motor_response_analizer_servo/responses/motor_response_2026_04_28_15_02_26
+
+# Specific run without between-run comparison:
+python -m analysis.motor_response_analizer_servo.generate_report `
+    analysis/motor_response_analizer_servo/responses/motor_response_2026_04_28_15_02_26 `
+    --no-comparison
+```
 
 ## Hardware notes
 

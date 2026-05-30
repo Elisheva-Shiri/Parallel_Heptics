@@ -22,7 +22,7 @@ Single command does the full pipeline (**one run**):
 
 By default all outputs go under **this package**:
 
-    analysis/motor_response_experiment/responses/motor_response_<timestamp>/
+    analysis/motor_response_analizer_servo/responses/motor_response_<timestamp>/
         protocol_log.csv / .xlsx
         recording.mp4
         frames/
@@ -34,15 +34,15 @@ Use ``--output-root`` only if you want a different parent folder.
 
 Run with::
 
-    python -m analysis.motor_response_experiment.run_experiment --port COM13
+    python -m analysis.motor_response_analizer_servo.run_experiment --port COM13
 
 Or, without hardware/camera::
 
-    python -m analysis.motor_response_experiment.run_experiment --dry-run --no-camera
+    python -m analysis.motor_response_analizer_servo.run_experiment --dry-run --no-camera
 
-The output folder layout is (default: under ``motor_response_experiment/responses/``)::
+The output folder layout is (default: under ``motor_response_analizer_servo/responses/``)::
 
-    motor_response_experiment/responses/motor_response_<timestamp>/
+    motor_response_analizer_servo/responses/motor_response_<timestamp>/
         protocol_log.xlsx       # full log (matches the Excel template + extra columns)
         protocol_log.csv        # same data, plain CSV
         recording.mp4           # full-length camera recording
@@ -63,11 +63,10 @@ from pathlib import Path
 from typing import Optional
 
 import cv2
-import numpy as np
 import pandas as pd
 
 # Allow running both as a script (``python file.py``) and as a module
-# (``python -m analysis.motor_response_experiment.run_experiment``).
+# (``python -m analysis.motor_response_analizer_servo.run_experiment``).
 if __package__ in (None, ""):
     THIS_DIR = Path(__file__).resolve().parent
     sys.path.insert(0, str(THIS_DIR.parent))
@@ -78,7 +77,6 @@ if __package__ in (None, ""):
         SpoolROI,
         detect_dark_spot,
         detect_white_spool,
-        find_spool_roi,
         manual_pick_spool,
     )
     from motor_response_analizer_servo.camera_recorder import CameraConfig, CameraRecorder
@@ -90,7 +88,6 @@ else:
         SpoolROI,
         detect_dark_spot,
         detect_white_spool,
-        find_spool_roi,
         manual_pick_spool,
     )
     from .camera_recorder import CameraConfig, CameraRecorder
@@ -168,7 +165,7 @@ def _make_output_dir(root: Path) -> Path:
 
 def _open_motor(cfg: ExperimentConfig):
     if cfg.dry_run:
-        print(f"[motor] dry-run mode: no serial connection")
+        print("[motor] dry-run mode: no serial connection")
         return DryRunMotor()
     return MotorSerial(
         port=cfg.port,
@@ -520,7 +517,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output-root",
         default=None,
         metavar="DIR",
-        help="Parent folder for runs (default: motor_response_experiment/responses next to this code)",
+        help="Parent folder for runs (default: motor_response_analizer_servo/responses next to this code)",
     )
     return p
 

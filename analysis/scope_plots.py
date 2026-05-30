@@ -25,12 +25,17 @@ STAT_COLUMNS = {
     "ci95_lower",
     "ci95_upper",
     "raw_values_json",
+    "raw_values_count",
+    "raw_values_truncated",
 }
 LEVEL_SPECS = [
     ("analysis_scope", ["analysis_scope", "analysis_scope_value"]),
     ("experiment_group", ["experiment_group"]),
+    ("protocol_group", ["protocol_group"]),
     ("setup_factor", ["setup_factor"]),
 ]
+MAX_RAW_VALUES_PER_SUMMARY_POINT = 80
+MAX_SUMMARY_PLOT_ROWS = 160
 
 
 def sanitize_name(value: Any, fallback: str = "unknown") -> str:
@@ -124,6 +129,8 @@ def _save_one_plot(
         return None
     d["_plot_label"] = d[x_cols].astype(str).agg(" | ".join, axis=1)
     d = d.sort_values(x_cols)
+    if len(d) > MAX_SUMMARY_PLOT_ROWS:
+        return None
 
     width = min(18.0, max(5.5, 0.35 * len(d) + 2.5))
     fig, ax = plt.subplots(figsize=(width, 4.8))
@@ -133,9 +140,10 @@ def _save_one_plot(
             values = _raw_values_from_summary(raw)
             if not values:
                 continue
+            if len(values) > MAX_RAW_VALUES_PER_SUMMARY_POINT:
+                sample_idx = np.linspace(0, len(values) - 1, MAX_RAW_VALUES_PER_SUMMARY_POINT, dtype=int)
+                values = [values[j] for j in sample_idx]
             jitter = np.linspace(-0.16, 0.16, len(values)) if len(values) > 1 else np.array([0.0])
-            if len(values) > 80:
-                jitter = np.linspace(-0.18, 0.18, len(values))
             ax.scatter(
                 np.full(len(values), x[i]) + jitter,
                 values,

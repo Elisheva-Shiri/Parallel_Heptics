@@ -5,7 +5,7 @@ a small per-trial random noise and a small encoder error.  Useful to verify
 that ``analyze.py`` produces sensible plots before any real hardware is run.
 
 Run from repo root:
-    python analysis/motor_response_experiment/_synthesize_log.py
+    python analysis/motor_response_analizer_servo/_synthesize_log.py
 """
 
 from __future__ import annotations

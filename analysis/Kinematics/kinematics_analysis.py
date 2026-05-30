@@ -13,6 +13,7 @@ from typing import Any, Iterable, Optional
 
 import cv2
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 
@@ -99,6 +100,26 @@ WORKSPACE_SPECS_CM = {
     "L": {"workspace_width_cm": 60.0, "workspace_height_cm": 60.0},
     "N": {"workspace_width_cm": 40.0, "workspace_height_cm": 50.0},
 }
+EXPERIMENT_SETUP_CONTEXT = {
+    "L": {
+        "side_camera_side": "right",
+        "participant_position_context": "slightly_left",
+        "movement_space_context": "larger 60x60 cm movement space",
+        "side_camera_interpretation_note": (
+            "L experiment: side camera was on the participant's right side; "
+            "participant was slightly left of the workspace center."
+        ),
+    },
+    "N": {
+        "side_camera_side": "left",
+        "participant_position_context": "centered",
+        "movement_space_context": "smaller 40x50 cm movement space",
+        "side_camera_interpretation_note": (
+            "N experiment: participant sat at the center of the smaller movement "
+            "space; side camera was on the participant's left side."
+        ),
+    },
+}
 STIFFNESS_CMAP = "viridis"
 MOTOR_CONTROL_METRICS = [
     "success_rate",
@@ -164,6 +185,24 @@ def sanitize_name(value: Any, fallback: str = "unknown") -> str:
     return text or fallback
 
 
+def subject_figure_path(fig_dir: Path, subject_id: Any, filename: str) -> Path:
+    """Return a figure path under a per-person folder such as ``N_E_7``."""
+
+    subject_dir = fig_dir / sanitize_name(subject_id, fallback="unknown_subject")
+    subject_dir.mkdir(parents=True, exist_ok=True)
+    return subject_dir / filename
+
+
+def subject_figure_path_for_scope(fig_dir: Path, scope_name: str, filename: str) -> Path:
+    """Route ``subject_<id>`` scope figures into an ``<id>/`` folder."""
+
+    subject_prefix = "subject_"
+    if scope_name.startswith(subject_prefix):
+        subject_id = scope_name[len(subject_prefix) :]
+        return subject_figure_path(fig_dir, subject_id, filename)
+    return fig_dir / filename
+
+
 def normalize_finger_condition(value: Any) -> Any:
     """Return canonical finger codes (I/M/R/P) while tolerating legacy labels."""
     if value is None or pd.isna(value):
@@ -215,10 +254,72 @@ def workspace_label_for_setup(setup_factor: Any) -> str:
     return "unknown workspace"
 
 
+def experiment_setup_context_for_setup(setup_factor: Any, field: str) -> Any:
+    setup = str(setup_factor).strip().upper()
+    return EXPERIMENT_SETUP_CONTEXT.get(setup, {}).get(field, np.nan)
+
+
+def side_camera_view_sign_for_side(side_camera_side: Any) -> float:
+    """Return a pixel-space mirror sign for opposite side-camera placements.
+
+    We keep raw side-camera pixels unchanged.  For derived side-view
+    orientation/direction values, left-side cameras are mirrored into the same
+    convention as right-side cameras so L and N can be compared without treating
+    a camera-placement reversal as a movement-direction reversal.
+    """
+
+    side = str(side_camera_side).strip().lower()
+    if side == "right":
+        return 1.0
+    if side == "left":
+        return -1.0
+    return np.nan
+
+
+def experiment_setup_context_table() -> pd.DataFrame:
+    rows = []
+    for setup, spec in WORKSPACE_SPECS_CM.items():
+        rows.append(
+            {
+                "workspace_setup": setup,
+                "workspace_width_cm": spec["workspace_width_cm"],
+                "workspace_height_cm": spec["workspace_height_cm"],
+                **EXPERIMENT_SETUP_CONTEXT.get(setup, {}),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def save_experiment_setup_context(output_root: Path) -> Path:
+    return save_csv(
+        experiment_setup_context_table(), output_root, "experiment_setup_context.csv"
+    )
+
+
 def _figure_colors(labels: Iterable[Any]) -> dict[Any, Any]:
     labels = list(labels)
     cmap = plt.get_cmap("tab20")
     return {label: cmap(i % cmap.N) for i, label in enumerate(labels)}
+
+
+def _stiffness_viridis_colors(
+    stiffness_values: Iterable[Any],
+    *,
+    min_stiffness: float = 25.0,
+    max_stiffness: float = 145.0,
+) -> dict[Any, Any]:
+    """Map stiffness to viridis: 25=dark purple, 145=bright yellow."""
+    cmap = plt.get_cmap("viridis")
+    span = max(max_stiffness - min_stiffness, 1e-9)
+    colors: dict[Any, Any] = {}
+    for value in stiffness_values:
+        numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if pd.isna(numeric):
+            colors[value] = "0.35"
+            continue
+        clipped = min(max(float(numeric), min_stiffness), max_stiffness)
+        colors[value] = cmap((clipped - min_stiffness) / span)
+    return colors
 
 
 def _first_existing_column(df: pd.DataFrame, names: list[str]) -> str | None:
@@ -317,6 +418,20 @@ def add_workspace_normalization_columns(df: pd.DataFrame) -> pd.DataFrame:
             "workspace_height_cm", np.nan
         )
     )
+    for context_col in [
+        "side_camera_side",
+        "participant_position_context",
+        "movement_space_context",
+        "side_camera_interpretation_note",
+    ]:
+        if context_col not in out.columns:
+            out[context_col] = out["workspace_setup"].map(
+                lambda s, col=context_col: experiment_setup_context_for_setup(s, col)
+            )
+    if "side_camera_view_sign" not in out.columns:
+        out["side_camera_view_sign"] = out["side_camera_side"].map(
+            side_camera_view_sign_for_side
+        )
     if "x_centered_px" in out.columns:
         out["x_workspace_cm"] = (
             pd.to_numeric(out["x_centered_px"], errors="coerce")
@@ -657,6 +772,50 @@ def _resultant_length(degrees: pd.Series, weights: Optional[pd.Series] = None) -
     )
 
 
+def _wrap_radians(values: Any) -> Any:
+    """Wrap angles to [-pi, pi] while preserving pandas indexes when present."""
+    wrapped = (np.asarray(values, dtype=float) + np.pi) % (2 * np.pi) - np.pi
+    if isinstance(values, pd.Series):
+        return pd.Series(wrapped, index=values.index)
+    return wrapped
+
+
+def _circ_mean_rad(radians: pd.Series) -> float:
+    a = pd.to_numeric(radians, errors="coerce").to_numpy(dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return np.nan
+    return float(math.atan2(np.sum(np.sin(a)), np.sum(np.cos(a))))
+
+
+def _circ_median_rad(radians: pd.Series) -> float:
+    """Circular median approximation centered on the circular mean."""
+    a = pd.to_numeric(radians, errors="coerce").to_numpy(dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return np.nan
+    center = _circ_mean_rad(pd.Series(a))
+    centered = _wrap_radians(a - center)
+    return float(_wrap_radians(center + np.median(centered)))
+
+
+def _circ_quantile_rad(radians: pd.Series, q: float) -> float:
+    """Circular quantile after unwrapping around the circular mean."""
+    a = pd.to_numeric(radians, errors="coerce").to_numpy(dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return np.nan
+    center = _circ_mean_rad(pd.Series(a))
+    centered = _wrap_radians(a - center)
+    return float(_wrap_radians(center + np.quantile(centered, q)))
+
+
+def _set_pi_axis(ax: Any) -> None:
+    ax.set_ylim(-np.pi, np.pi)
+    ax.set_yticks([-np.pi, -np.pi / 2, 0, np.pi / 2, np.pi])
+    ax.set_yticklabels(["-pi", "-pi/2", "0", "pi/2", "pi"])
+
+
 def _direction_label(angle_deg: float) -> str:
     if not np.isfinite(angle_deg):
         return "unknown"
@@ -752,6 +911,18 @@ def _profile_filter_pair(
         low = numeric.rolling(5, center=True, min_periods=1).mean()
         high = numeric - low
     return low, high, effective_cutoff
+
+
+def _mask_filter_plot_values(
+    values: pd.Series,
+    *,
+    min_abs: float = 1e-1,
+    max_abs: float = 1e4,
+) -> pd.Series:
+    """Hide near-zero speckles and extreme spikes from filter-overlay plots."""
+    numeric = pd.to_numeric(values, errors="coerce")
+    keep = numeric.abs().between(min_abs, max_abs, inclusive="both")
+    return numeric.where(keep)
 
 
 def _first_numeric(row: pd.Series, names: list[str], default: float = np.nan) -> float:
@@ -1295,6 +1466,32 @@ def compute_tracking_kinematics(
                     "workspace_height_cm": float(movement["workspace_height_cm"].mean())
                     if "workspace_height_cm" in movement.columns
                     else np.nan,
+                    "side_camera_side": movement["side_camera_side"].dropna().iloc[0]
+                    if "side_camera_side" in movement.columns
+                    and movement["side_camera_side"].notna().any()
+                    else np.nan,
+                    "participant_position_context": movement[
+                        "participant_position_context"
+                    ]
+                    .dropna()
+                    .iloc[0]
+                    if "participant_position_context" in movement.columns
+                    and movement["participant_position_context"].notna().any()
+                    else np.nan,
+                    "movement_space_context": movement[
+                        "movement_space_context"
+                    ].dropna().iloc[0]
+                    if "movement_space_context" in movement.columns
+                    and movement["movement_space_context"].notna().any()
+                    else np.nan,
+                    "side_camera_interpretation_note": movement[
+                        "side_camera_interpretation_note"
+                    ]
+                    .dropna()
+                    .iloc[0]
+                    if "side_camera_interpretation_note" in movement.columns
+                    and movement["side_camera_interpretation_note"].notna().any()
+                    else np.nan,
                     "mean_r_center_px": float(movement["r_center_px"].mean()),
                     "max_r_center_px": float(movement["r_center_px"].max()),
                     "mean_thumb_active_span_px": float(
@@ -1386,6 +1583,13 @@ def compute_tracking_kinematics(
                 workspace_label=("workspace_label", "first"),
                 workspace_width_cm=("workspace_width_cm", "first"),
                 workspace_height_cm=("workspace_height_cm", "first"),
+                side_camera_side=("side_camera_side", "first"),
+                participant_position_context=("participant_position_context", "first"),
+                movement_space_context=("movement_space_context", "first"),
+                side_camera_interpretation_note=(
+                    "side_camera_interpretation_note",
+                    "first",
+                ),
                 thumb_x_centered_px=("thumb_x_centered_px", "mean"),
                 thumb_y_centered_px=("thumb_y_centered_px", "mean"),
                 active_finger_x_centered_px=("active_finger_x_centered_px", "mean"),
@@ -1446,6 +1650,10 @@ def compute_tracking_kinematics(
             "workspace_label",
             "workspace_width_cm",
             "workspace_height_cm",
+            "side_camera_side",
+            "participant_position_context",
+            "movement_space_context",
+            "side_camera_interpretation_note",
             "position_angle_deg",
             "thumb_x_centered_px",
             "thumb_y_centered_px",
@@ -1494,6 +1702,7 @@ def compute_tracking_kinematics(
 
 
 def _skin_mask_z_from_frame(frame: np.ndarray) -> dict[str, float]:
+    _, frame_width = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask1 = cv2.inRange(hsv, np.array([0, 25, 35]), np.array([25, 230, 255]))
     mask2 = cv2.inRange(hsv, np.array([160, 25, 35]), np.array([180, 230, 255]))
@@ -1507,14 +1716,61 @@ def _skin_mask_z_from_frame(frame: np.ndarray) -> dict[str, float]:
             "side_detected": 0,
             "side_z_top_y_px": np.nan,
             "side_z_centroid_y_px": np.nan,
+            "side_x_centroid_px": np.nan,
+            "side_x_from_frame_center_px": np.nan,
             "side_mask_area_px": float(len(ys)),
         }
+    x_centroid = float(np.mean(xs))
     return {
         "side_detected": 1,
         "side_z_top_y_px": float(np.percentile(ys, 5)),
         "side_z_centroid_y_px": float(np.mean(ys)),
+        "side_x_centroid_px": x_centroid,
+        "side_x_from_frame_center_px": x_centroid - (float(frame_width) / 2.0),
         "side_mask_area_px": float(len(ys)),
     }
+
+
+def add_side_camera_angle_normalization_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add pixel-space side-camera mirror correction for L/right vs N/left views.
+
+    Raw columns such as ``side_x_centroid_px`` and
+    ``side_x_from_frame_center_px`` stay untouched.  Corrected columns mirror
+    left-camera recordings into the same right-camera convention, which makes
+    side-view orientation and direction comparable in pixels without using real
+    workspace centimeters.
+    """
+
+    if df.empty:
+        return df.copy()
+    out = add_workspace_normalization_columns(df)
+    if "side_camera_view_sign" not in out.columns:
+        out["side_camera_view_sign"] = out["side_camera_side"].map(
+            side_camera_view_sign_for_side
+        )
+    if "side_x_from_frame_center_px" in out.columns:
+        raw_x = pd.to_numeric(out["side_x_from_frame_center_px"], errors="coerce")
+        sign = pd.to_numeric(out["side_camera_view_sign"], errors="coerce")
+        out["side_x_from_center_camera_corrected_px"] = raw_x * sign
+    if {"side_z_lift_px", "side_x_from_frame_center_px"}.issubset(out.columns):
+        out["side_lift_lateral_angle_raw_deg"] = np.degrees(
+            np.arctan2(
+                pd.to_numeric(out["side_z_lift_px"], errors="coerce"),
+                pd.to_numeric(out["side_x_from_frame_center_px"], errors="coerce"),
+            )
+        )
+    if {"side_z_lift_px", "side_x_from_center_camera_corrected_px"}.issubset(
+        out.columns
+    ):
+        out["side_lift_lateral_angle_camera_corrected_deg"] = np.degrees(
+            np.arctan2(
+                pd.to_numeric(out["side_z_lift_px"], errors="coerce"),
+                pd.to_numeric(
+                    out["side_x_from_center_camera_corrected_px"], errors="coerce"
+                ),
+            )
+        )
+    return out
 
 
 def estimate_side_video_z(
@@ -1536,6 +1792,7 @@ def estimate_side_video_z(
         .copy()
         .sort_values(["subject_id", "trial_index_raw"])
     )
+    selected = add_workspace_normalization_columns(selected)
     if max_trials is not None:
         selected = selected.head(max_trials)
     for _, meta in selected.iterrows():
@@ -1612,6 +1869,49 @@ def estimate_side_video_z(
                 if vals["side_z_centroid_y_px"].notna().any()
                 else np.nan
             )
+            vals = add_side_camera_angle_normalization_columns(vals)
+            vals = vals.sort_values("side_time_s").copy()
+            dt = pd.to_numeric(vals["side_time_s"], errors="coerce").diff().replace(
+                0, np.nan
+            )
+            if "side_x_from_frame_center_px" in vals.columns:
+                vals["side_lateral_velocity_raw_px_s"] = (
+                    pd.to_numeric(vals["side_x_from_frame_center_px"], errors="coerce")
+                    .diff()
+                    .divide(dt)
+                )
+            if "side_x_from_center_camera_corrected_px" in vals.columns:
+                vals["side_lateral_velocity_camera_corrected_px_s"] = (
+                    pd.to_numeric(
+                        vals["side_x_from_center_camera_corrected_px"],
+                        errors="coerce",
+                    )
+                    .diff()
+                    .divide(dt)
+                )
+            vals["side_z_velocity_px_s"] = (
+                pd.to_numeric(vals["side_z_lift_px"], errors="coerce").diff().divide(dt)
+            )
+            if {
+                "side_lateral_velocity_raw_px_s",
+                "side_z_velocity_px_s",
+            }.issubset(vals.columns):
+                vals["side_motion_direction_raw_deg"] = np.degrees(
+                    np.arctan2(
+                        vals["side_z_velocity_px_s"],
+                        vals["side_lateral_velocity_raw_px_s"],
+                    )
+                )
+            if {
+                "side_lateral_velocity_camera_corrected_px_s",
+                "side_z_velocity_px_s",
+            }.issubset(vals.columns):
+                vals["side_motion_direction_camera_corrected_deg"] = np.degrees(
+                    np.arctan2(
+                        vals["side_z_velocity_px_s"],
+                        vals["side_lateral_velocity_camera_corrected_px_s"],
+                    )
+                )
             rows.extend(vals.to_dict("records"))
     side_samples = pd.DataFrame(rows)
     if side_samples.empty:
@@ -1641,10 +1941,33 @@ def estimate_side_video_z(
             signed_stiffness_delta=("signed_stiffness_delta", "first"),
             correct_response=("correct_response", "first"),
             side_video_file=("side_video_file", "first"),
+            side_camera_side=("side_camera_side", "first"),
+            side_camera_view_sign=("side_camera_view_sign", "first"),
             n_side_samples=("frame_index", "count"),
             side_detection_rate=("side_detected", "mean"),
             mean_side_z_lift_px=("side_z_lift_px", "mean"),
             max_side_z_lift_px=("side_z_lift_px", "max"),
+            mean_side_x_from_center_raw_px=("side_x_from_frame_center_px", "mean"),
+            mean_side_x_from_center_camera_corrected_px=(
+                "side_x_from_center_camera_corrected_px",
+                "mean",
+            ),
+            max_abs_side_x_from_center_camera_corrected_px=(
+                "side_x_from_center_camera_corrected_px",
+                lambda s: float(pd.to_numeric(s, errors="coerce").abs().max()),
+            ),
+            mean_side_lift_lateral_angle_raw_deg=(
+                "side_lift_lateral_angle_raw_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
+            mean_side_lift_lateral_angle_camera_corrected_deg=(
+                "side_lift_lateral_angle_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
+            mean_side_motion_direction_camera_corrected_deg=(
+                "side_motion_direction_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
             mean_side_mask_area_px=("side_mask_area_px", "mean"),
         )
         .reset_index()
@@ -1685,13 +2008,31 @@ def estimate_side_video_z(
             side_trial_time_fraction=("side_trial_time_fraction", "mean"),
             mean_side_z_lift_px=("side_z_lift_px", "mean"),
             sem_side_z_lift_px=("side_z_lift_px", _sem),
+            mean_side_x_from_center_camera_corrected_px=(
+                "side_x_from_center_camera_corrected_px",
+                "mean",
+            ),
+            mean_side_lift_lateral_angle_camera_corrected_deg=(
+                "side_lift_lateral_angle_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
+            mean_side_motion_direction_camera_corrected_deg=(
+                "side_motion_direction_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
             mean_detection_rate=("side_detected", "mean"),
         )
         .reset_index()
     )
     side_subject_stiffness_summary = (
         side_trial_summary.groupby(
-            ["subject_id", "subject_group", "stiffness_value", "finger_condition"],
+            [
+                "subject_id",
+                "subject_group",
+                "side_camera_side",
+                "stiffness_value",
+                "finger_condition",
+            ],
             dropna=False,
         )
         .agg(
@@ -1699,6 +2040,18 @@ def estimate_side_video_z(
             mean_side_z_lift_px=("mean_side_z_lift_px", "mean"),
             sem_side_z_lift_px=("mean_side_z_lift_px", _sem),
             max_side_z_lift_px=("max_side_z_lift_px", "mean"),
+            mean_side_x_from_center_camera_corrected_px=(
+                "mean_side_x_from_center_camera_corrected_px",
+                "mean",
+            ),
+            mean_side_lift_lateral_angle_camera_corrected_deg=(
+                "mean_side_lift_lateral_angle_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
+            mean_side_motion_direction_camera_corrected_deg=(
+                "mean_side_motion_direction_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
             success_rate=("correct_response", "mean"),
         )
         .reset_index()
@@ -1711,6 +2064,18 @@ def estimate_side_video_z(
             mean_side_z_lift_px=("mean_side_z_lift_px", "mean"),
             sem_side_z_lift_px=("mean_side_z_lift_px", _sem),
             max_side_z_lift_px=("max_side_z_lift_px", "mean"),
+            mean_side_x_from_center_camera_corrected_px=(
+                "mean_side_x_from_center_camera_corrected_px",
+                "mean",
+            ),
+            mean_side_lift_lateral_angle_camera_corrected_deg=(
+                "mean_side_lift_lateral_angle_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
+            mean_side_motion_direction_camera_corrected_deg=(
+                "mean_side_motion_direction_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
             success_rate=("correct_response", "mean"),
         )
         .reset_index()
@@ -1813,6 +2178,8 @@ def summarize_kinematics(
             "subject_group",
             EXPERIMENT_GROUP_COLUMN,
             "workspace_setup",
+            "side_camera_side",
+            "participant_position_context",
             "stiffness_value",
             "finger_condition",
             "dominant_movement_direction",
@@ -1858,6 +2225,8 @@ def summarize_kinematics(
             "subject_group",
             EXPERIMENT_GROUP_COLUMN,
             "workspace_setup",
+            "side_camera_side",
+            "participant_position_context",
             "stiffness_value",
             "finger_condition",
             "distance_quantile",
@@ -1881,6 +2250,8 @@ def summarize_kinematics(
             "subject_group",
             EXPERIMENT_GROUP_COLUMN,
             "workspace_setup",
+            "side_camera_side",
+            "participant_position_context",
             "stiffness_value",
             "finger_condition",
         ],
@@ -1978,6 +2349,8 @@ def summarize_kinematics(
                 "subject_group",
                 EXPERIMENT_GROUP_COLUMN,
                 "workspace_setup",
+                "side_camera_side",
+                "participant_position_context",
                 "success_label",
                 "stiffness_value",
                 "finger_condition",
@@ -2083,6 +2456,27 @@ KINEMATIC_GROUP_METRICS = [
     "movement_direction_resultant_length",
 ]
 
+KINEMATIC_INTERACTION_SCOPES = [
+    {
+        "interaction_scope": "all",
+        "interaction_code": "all",
+        "folder_name": "all",
+        "description": "All stiffness interactions already used by the legacy kinematic analysis.",
+    },
+    {
+        "interaction_scope": "standard",
+        "interaction_code": "S",
+        "folder_name": "standard",
+        "description": "Only samples/segments where the active stiffness equals the standard value.",
+    },
+    {
+        "interaction_scope": "comparison",
+        "interaction_code": "C",
+        "folder_name": "Comparison",
+        "description": "Only samples/segments where the active stiffness equals the comparison value.",
+    },
+]
+
 
 def _kinematic_condition_columns(df: pd.DataFrame) -> list[str]:
     """Return optional kinematic condition columns that contain usable labels."""
@@ -2090,6 +2484,7 @@ def _kinematic_condition_columns(df: pd.DataFrame) -> list[str]:
         "finger_condition",
         "stiffness_value",
         "success_label",
+        "side_camera_side",
         "protocol_factor",
         "sex_factor",
         "age_group",
@@ -2168,6 +2563,7 @@ def compute_expanded_kinematic_scope_tables(
         ("protocol", "protocol_factor", "protocol 1/2/3/4 if present/inferred"),
         ("E_vs_P", "subject_group", "E vs P"),
         ("N_vs_L_workspace", "workspace_setup", "N=40x50 cm vs L=60x60 cm"),
+        ("side_camera", "side_camera_side", "right-side L vs left-side N camera"),
         ("experiment_group", EXPERIMENT_GROUP_COLUMN, "N_E/L_E/L_P exact group"),
         ("sex", "sex_factor", "male vs female if present"),
         ("age", "age_group", "age bins if present"),
@@ -2285,6 +2681,360 @@ def save_experiment_group_comparison_outputs(
     )
     tables["kinematic_scope_figure_manifest"] = figure_manifest
     return tables
+
+
+def _interaction_value_column(df: pd.DataFrame) -> str | None:
+    for candidate in [
+        "stiffness_value",
+        "skin_stretch_gain_mm_per_m",
+        "mean_skin_stretch_gain_mm_per_m",
+    ]:
+        if candidate in df.columns:
+            return candidate
+    return None
+
+
+def _numeric_close_mask(
+    value: pd.Series, target: pd.Series, *, atol: float = 1e-9
+) -> pd.Series:
+    left = pd.to_numeric(value, errors="coerce")
+    right = pd.to_numeric(target, errors="coerce")
+    return (left.notna() & right.notna() & np.isclose(left, right, atol=atol)).fillna(
+        False
+    )
+
+
+def kinematic_interaction_mask(
+    df: pd.DataFrame, interaction_scope: str, *, atol: float = 1e-9
+) -> pd.Series:
+    """Return rows belonging to all, standard (S), or comparison (C) interactions.
+
+    The kinematic tables are segment/sample-level after tracking is processed.
+    ``standard`` keeps only rows where the active ``stiffness_value`` equals
+    ``standard_value``; ``comparison`` keeps rows where active stiffness equals
+    ``comparison_value``.  ``all`` preserves the previous analysis behavior.
+    """
+
+    scope = str(interaction_scope).strip().lower()
+    if scope in {"all", "*", "any"}:
+        return pd.Series(True, index=df.index)
+
+    value_col = _interaction_value_column(df)
+    target_col = (
+        "standard_value"
+        if scope in {"standard", "standart", "s"}
+        else "comparison_value"
+        if scope in {"comparison", "comperison", "c"}
+        else None
+    )
+    if value_col is None or target_col is None or target_col not in df.columns:
+        return pd.Series(False, index=df.index)
+    return _numeric_close_mask(df[value_col], df[target_col], atol=atol)
+
+
+def filter_kinematic_interaction(
+    df: pd.DataFrame, interaction_scope: str, *, atol: float = 1e-9
+) -> pd.DataFrame:
+    """Filter any kinematic table to all/S/C interaction rows."""
+
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+    return df.loc[kinematic_interaction_mask(df, interaction_scope, atol=atol)].copy()
+
+
+def _save_named_tables(output_root: Path, tables: dict[str, pd.DataFrame]) -> None:
+    for name, df in tables.items():
+        save_csv(df, output_root, f"{name}.csv")
+
+
+def _save_interaction_summary_block(
+    output_root: Path,
+    *,
+    trial_kinematic_summary: pd.DataFrame,
+    trajectory_time_bins: pd.DataFrame,
+    side_z_trial_summary: Optional[pd.DataFrame] = None,
+    fig_dpi: int = 160,
+    save_figures: bool = True,
+) -> dict[str, pd.DataFrame]:
+    summaries = summarize_kinematics(trial_kinematic_summary, trajectory_time_bins)
+    output_tables = {
+        "direction_success_summary": summaries.get("direction_success", pd.DataFrame()),
+        "distance_success_summary": summaries.get("distance_success", pd.DataFrame()),
+        "subject_kinematic_summary": summaries.get("subject_summary", pd.DataFrame()),
+        "participant_stiffness_kinematic_summary": summaries.get(
+            "participant_stiffness_summary", pd.DataFrame()
+        ),
+        "stiffness_kinematic_summary": summaries.get("stiffness_summary", pd.DataFrame()),
+        "group_time_summary": summaries.get("group_time", pd.DataFrame()),
+        "stiffness_time_summary": summaries.get("stiffness_time", pd.DataFrame()),
+    }
+    for name, df in summaries.items():
+        if name.startswith("kinematic_"):
+            output_tables[name] = df
+    _save_named_tables(output_root, output_tables)
+
+    subject_summary = summaries.get("subject_summary", pd.DataFrame())
+    motor_control = compute_motor_control_comparisons(subject_summary)
+    motor_tables = {
+        "kinematic_within_subject": motor_control.get("within_subject", pd.DataFrame()),
+        "finger_metric_summary": motor_control.get("finger_metric_summary", pd.DataFrame()),
+        "within_finger_stiffness_effects": motor_control.get(
+            "within_finger_stiffness_effects", pd.DataFrame()
+        ),
+        "within_finger_stiffness_effect_summary": motor_control.get(
+            "within_finger_stiffness_effect_summary", pd.DataFrame()
+        ),
+        "finger_comparison_paired": motor_control.get(
+            "finger_comparison_paired", pd.DataFrame()
+        ),
+        "finger_comparison_by_stiffness_paired": motor_control.get(
+            "finger_comparison_by_stiffness_paired", pd.DataFrame()
+        ),
+    }
+    _save_named_tables(output_root, motor_tables)
+
+    side_trials = (
+        side_z_trial_summary
+        if side_z_trial_summary is not None
+        else pd.DataFrame()
+    )
+    success_kinematic_z = compute_success_kinematic_z_analysis(
+        trial_kinematic_summary, side_trials
+    )
+    trajectory_structure = compute_trajectory_similarity_analysis(trajectory_time_bins)
+    advanced_tables = {
+        "trial_success_kinematic_z_table": success_kinematic_z.get(
+            "trial_success_table", pd.DataFrame()
+        ),
+        "success_kinematic_z_contrast_by_subject_finger": success_kinematic_z.get(
+            "success_contrast_by_subject_finger", pd.DataFrame()
+        ),
+        "success_kinematic_z_contrast_summary": success_kinematic_z.get(
+            "success_contrast_summary", pd.DataFrame()
+        ),
+        "success_kinematic_z_contrast_by_finger_summary": success_kinematic_z.get(
+            "success_contrast_by_finger_summary", pd.DataFrame()
+        ),
+        "subject_finger_trajectory": trajectory_structure.get(
+            "subject_finger_trajectory", pd.DataFrame()
+        ),
+        "trajectory_variability_summary": trajectory_structure.get(
+            "trajectory_variability_summary", pd.DataFrame()
+        ),
+        "finger_trajectory_distance_paired": trajectory_structure.get(
+            "finger_trajectory_distance_paired", pd.DataFrame()
+        ),
+        "finger_trajectory_distance_summary": trajectory_structure.get(
+            "finger_trajectory_distance_summary", pd.DataFrame()
+        ),
+        "success_failure_trajectory_distance": trajectory_structure.get(
+            "success_failure_trajectory_distance", pd.DataFrame()
+        ),
+        "success_failure_trajectory_distance_summary": trajectory_structure.get(
+            "success_failure_trajectory_distance_summary", pd.DataFrame()
+        ),
+    }
+    _save_named_tables(output_root, advanced_tables)
+
+    subject_spatial = compute_subject_spatial_trajectory_analysis(trajectory_time_bins)
+    spatial_tables = {
+        "subject_xy_trajectory": subject_spatial.get("subject_xy_trajectory", pd.DataFrame()),
+        "subject_spatial_trajectory_summary": subject_spatial.get(
+            "subject_spatial_trajectory_summary", pd.DataFrame()
+        ),
+        "subject_finger_spatial_distance": subject_spatial.get(
+            "subject_finger_spatial_distance", pd.DataFrame()
+        ),
+        "subject_spatial_metric_distribution": subject_spatial.get(
+            "subject_spatial_metric_distribution", pd.DataFrame()
+        ),
+    }
+    _save_named_tables(output_root, spatial_tables)
+
+    subject_va = compute_subject_velocity_acceleration_analysis(trajectory_time_bins)
+    va_tables = {
+        "subject_velocity_acceleration_profile": subject_va.get(
+            "subject_velocity_acceleration_profile", pd.DataFrame()
+        ),
+        "subject_velocity_acceleration_summary": subject_va.get(
+            "subject_velocity_acceleration_summary", pd.DataFrame()
+        ),
+        "subject_finger_velocity_acceleration_distance": subject_va.get(
+            "subject_finger_velocity_acceleration_distance", pd.DataFrame()
+        ),
+        "subject_velocity_acceleration_metric_distribution": subject_va.get(
+            "subject_velocity_acceleration_metric_distribution", pd.DataFrame()
+        ),
+        "velocity_stiffness_influence_summary": subject_va.get(
+            "velocity_stiffness_influence_summary", pd.DataFrame()
+        ),
+        "velocity_finger_influence_summary": subject_va.get(
+            "velocity_finger_influence_summary", pd.DataFrame()
+        ),
+        "velocity_time_influence_summary": subject_va.get(
+            "velocity_time_influence_summary", pd.DataFrame()
+        ),
+    }
+    _save_named_tables(output_root, va_tables)
+
+    if not side_trials.empty:
+        save_csv(side_trials, output_root, "side_z_trial_summary.csv")
+    hand_orientation = compute_hand_orientation_plane_analysis(
+        trial_kinematic_summary, side_trials
+    )
+    hand_tables = {
+        "hand_orientation_plane_trials": hand_orientation.get(
+            "hand_orientation_plane_trials", pd.DataFrame()
+        ),
+        "hand_orientation_plane_summary": hand_orientation.get(
+            "hand_orientation_plane_summary", pd.DataFrame()
+        ),
+    }
+    _save_named_tables(output_root, hand_tables)
+
+    if save_figures:
+        save_motor_control_figures(output_root, motor_control, fig_dpi=fig_dpi)
+        save_advanced_kinematic_figures(
+            output_root, success_kinematic_z, trajectory_structure, fig_dpi=fig_dpi
+        )
+        save_subject_xy_trajectory_figures(
+            output_root, spatial_tables["subject_xy_trajectory"], fig_dpi=fig_dpi
+        )
+        save_subject_velocity_acceleration_figures(
+            output_root,
+            va_tables["subject_velocity_acceleration_profile"],
+            fig_dpi=fig_dpi,
+        )
+        save_hand_orientation_plane_figures(
+            output_root,
+            hand_tables["hand_orientation_plane_summary"],
+            hand_tables["hand_orientation_plane_trials"],
+            fig_dpi=fig_dpi,
+        )
+        save_hand_orientation_axis_matrix_figures(
+            output_root, hand_tables["hand_orientation_plane_trials"], fig_dpi=fig_dpi
+        )
+        save_movement_cycle_hand_angle_figures(
+            output_root, trajectory_time_bins, fig_dpi=fig_dpi
+        )
+        save_kinematic_figures(
+            output_root,
+            trial_kinematic_summary,
+            output_tables["group_time_summary"],
+            output_tables["direction_success_summary"],
+            output_tables["distance_success_summary"],
+            fig_dpi=fig_dpi,
+        )
+
+    return {
+        **output_tables,
+        **motor_tables,
+        **advanced_tables,
+        **spatial_tables,
+        **va_tables,
+        **hand_tables,
+    }
+
+
+def save_interaction_filtered_kinematic_outputs(
+    output_root: Path,
+    *,
+    trial_kinematic_summary: pd.DataFrame,
+    trajectory_time_bins: pd.DataFrame,
+    pair_kinematic_summary: Optional[pd.DataFrame] = None,
+    kinematic_samples: Optional[pd.DataFrame] = None,
+    side_z_trial_summary: Optional[pd.DataFrame] = None,
+    side_z_samples: Optional[pd.DataFrame] = None,
+    fig_dpi: int = 160,
+    save_figures: bool = True,
+    save_sample_tables: bool = False,
+) -> pd.DataFrame:
+    """Write mirrored all/S/C kinematic analysis folders.
+
+    The existing flat ``results`` directory remains compatible.  This helper
+    adds a branch architecture under ``results``:
+
+    - ``all``: the current/legacy analysis over every stiffness segment.
+    - ``standard`` (code ``S``): only standard-value interaction segments.
+    - ``Comparison`` (code ``C``): only comparison-value interaction segments.
+
+    Each branch recalculates subject, group, scope, motor-control, trajectory,
+    velocity/acceleration, hand-orientation, and success-linked tables from the
+    filtered rows so group and individual outputs stay aligned with the selected
+    interaction.
+    """
+
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    save_experiment_setup_context(output_root)
+    index_rows: list[dict[str, Any]] = []
+    for spec in KINEMATIC_INTERACTION_SCOPES:
+        scope = spec["interaction_scope"]
+        folder = output_root / spec["folder_name"]
+        folder.mkdir(parents=True, exist_ok=True)
+        save_experiment_setup_context(folder)
+
+        trial_subset = filter_kinematic_interaction(trial_kinematic_summary, scope)
+        time_subset = filter_kinematic_interaction(trajectory_time_bins, scope)
+        side_trial_subset = (
+            filter_kinematic_interaction(side_z_trial_summary, scope)
+            if side_z_trial_summary is not None
+            else pd.DataFrame()
+        )
+        save_csv(trial_subset, folder, "trial_kinematic_summary.csv")
+        save_csv(time_subset, folder, "trajectory_time_bins.csv")
+        if pair_kinematic_summary is not None:
+            pair_subset = (
+                pair_kinematic_summary.copy()
+                if scope == "all"
+                else pair_kinematic_summary[
+                    pair_kinematic_summary.get("trial_index_raw").isin(
+                        trial_subset.get("trial_index_raw", pd.Series(dtype=float))
+                    )
+                ].copy()
+                if "trial_index_raw" in pair_kinematic_summary.columns
+                else pair_kinematic_summary.copy()
+            )
+            save_csv(pair_subset, folder, "pair_kinematic_summary.csv")
+        if save_sample_tables and kinematic_samples is not None:
+            save_csv(
+                filter_kinematic_interaction(kinematic_samples, scope),
+                folder,
+                "kinematic_samples.csv",
+            )
+        if save_sample_tables and side_z_samples is not None:
+            save_csv(
+                filter_kinematic_interaction(side_z_samples, scope),
+                folder,
+                "side_z_samples.csv",
+            )
+
+        _save_interaction_summary_block(
+            folder,
+            trial_kinematic_summary=trial_subset,
+            trajectory_time_bins=time_subset,
+            side_z_trial_summary=side_trial_subset,
+            fig_dpi=fig_dpi,
+            save_figures=save_figures,
+        )
+        manifest = analysis_manifest(folder)
+        save_csv(manifest, folder, "analysis_manifest.csv")
+        index_rows.append(
+            {
+                **spec,
+                "path": str(folder),
+                "n_trial_segments": int(len(trial_subset)),
+                "n_time_bins": int(len(time_subset)),
+                "n_subjects": int(trial_subset["subject_id"].nunique())
+                if "subject_id" in trial_subset.columns
+                else 0,
+                "manifest_exists": bool((folder / "analysis_manifest.csv").exists()),
+            }
+        )
+
+    index = pd.DataFrame(index_rows)
+    save_csv(index, output_root, "interaction_analysis_folder_index.csv")
+    return index
 
 
 def _available_metric_columns(
@@ -3742,7 +4492,11 @@ def save_subject_xy_trajectory_figures(
         ax.legend(loc="best", fontsize=8)
         ax.grid(alpha=0.2)
         fig.tight_layout()
-        out = fig_dir / f"subject_{sanitize_name(subject)}_xy_trajectories.png"
+        out = subject_figure_path(
+            fig_dir,
+            subject,
+            f"subject_{sanitize_name(subject)}_xy_trajectories.png",
+        )
         fig.savefig(out, dpi=fig_dpi)
         plt.close(fig)
         paths.append(out)
@@ -4350,6 +5104,8 @@ def save_subject_velocity_acceleration_figures(
                 )
                 if np.isfinite(effective_cutoff):
                     cutoff_labels.append(f"{effective_cutoff:g}")
+                low = _mask_filter_plot_values(low)
+                high = _mask_filter_plot_values(high)
                 ax.plot(
                     avg["time_fraction"],
                     low,
@@ -4385,6 +5141,8 @@ def save_subject_velocity_acceleration_figures(
                 )
                 if np.isfinite(effective_cutoff):
                     cutoff_labels.append(f"{effective_cutoff:g}")
+                low = _mask_filter_plot_values(low)
+                high = _mask_filter_plot_values(high)
                 ax.plot(
                     avg["time_fraction"],
                     low,
@@ -4416,11 +5174,15 @@ def save_subject_velocity_acceleration_figures(
         fig.suptitle(
             f"Subject {subject}: velocity and acceleration components\n"
             "solid=LPF, dashed=HPF; thick lines=subject mean by stiffness, "
-            f"averaged across fingers{cutoff_note}",
+            f"averaged across fingers{cutoff_note}; shown |value| range: 1e-1 to 1e4",
             y=1.02,
         )
         fig.tight_layout()
-        out = fig_dir / f"subject_{sanitize_name(subject)}_velocity_acceleration.png"
+        out = subject_figure_path(
+            fig_dir,
+            subject,
+            f"subject_{sanitize_name(subject)}_velocity_acceleration.png",
+        )
         fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
         plt.close(fig)
         paths.append(out)
@@ -4815,6 +5577,7 @@ def compute_3d_proxy_kinematics(
                 "stiffness_value",
                 "side_time_fraction",
                 "side_z_lift_px",
+                "side_x_from_center_camera_corrected_px",
             ],
         ),
     ]:
@@ -4824,6 +5587,7 @@ def compute_3d_proxy_kinematics(
 
     rows: list[pd.DataFrame] = []
     keys = ["subject_id", "trial_index_raw", "stiffness_segment_id"]
+    side = add_side_camera_angle_normalization_columns(side)
     side_groups = {
         k: g.sort_values("side_time_fraction")
         for k, g in side.dropna(
@@ -4840,29 +5604,51 @@ def compute_3d_proxy_kinematics(
             z_old = pd.to_numeric(z_group["side_z_lift_px"], errors="coerce").to_numpy(
                 dtype=float
             )
+            lateral_old = (
+                pd.to_numeric(
+                    z_group.get("side_x_from_center_camera_corrected_px", np.nan),
+                    errors="coerce",
+                ).to_numpy(dtype=float)
+                if "side_x_from_center_camera_corrected_px" in z_group.columns
+                else np.full_like(z_old, np.nan, dtype=float)
+            )
             valid = np.isfinite(x_old) & np.isfinite(z_old)
             x_old = x_old[valid]
             z_old = z_old[valid]
+            lateral_old = lateral_old[valid]
             if x_old.size == 1:
                 g["z_lift_px"] = z_old[0]
+                g["side_lateral_camera_corrected_px"] = lateral_old[0]
             elif x_old.size > 1:
                 order = np.argsort(x_old)
                 x_old = x_old[order]
                 z_old = z_old[order]
+                lateral_old = lateral_old[order]
                 # Remove duplicated side fractions for stable interpolation.
                 unique_x, unique_idx = np.unique(x_old, return_index=True)
                 unique_z = z_old[unique_idx]
-                g["z_lift_px"] = np.interp(
+                unique_lateral = lateral_old[unique_idx]
+                sample_fraction = (
                     pd.to_numeric(g["stiffness_time_fraction"], errors="coerce")
                     .fillna(0)
-                    .clip(0, 1),
+                    .clip(0, 1)
+                )
+                g["z_lift_px"] = np.interp(
+                    sample_fraction,
                     unique_x,
                     unique_z,
                 )
+                g["side_lateral_camera_corrected_px"] = np.interp(
+                    sample_fraction,
+                    unique_x,
+                    unique_lateral,
+                )
             else:
                 g["z_lift_px"] = np.nan
+                g["side_lateral_camera_corrected_px"] = np.nan
         else:
             g["z_lift_px"] = np.nan
+            g["side_lateral_camera_corrected_px"] = np.nan
         x_col = (
             "x_lpf_px"
             if "x_lpf_px" in g.columns and g["x_lpf_px"].notna().any()
@@ -4876,6 +5662,12 @@ def compute_3d_proxy_kinematics(
         g["x_3d_px"] = pd.to_numeric(g[x_col], errors="coerce")
         g["y_3d_px"] = pd.to_numeric(g[y_col], errors="coerce")
         g["z_3d_proxy_px"] = pd.to_numeric(g["z_lift_px"], errors="coerce")
+        g["side_lateral_camera_corrected_px"] = pd.to_numeric(
+            g["side_lateral_camera_corrected_px"], errors="coerce"
+        )
+        g["side_lift_lateral_angle_camera_corrected_deg"] = np.degrees(
+            np.arctan2(g["z_3d_proxy_px"], g["side_lateral_camera_corrected_px"])
+        )
         if {"thumb_active_dx_px", "thumb_active_dy_px"}.issubset(g.columns):
             g["hand_orientation_xy_deg"] = np.degrees(
                 np.arctan2(g["thumb_active_dy_px"], g["thumb_active_dx_px"])
@@ -4916,7 +5708,9 @@ def compute_3d_proxy_kinematics(
         dx = g["x_3d_px"].diff()
         dy = g["y_3d_px"].diff()
         dz = g["z_3d_proxy_px"].diff()
+        dside = g["side_lateral_camera_corrected_px"].diff()
         step_3d = np.sqrt(dx**2 + dy**2 + dz**2)
+        side_view_step = np.sqrt(dside**2 + dz**2)
         x0 = valid["x_3d_px"].iloc[0]
         y0 = valid["y_3d_px"].iloc[0]
         z0 = valid["z_3d_proxy_px"].iloc[0]
@@ -4980,6 +5774,17 @@ def compute_3d_proxy_kinematics(
             "max_z_lift_px": float(
                 pd.to_numeric(g["z_3d_proxy_px"], errors="coerce").max()
             ),
+            "mean_side_lateral_camera_corrected_px": float(
+                pd.to_numeric(
+                    g["side_lateral_camera_corrected_px"], errors="coerce"
+                ).mean()
+            ),
+            "path_length_side_view_camera_corrected_px": float(
+                np.nansum(side_view_step)
+            ),
+            "mean_side_lift_lateral_angle_camera_corrected_deg": _circ_mean_deg(
+                g["side_lift_lateral_angle_camera_corrected_deg"]
+            ),
             "mean_hand_orientation_xy_deg": _circ_mean_deg(g["hand_orientation_xy_deg"])
             if "hand_orientation_xy_deg" in g.columns
             else np.nan,
@@ -5020,6 +5825,18 @@ def compute_3d_proxy_kinematics(
                 ),
                 mean_z_lift_px=("mean_z_lift_px", "mean"),
                 max_z_lift_px=("max_z_lift_px", "mean"),
+                mean_side_lateral_camera_corrected_px=(
+                    "mean_side_lateral_camera_corrected_px",
+                    "mean",
+                ),
+                path_length_side_view_camera_corrected_px=(
+                    "path_length_side_view_camera_corrected_px",
+                    "mean",
+                ),
+                mean_side_lift_lateral_angle_camera_corrected_deg=(
+                    "mean_side_lift_lateral_angle_camera_corrected_deg",
+                    lambda s: _circ_mean_deg(s),
+                ),
                 mean_hand_orientation_xy_deg=(
                     "mean_hand_orientation_xy_deg",
                     lambda s: _circ_mean_deg(s),
@@ -5055,6 +5872,9 @@ def compute_3d_proxy_kinematics(
             "peak_acceleration_3d_proxy_px_s2",
             "mean_z_lift_px",
             "max_z_lift_px",
+            "mean_side_lateral_camera_corrected_px",
+            "path_length_side_view_camera_corrected_px",
+            "mean_side_lift_lateral_angle_camera_corrected_deg",
             "mean_hand_orientation_xy_deg",
             "mean_hand_orientation_yz_deg",
             "mean_hand_orientation_zx_deg",
@@ -5070,6 +5890,8 @@ def compute_3d_proxy_kinematics(
             "max_radius_3d_from_center_px",
             "peak_velocity_3d_proxy_px_s",
             "peak_acceleration_3d_proxy_px_s2",
+            "path_length_side_view_camera_corrected_px",
+            "mean_side_lift_lateral_angle_camera_corrected_deg",
         ],
     )
     return {
@@ -5324,8 +6146,10 @@ def save_3d_proxy_figures(
                 y=0.99,
             )
             fig.tight_layout(rect=[0, 0, 1, 0.95])
-            out = (
-                fig_dir / f"subject_{sanitize_name(subject)}_3d_proxy_trajectories.png"
+            out = subject_figure_path(
+                fig_dir,
+                subject,
+                f"subject_{sanitize_name(subject)}_3d_proxy_trajectories.png",
             )
             fig.savefig(out, dpi=fig_dpi)
             plt.close(fig)
@@ -5555,6 +6379,137 @@ def compute_hand_orientation_plane_analysis(
     }
 
 
+def _prepare_hand_orientation_xy_vector_trials(
+    hand_orientation_plane_trials: pd.DataFrame,
+) -> tuple[pd.DataFrame, str | None]:
+    """Return thumb-to-active-finger XY vectors for hand-orientation plots.
+
+    The ``hand_orientation_planes`` figures are intended to show hand posture:
+    the vector from the thumb marker to the active-finger marker.  They must not
+    use centered hand/workspace position columns, which describe where the hand
+    moved in the workspace rather than how the hand was oriented.
+    """
+
+    if hand_orientation_plane_trials.empty:
+        return pd.DataFrame(), None
+    trials = add_success_label_column(
+        add_protocol_demographic_factors(
+            add_workspace_normalization_columns(hand_orientation_plane_trials)
+        )
+    ).copy()
+    if "finger_condition" in trials.columns:
+        trials["finger_condition"] = trials["finger_condition"].map(
+            normalize_finger_condition
+        )
+    required = {"stiffness_value", "finger_condition"}
+    if not required.issubset(trials.columns):
+        return pd.DataFrame(), None
+
+    dx_col = _first_existing_column(
+        trials, ["hand_orientation_dx_px", "thumb_active_dx_px"]
+    )
+    dy_col = _first_existing_column(
+        trials, ["hand_orientation_dy_px", "thumb_active_dy_px"]
+    )
+    magnitude_col = _first_existing_column(
+        trials, ["mean_thumb_active_span_px", "thumb_active_span_px"]
+    )
+    angle_col = _first_existing_column(
+        trials, ["hand_orientation_xy_deg", "mean_hand_orientation_xy_deg"]
+    )
+
+    if dx_col is not None and dy_col is not None:
+        trials["_vector_dx"] = pd.to_numeric(trials[dx_col], errors="coerce")
+        trials["_vector_dy"] = pd.to_numeric(trials[dy_col], errors="coerce")
+        vector_source = f"{dx_col}/{dy_col}"
+    elif magnitude_col is not None and angle_col is not None:
+        span = pd.to_numeric(trials[magnitude_col], errors="coerce")
+        angle_rad = np.deg2rad(pd.to_numeric(trials[angle_col], errors="coerce"))
+        trials["_vector_dx"] = span * np.cos(angle_rad)
+        trials["_vector_dy"] = span * np.sin(angle_rad)
+        vector_source = f"{magnitude_col}+{angle_col}"
+    else:
+        return pd.DataFrame(), None
+
+    trials["_orientation_span_px"] = np.hypot(trials["_vector_dx"], trials["_vector_dy"])
+    finite_span = trials["_orientation_span_px"].replace([np.inf, -np.inf], np.nan)
+    finite_span = finite_span[finite_span > 0].dropna()
+    if len(finite_span) > 2:
+        span_p05 = float(finite_span.quantile(0.05))
+        span_p95 = float(finite_span.quantile(0.95))
+        if np.isfinite(span_p05) and np.isfinite(span_p95) and span_p95 > span_p05:
+            trials = trials[
+                trials["_orientation_span_px"].between(
+                    span_p05, span_p95, inclusive="both"
+                )
+            ].copy()
+    trials = trials.dropna(
+        subset=[
+            "stiffness_value",
+            "finger_condition",
+            "_orientation_span_px",
+            "_vector_dx",
+            "_vector_dy",
+        ]
+    )
+    trials = trials[trials["_orientation_span_px"] > 0].copy()
+    return trials, vector_source
+
+
+def _hand_orientation_matrix_scopes(
+    trials: pd.DataFrame,
+) -> list[tuple[str, str, pd.DataFrame]]:
+    trials = trials.copy()
+    scopes: list[tuple[str, str, pd.DataFrame]] = []
+    seen: set[str] = set()
+
+    def add_scope(name: str, label: str, subset: pd.DataFrame) -> None:
+        if subset.empty or name in seen:
+            return
+        seen.add(name)
+        scopes.append((name, label, subset.copy()))
+
+    if "subject_id" in trials.columns:
+        for subject in sorted(trials["subject_id"].dropna().unique(), key=str):
+            add_scope(
+                f"subject_{sanitize_name(subject)}",
+                f"Subject {subject}",
+                trials[trials["subject_id"].astype(str) == str(subject)],
+            )
+    if EXPERIMENT_GROUP_COLUMN in trials.columns or "subject_id" in trials.columns:
+        group_series = (
+            trials[EXPERIMENT_GROUP_COLUMN].copy()
+            if EXPERIMENT_GROUP_COLUMN in trials.columns
+            else pd.Series(np.nan, index=trials.index)
+        )
+        if "subject_id" in trials.columns:
+            subject_text = trials["subject_id"].astype(str).str.upper()
+            for group in ["N_E", "N_P", "L_E", "L_P"]:
+                missing_group = group_series.isna() | (
+                    group_series.astype(str).str.lower() == "nan"
+                )
+                group_series = group_series.mask(
+                    missing_group & subject_text.str.startswith(group),
+                    group,
+                )
+        trials["_hand_orientation_experiment_group"] = group_series
+        group_labels = {
+            "N_E": "N group (E only)",
+            "N_P": "N group (P only)",
+            "L_E": "L group (E only)",
+            "L_P": "L group (P only)",
+        }
+        for group in ["N_E", "N_P", "L_E", "L_P"]:
+            add_scope(
+                f"group_{group}",
+                group_labels[group],
+                trials[
+                    trials["_hand_orientation_experiment_group"].astype(str) == group
+                ],
+            )
+    return scopes
+
+
 def save_hand_orientation_plane_figures(
     output_root: Path,
     hand_orientation_plane_summary: pd.DataFrame,
@@ -5562,12 +6517,12 @@ def save_hand_orientation_plane_figures(
     *,
     fig_dpi: int = 160,
 ) -> list[Path]:
-    """Save grouped XY/YZ/ZX orientation summaries and vector panels."""
+    """Save thumb-to-active-finger XY orientation matrices by participant/group."""
 
     fig_dir = output_root / "figures" / "hand_orientation_planes"
     fig_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
-    if hand_orientation_plane_summary.empty:
+    if hand_orientation_plane_trials is None or hand_orientation_plane_trials.empty:
         save_csv(
             pd.DataFrame({"figure": []}),
             output_root,
@@ -5575,210 +6530,665 @@ def save_hand_orientation_plane_figures(
         )
         return paths
 
-    summary = hand_orientation_plane_summary.copy()
-    summary["group"] = summary["group"].astype(str)
-    if hand_orientation_plane_trials is None or hand_orientation_plane_trials.empty:
-        for scope, scope_df in summary.groupby("scope", dropna=False):
-            if scope_df.empty:
-                continue
-            fig, axes = plt.subplots(1, 3, figsize=(15, 5.1))
-            groups = sorted(scope_df["group"].dropna().unique(), key=str)
-            colors = _figure_colors(groups)
-            plane_specs = [
-                ("XY", "X proxy (resultant)", "Y proxy (resultant)"),
-                ("YZ", "Y proxy (resultant)", "Z/lift proxy (resultant)"),
-                ("ZX", "Z/lift proxy (resultant)", "X proxy (resultant)"),
-            ]
-            for ax, (plane, x_label, y_label) in zip(axes, plane_specs):
-                p = scope_df[scope_df["plane"] == plane]
-                if p.empty:
-                    ax.set_visible(False)
-                    continue
-                for _, row in p.iterrows():
-                    angle = float(row.get("circular_mean_deg", np.nan))
-                    length = float(row.get("resultant_length", np.nan))
-                    if not np.isfinite(angle) or not np.isfinite(length):
-                        continue
-                    dx = length * np.cos(np.deg2rad(angle))
-                    dy = length * np.sin(np.deg2rad(angle))
-                    group = str(row.get("group", "group"))
-                    ax.quiver(
-                        [0],
-                        [0],
-                        [dx],
-                        [dy],
-                        angles="xy",
-                        scale_units="xy",
-                        scale=1,
-                        color=colors.get(group),
-                        width=0.011,
-                        label=group,
-                    )
-                ax.set_xlim(-1.05, 1.05)
-                ax.set_ylim(-1.05, 1.05)
-                ax.axhline(0, color="0.55", linewidth=0.8)
-                ax.axvline(0, color="0.55", linewidth=0.8)
-                ax.set_aspect("equal", adjustable="box")
-                ax.set_title(f"{plane} orientation vectors")
-                ax.set_xlabel(x_label)
-                ax.set_ylabel(y_label)
-                ax.grid(alpha=0.18)
-            handles, labels = axes[0].get_legend_handles_labels()
-            if handles:
-                fig.legend(
-                    handles,
-                    labels,
-                    loc="lower center",
-                    ncol=min(6, len(labels)),
-                )
-            fig.suptitle(
-                f"Hand / active-finger orientation vectors by {scope}\n"
-                "summary vectors: direction=circular mean, length=resultant length",
-                y=0.98,
-            )
-            fig.tight_layout(rect=[0, 0.06, 1, 0.92])
-            safe_scope = (
-                re.sub(r"[^A-Za-z0-9_.-]+", "_", str(scope)).strip("_") or "scope"
-            )
-            out = fig_dir / f"hand_orientation_planes_by_{safe_scope}.png"
-            fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
-            plt.close(fig)
-            paths.append(out)
+    trials, vector_source = _prepare_hand_orientation_xy_vector_trials(
+        hand_orientation_plane_trials
+    )
+    if trials.empty or vector_source is None:
+        save_csv(
+            pd.DataFrame({"figure": []}),
+            output_root,
+            "hand_orientation_plane_figure_manifest.csv",
+        )
+        return paths
 
-    if hand_orientation_plane_trials is not None and not hand_orientation_plane_trials.empty:
-        trials = add_success_label_column(
-            add_protocol_demographic_factors(
-                add_workspace_normalization_columns(hand_orientation_plane_trials)
-            )
-        ).copy()
-        if {"hand_orientation_dx_px", "hand_orientation_dy_px"}.issubset(trials.columns):
-            if "mean_side_z_lift_px" in trials.columns:
-                trials["hand_orientation_dz_px"] = pd.to_numeric(
-                    trials["mean_side_z_lift_px"], errors="coerce"
-                )
-            else:
-                trials["hand_orientation_dz_px"] = np.nan
-            plane_specs = [
-                ("XY", "hand_orientation_dx_px", "hand_orientation_dy_px", "X proxy (px)", "Y proxy (px)"),
-                ("YZ", "hand_orientation_dy_px", "hand_orientation_dz_px", "Y proxy (px)", "Z/lift proxy (px)"),
-                ("ZX", "hand_orientation_dz_px", "hand_orientation_dx_px", "Z/lift proxy (px)", "X proxy (px)"),
-            ]
-            scope_columns = [
-                ("all", None),
-                ("experiment_group", EXPERIMENT_GROUP_COLUMN),
-                ("subject_group", "subject_group"),
-                ("workspace", "workspace_setup"),
-                ("success", "success_label"),
-                ("finger", "finger_condition"),
-                ("stiffness", "stiffness_value"),
-                ("protocol", "protocol_factor"),
-                ("sex", "sex_factor"),
-                ("age", "age_group"),
-            ]
-            for scope, col in scope_columns:
-                if col is not None and (
-                    col not in trials.columns or not trials[col].notna().any()
-                ):
+    stiffness_values = sorted(trials["stiffness_value"].dropna().unique(), key=float)
+    stiffness_colors = _stiffness_viridis_colors(stiffness_values)
+    finger_values = [
+        finger
+        for finger in FINGER_ORDER
+        if finger in set(trials["finger_condition"].dropna().astype(str))
+    ]
+    other_fingers = sorted(
+        {str(finger) for finger in trials["finger_condition"].dropna().unique()}
+        - set(finger_values),
+        key=str,
+    )
+    finger_values.extend(other_fingers)
+
+    for scope_name, scope_label, scope_df in _hand_orientation_matrix_scopes(trials):
+        scope_values = scope_df[["_vector_dx", "_vector_dy"]].to_numpy(dtype=float)
+        scope_vector_extent = (
+            np.nanmax(np.abs(scope_values)) if np.isfinite(scope_values).any() else 1.0
+        )
+        scope_limit = max(float(scope_vector_extent) * 1.12, 1.0)
+        scope_fingers = [
+            finger
+            for finger in finger_values
+            if not scope_df[
+                scope_df["finger_condition"].astype(str) == str(finger)
+            ].empty
+        ]
+        if not scope_fingers:
+            continue
+        scope_stiffness_values = [
+            stiffness
+            for stiffness in stiffness_values
+            if not scope_df[scope_df["stiffness_value"] == stiffness].empty
+        ]
+        ncols = min(2, len(scope_fingers))
+        nrows = int(math.ceil(len(scope_fingers) / ncols))
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(6.0 * ncols, 5.4 * nrows),
+            squeeze=False,
+            sharex=True,
+            sharey=True,
+        )
+        for ax in axes.ravel():
+            ax.set_visible(False)
+        for finger_idx, finger in enumerate(scope_fingers):
+            ax = axes[finger_idx // ncols, finger_idx % ncols]
+            ax.set_visible(True)
+            finger_df = scope_df[scope_df["finger_condition"].astype(str) == str(finger)]
+            for stiffness in scope_stiffness_values:
+                stiff_finger_df = finger_df[finger_df["stiffness_value"] == stiffness]
+                if stiff_finger_df.empty:
                     continue
-                plot_trials = trials.copy()
-                plot_trials["_group"] = "all" if col is None else plot_trials[col].astype(str)
-                plot_trials = plot_trials.dropna(
-                    subset=["hand_orientation_dx_px", "hand_orientation_dy_px"],
-                    how="all",
+                color = stiffness_colors.get(stiffness)
+                dx = pd.to_numeric(stiff_finger_df["_vector_dx"], errors="coerce")
+                dy = pd.to_numeric(stiff_finger_df["_vector_dy"], errors="coerce")
+                draw_df = pd.DataFrame({"dx": dx, "dy": dy}).dropna()
+                if len(draw_df) > 250:
+                    draw_df = draw_df.sample(n=250, random_state=20260524)
+                ax.quiver(
+                    np.zeros(len(draw_df)),
+                    np.zeros(len(draw_df)),
+                    draw_df["dx"],
+                    draw_df["dy"],
+                    angles="xy",
+                    scale_units="xy",
+                    scale=1,
+                    color=color,
+                    alpha=0.09,
+                    width=0.0022,
                 )
-                if plot_trials.empty:
-                    continue
-                groups = sorted(plot_trials["_group"].dropna().unique(), key=str)
-                colors = _figure_colors(groups)
-                fig, axes = plt.subplots(1, 3, figsize=(15, 5.1))
-                for ax, (plane, x_col, y_col, x_label, y_label) in zip(axes, plane_specs):
-                    plane_df = plot_trials.dropna(subset=[x_col, y_col]).copy()
-                    if plane_df.empty:
-                        ax.set_visible(False)
-                        continue
-                    # Faded individual vectors are the motor-control style
-                    # background; thick vectors are circular/Cartesian group means.
-                    bg = plane_df
-                    if len(bg) > 900:
-                        bg = bg.sample(n=900, random_state=20260518)
+                median_dx = float(dx.median())
+                median_dy = float(dy.median())
+                if np.isfinite(median_dx) and np.isfinite(median_dy):
                     ax.quiver(
-                        np.zeros(len(bg)),
-                        np.zeros(len(bg)),
-                        pd.to_numeric(bg[x_col], errors="coerce"),
-                        pd.to_numeric(bg[y_col], errors="coerce"),
+                        [0],
+                        [0],
+                        [median_dx],
+                        [median_dy],
                         angles="xy",
                         scale_units="xy",
                         scale=1,
-                        color="0.2",
-                        alpha=0.08,
-                        width=0.0025,
+                        color=color,
+                        width=0.013,
                     )
-                    for group, group_df in plane_df.groupby("_group", dropna=False):
-                        gx = pd.to_numeric(group_df[x_col], errors="coerce").mean()
-                        gy = pd.to_numeric(group_df[y_col], errors="coerce").mean()
-                        if not np.isfinite(gx) or not np.isfinite(gy):
-                            continue
-                        ax.quiver(
-                            [0],
-                            [0],
-                            [gx],
-                            [gy],
-                            angles="xy",
-                            scale_units="xy",
-                            scale=1,
-                            color=colors.get(group),
-                            width=0.011,
-                            label=str(group),
-                        )
-                    lim = float(
-                        np.nanmax(
-                            np.abs(
-                                plane_df[[x_col, y_col]]
-                                .apply(pd.to_numeric, errors="coerce")
-                                .to_numpy()
-                            )
-                        )
-                    )
-                    lim = max(lim * 1.12, 1.0)
-                    ax.set_xlim(-lim, lim)
-                    ax.set_ylim(-lim, lim)
-                    ax.axhline(0, color="0.55", linewidth=0.8)
-                    ax.axvline(0, color="0.55", linewidth=0.8)
-                    ax.set_aspect("equal", adjustable="box")
-                    ax.set_title(f"{plane} orientation vectors")
-                    ax.set_xlabel(x_label)
-                    ax.set_ylabel(y_label)
-                    ax.grid(alpha=0.18)
-                handles, labels = axes[0].get_legend_handles_labels()
-                if handles:
-                    fig.legend(
-                        handles,
-                        labels,
-                        loc="lower center",
-                        ncol=min(6, len(labels)),
-                    )
-                fig.suptitle(
-                    f"Hand / active-finger orientation vectors by {scope}\n"
-                    "faded=individual trials, thick=group mean vector; angles remain in camera/proxy units",
-                    y=0.98,
-                )
-                fig.tight_layout(rect=[0, 0.06, 1, 0.92])
-                safe_scope = (
-                    re.sub(r"[^A-Za-z0-9_.-]+", "_", str(scope)).strip("_")
-                    or "scope"
-                )
-                out = fig_dir / f"orientation_vector_planes_by_{safe_scope}.png"
-                fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
-                paths.append(out)
-                out = fig_dir / f"hand_orientation_planes_by_{safe_scope}.png"
-                fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
-                plt.close(fig)
-                paths.append(out)
+            ax.axhline(0, color="0.55", linewidth=0.8)
+            ax.axvline(0, color="0.55", linewidth=0.8)
+            ax.set_xlim(-scope_limit, scope_limit)
+            ax.set_ylim(-scope_limit, scope_limit)
+            ax.set_aspect("equal", adjustable="box")
+            ax.grid(alpha=0.18)
+            ax.set_title(FINGER_LABELS.get(str(finger), str(finger)))
+            ax.set_xlabel("Thumb→active-finger dx (px)")
+            ax.set_ylabel("Thumb→active-finger dy (px)")
+        fig.suptitle(
+            f"{scope_label}: thumb→active-finger XY orientation vectors by finger\n"
+            "matrix panels=fingers; colors=stiffness; "
+            "faded=trials; thick=median per stiffness; "
+            f"orientation span trimmed to P5-P95; source={vector_source}",
+            y=0.99,
+        )
+        if scope_stiffness_values:
+            legend_handles = [
+                Line2D([0], [0], color=stiffness_colors.get(stiffness), linewidth=3.0)
+                for stiffness in scope_stiffness_values
+            ]
+            legend_labels = [f"{stiffness:g}" for stiffness in scope_stiffness_values]
+            fig.legend(
+                legend_handles,
+                legend_labels,
+                title="Stiffness\n25=purple\n145=yellow",
+                loc="center right",
+                bbox_to_anchor=(0.995, 0.5),
+                ncol=1,
+                fontsize=8,
+            )
+        fig.tight_layout(rect=[0, 0.02, 0.88, 0.94])
+        out = subject_figure_path_for_scope(
+            fig_dir,
+            scope_name,
+            f"hand_orientation_xy_vectors_{scope_name}.png",
+        )
+        fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
+        plt.close(fig)
+        paths.append(out)
 
     save_csv(
         pd.DataFrame({"figure": [str(p) for p in paths]}),
         output_root,
         "hand_orientation_plane_figure_manifest.csv",
+    )
+    return paths
+
+
+def save_hand_orientation_axis_matrix_figures(
+    output_root: Path,
+    hand_orientation_plane_trials: pd.DataFrame,
+    *,
+    fig_dpi: int = 160,
+) -> list[Path]:
+    """Save XY/YZ/ZX orientation-vector matrices by finger and stiffness.
+
+    Rows are projection planes (XY, YZ, ZX), columns are active fingers, faded
+    arrows are trials, and thick arrows are medians per stiffness.  The XY row
+    uses the corrected thumb-to-active-finger vector.  The YZ/ZX rows combine
+    that top-camera vector with the side-camera Z/lift proxy.
+    """
+
+    fig_dir = output_root / "figures" / "hand_orientation_axis_matrices"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+
+    if hand_orientation_plane_trials.empty:
+        save_csv(
+            pd.DataFrame({"figure": []}),
+            output_root,
+            "hand_orientation_axis_matrix_figure_manifest.csv",
+        )
+        return paths
+
+    trials, vector_source = _prepare_hand_orientation_xy_vector_trials(
+        hand_orientation_plane_trials
+    )
+    z_col = _first_existing_column(
+        trials, ["mean_side_z_lift_px", "max_side_z_lift_px", "z_3d_proxy_px"]
+    )
+    if trials.empty or vector_source is None or z_col is None:
+        save_csv(
+            pd.DataFrame({"figure": []}),
+            output_root,
+            "hand_orientation_axis_matrix_figure_manifest.csv",
+        )
+        return paths
+
+    trials["_vector_z"] = pd.to_numeric(trials[z_col], errors="coerce")
+    trials = trials.dropna(subset=["_vector_z"]).copy()
+    if trials.empty:
+        save_csv(
+            pd.DataFrame({"figure": []}),
+            output_root,
+            "hand_orientation_axis_matrix_figure_manifest.csv",
+        )
+        return paths
+
+    plane_specs = [
+        ("XY", "_vector_dx", "_vector_dy", "dx thumb-to-active (px)", "dy thumb-to-active (px)"),
+        ("YZ", "_vector_dy", "_vector_z", "dy thumb-to-active (px)", "side Z/lift proxy (px)"),
+        ("ZX", "_vector_z", "_vector_dx", "side Z/lift proxy (px)", "dx thumb-to-active (px)"),
+    ]
+    stiffness_values = sorted(trials["stiffness_value"].dropna().unique(), key=float)
+    stiffness_colors = _stiffness_viridis_colors(stiffness_values)
+    finger_values = [
+        finger
+        for finger in FINGER_ORDER
+        if finger in set(trials["finger_condition"].dropna().astype(str))
+    ]
+    other_fingers = sorted(
+        {str(finger) for finger in trials["finger_condition"].dropna().unique()}
+        - set(finger_values),
+        key=str,
+    )
+    finger_values.extend(other_fingers)
+
+    for scope_name, scope_label, scope_df in _hand_orientation_matrix_scopes(trials):
+        scope_fingers = [
+            finger
+            for finger in finger_values
+            if not scope_df[
+                scope_df["finger_condition"].astype(str) == str(finger)
+            ].empty
+        ]
+        if not scope_fingers:
+            continue
+        scope_stiffness_values = [
+            stiffness
+            for stiffness in stiffness_values
+            if not scope_df[scope_df["stiffness_value"] == stiffness].empty
+        ]
+
+        plane_limits: dict[str, float] = {}
+        for plane_name, x_col, y_col, _, _ in plane_specs:
+            values = scope_df[[x_col, y_col]].to_numpy(dtype=float)
+            extent = np.nanmax(np.abs(values)) if np.isfinite(values).any() else 1.0
+            plane_limits[plane_name] = max(float(extent) * 1.12, 1.0)
+
+        fig, axes = plt.subplots(
+            len(plane_specs),
+            len(scope_fingers),
+            figsize=(4.8 * len(scope_fingers), 4.4 * len(plane_specs)),
+            squeeze=False,
+            sharex=False,
+            sharey=False,
+        )
+
+        for row_idx, (plane_name, x_col, y_col, x_label, y_label) in enumerate(
+            plane_specs
+        ):
+            limit = plane_limits[plane_name]
+            for col_idx, finger in enumerate(scope_fingers):
+                ax = axes[row_idx, col_idx]
+                finger_df = scope_df[
+                    scope_df["finger_condition"].astype(str) == str(finger)
+                ]
+                for stiffness in scope_stiffness_values:
+                    stiff_finger_df = finger_df[
+                        finger_df["stiffness_value"] == stiffness
+                    ]
+                    if stiff_finger_df.empty:
+                        continue
+                    color = stiffness_colors.get(stiffness)
+                    draw_df = pd.DataFrame(
+                        {
+                            "x": pd.to_numeric(stiff_finger_df[x_col], errors="coerce"),
+                            "y": pd.to_numeric(stiff_finger_df[y_col], errors="coerce"),
+                        }
+                    ).dropna()
+                    if len(draw_df) > 200:
+                        draw_df = draw_df.sample(n=200, random_state=20260527)
+                    ax.quiver(
+                        np.zeros(len(draw_df)),
+                        np.zeros(len(draw_df)),
+                        draw_df["x"],
+                        draw_df["y"],
+                        angles="xy",
+                        scale_units="xy",
+                        scale=1,
+                        color=color,
+                        alpha=0.08,
+                        width=0.002,
+                    )
+                    median_x = float(
+                        pd.to_numeric(stiff_finger_df[x_col], errors="coerce").median()
+                    )
+                    median_y = float(
+                        pd.to_numeric(stiff_finger_df[y_col], errors="coerce").median()
+                    )
+                    if np.isfinite(median_x) and np.isfinite(median_y):
+                        ax.quiver(
+                            [0],
+                            [0],
+                            [median_x],
+                            [median_y],
+                            angles="xy",
+                            scale_units="xy",
+                            scale=1,
+                            color=color,
+                            width=0.012,
+                        )
+                ax.axhline(0, color="0.55", linewidth=0.8)
+                ax.axvline(0, color="0.55", linewidth=0.8)
+                ax.set_xlim(-limit, limit)
+                ax.set_ylim(-limit, limit)
+                ax.set_aspect("equal", adjustable="box")
+                ax.grid(alpha=0.18)
+                if row_idx == 0:
+                    ax.set_title(FINGER_LABELS.get(str(finger), str(finger)))
+                if col_idx == 0:
+                    ax.set_ylabel(f"{plane_name}\n{y_label}")
+                else:
+                    ax.set_ylabel(y_label)
+                ax.set_xlabel(x_label)
+
+        fig.suptitle(
+            f"{scope_label}: hand-orientation plane matrix\n"
+            "rows=axes/projection planes; columns=fingers; colors=stiffness; "
+            "faded=trials; thick=median per stiffness; "
+            f"XY source={vector_source}; Z source={z_col}",
+            y=0.995,
+        )
+        if scope_stiffness_values:
+            legend_handles = [
+                Line2D([0], [0], color=stiffness_colors.get(stiffness), linewidth=3.0)
+                for stiffness in scope_stiffness_values
+            ]
+            legend_labels = [f"{stiffness:g}" for stiffness in scope_stiffness_values]
+            fig.legend(
+                legend_handles,
+                legend_labels,
+                title="Stiffness\n25=purple\n145=yellow",
+                loc="center right",
+                bbox_to_anchor=(0.995, 0.5),
+                ncol=1,
+                fontsize=8,
+            )
+        fig.tight_layout(rect=[0, 0.02, 0.90, 0.95])
+        out = subject_figure_path_for_scope(
+            fig_dir,
+            scope_name,
+            f"hand_orientation_axis_matrix_{scope_name}.png",
+        )
+        fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
+        plt.close(fig)
+        paths.append(out)
+
+    save_csv(
+        pd.DataFrame({"figure": [str(p) for p in paths]}),
+        output_root,
+        "hand_orientation_axis_matrix_figure_manifest.csv",
+    )
+    return paths
+
+
+def _movement_cycle_time_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
+    d = df.copy()
+    if "stiffness_time_s" in d.columns:
+        d["movement_cycle_time_s"] = pd.to_numeric(
+            d["stiffness_time_s"], errors="coerce"
+        )
+        if d["movement_cycle_time_s"].notna().any():
+            return d, "movement_cycle_time_s", "Movement-cycle time (s)"
+    if {
+        "stiffness_time_fraction",
+        "stiffness_start_fraction",
+        "stiffness_end_fraction",
+        "time_to_answer_s",
+    }.issubset(d.columns):
+        duration = (
+            pd.to_numeric(d["stiffness_end_fraction"], errors="coerce")
+            - pd.to_numeric(d["stiffness_start_fraction"], errors="coerce")
+        ) * pd.to_numeric(d["time_to_answer_s"], errors="coerce")
+        d["movement_cycle_time_s"] = (
+            pd.to_numeric(d["stiffness_time_fraction"], errors="coerce") * duration
+        )
+        if d["movement_cycle_time_s"].notna().any():
+            return d, "movement_cycle_time_s", "Movement-cycle time (s)"
+    if {"time_fraction", "time_to_answer_s"}.issubset(d.columns):
+        d["movement_cycle_time_s"] = pd.to_numeric(
+            d["time_fraction"], errors="coerce"
+        ) * pd.to_numeric(d["time_to_answer_s"], errors="coerce")
+        if d["movement_cycle_time_s"].notna().any():
+            return d, "movement_cycle_time_s", "Trial time (s)"
+    if "stiffness_time_fraction" in d.columns:
+        return d, "stiffness_time_fraction", "Normalized movement-cycle time"
+    return d, "time_fraction", "Normalized trial time"
+
+
+def _movement_cycle_scope_variants(
+    df: pd.DataFrame,
+) -> list[tuple[str, str, pd.DataFrame]]:
+    scopes: list[tuple[str, str, pd.DataFrame]] = []
+    seen: set[str] = set()
+
+    def add_scope(prefix: str, label: str, subset: pd.DataFrame) -> None:
+        if subset.empty or prefix in seen:
+            return
+        seen.add(prefix)
+        scopes.append((prefix, label, subset.copy()))
+
+    if "subject_id" in df.columns:
+        for subject in sorted(df["subject_id"].dropna().unique(), key=str):
+            add_scope(
+                f"subject_{sanitize_name(subject)}",
+                f"Subject {subject}",
+                df[df["subject_id"].astype(str) == str(subject)],
+            )
+    if "subject_group" in df.columns:
+        for group in sorted(df["subject_group"].dropna().unique(), key=str):
+            add_scope(
+                f"group_{sanitize_name(group)}",
+                f"Group {group}",
+                df[df["subject_group"].astype(str) == str(group)],
+            )
+    if EXPERIMENT_GROUP_COLUMN in df.columns:
+        for group in sorted(df[EXPERIMENT_GROUP_COLUMN].dropna().unique(), key=str):
+            add_scope(
+                f"experiment_group_{sanitize_name(group)}",
+                f"Experiment group {group}",
+                df[df[EXPERIMENT_GROUP_COLUMN].astype(str) == str(group)],
+            )
+    return scopes
+
+
+def _trial_group_columns(df: pd.DataFrame) -> list[str]:
+    candidates = [
+        "subject_id",
+        "tracking_file",
+        "trial_index_raw",
+        "pair_number",
+        "stiffness_segment_id",
+    ]
+    cols = [col for col in candidates if col in df.columns]
+    return cols or ["trajectory_time_bin"]
+
+
+def save_movement_cycle_hand_angle_figures(
+    output_root: Path,
+    trajectory_time_bins: pd.DataFrame,
+    fig_dpi: int = 160,
+) -> list[Path]:
+    """Plot movement direction and hand angle over each stiffness cycle.
+
+    Each figure overlays all trials as faint per-trial trajectories and adds
+    thick circular mean/median angle trajectories per stiffness value.
+    """
+    fig_dir = output_root / "figures" / "movement_cycle_hand_angles"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    required = {
+        "stiffness_value",
+        "trajectory_time_bin",
+        "movement_angle_deg",
+        "hand_orientation_xy_deg",
+    }
+    if trajectory_time_bins.empty or not required.issubset(trajectory_time_bins.columns):
+        save_csv(
+            pd.DataFrame({"figure": [str(p) for p in paths]}),
+            output_root,
+            "movement_cycle_hand_angle_figure_manifest.csv",
+        )
+        return paths
+
+    d = add_protocol_demographic_factors(
+        add_workspace_normalization_columns(trajectory_time_bins.copy())
+    )
+    if "subject_id" in d.columns:
+        subject_text = d["subject_id"].astype(str)
+        d = d[~subject_text.str.contains("_P_", case=False, na=False)].copy()
+    if "finger_condition" in d.columns:
+        d["finger_condition"] = d["finger_condition"].map(normalize_finger_condition)
+    d, time_col, _time_label = _movement_cycle_time_columns(d)
+    numeric_cols = [
+        "stiffness_value",
+        "trajectory_time_bin",
+        time_col,
+        "movement_angle_deg",
+        "hand_orientation_xy_deg",
+    ]
+    for col in numeric_cols:
+        if col in d.columns:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+    d["movement_angle_rad"] = _wrap_radians(np.deg2rad(d["movement_angle_deg"]))
+    d["hand_orientation_xy_rad"] = _wrap_radians(
+        np.deg2rad(d["hand_orientation_xy_deg"])
+    )
+    d = d.dropna(subset=["stiffness_value", "trajectory_time_bin", time_col])
+    d["duration_ms"] = pd.to_numeric(d[time_col], errors="coerce") * 1000.0
+    d = d.dropna(subset=["duration_ms"])
+    if d.empty:
+        save_csv(
+            pd.DataFrame({"figure": [str(p) for p in paths]}),
+            output_root,
+            "movement_cycle_hand_angle_figure_manifest.csv",
+        )
+        return paths
+
+    duration_p5 = float(d["duration_ms"].quantile(0.05))
+    duration_p95 = float(d["duration_ms"].quantile(0.95))
+    if not np.isfinite(duration_p5):
+        duration_p5 = float(d["duration_ms"].min())
+    if not np.isfinite(duration_p95) or duration_p95 <= duration_p5:
+        duration_p95 = float(d["duration_ms"].max())
+    d = d[d["duration_ms"].between(duration_p5, duration_p95, inclusive="both")]
+    if d.empty:
+        save_csv(
+            pd.DataFrame({"figure": [str(p) for p in paths]}),
+            output_root,
+            "movement_cycle_hand_angle_figure_manifest.csv",
+        )
+        return paths
+
+    angle_specs = [
+        ("movement_angle_rad", "Movement direction (rad)"),
+        (
+            "hand_orientation_xy_rad",
+            "Thumb-to-active-finger XY angle (rad)",
+        ),
+    ]
+    stiffness_values = sorted(d["stiffness_value"].dropna().unique())
+    stiffness_colors = _stiffness_viridis_colors(stiffness_values)
+    trial_cols = _trial_group_columns(d)
+
+    for prefix, label, scope_df in _movement_cycle_scope_variants(d):
+        scope_df = scope_df.dropna(subset=["stiffness_value", "duration_ms"])
+        if scope_df.empty:
+            continue
+        scope_stiffness_values = [
+            s
+            for s in stiffness_values
+            if not scope_df[scope_df["stiffness_value"] == s].empty
+        ]
+        if not scope_stiffness_values:
+            continue
+        # Keep every stiffness panel in one horizontal row so the movement-cycle
+        # sequence can be scanned left-to-right without wrapping.
+        ncols = max(1, len(scope_stiffness_values))
+        nrows = 1
+        for angle_col, angle_label in angle_specs:
+            safe_angle = (
+                "movement_direction"
+                if angle_col == "movement_angle_rad"
+                else "thumb_to_active_finger_xy_angle"
+            )
+            fig, axes = plt.subplots(
+                nrows,
+                ncols,
+                figsize=(3.4 * ncols, 2.7 * nrows),
+                sharex=True,
+                squeeze=False,
+            )
+            for ax in axes.ravel():
+                ax.set_visible(False)
+            for stiffness_idx, stiffness in enumerate(scope_stiffness_values):
+                row = 0
+                col = stiffness_idx
+                ax = axes[row, col]
+                ax.set_visible(True)
+                ax.axhline(0, color="0.55", linewidth=0.8, alpha=0.7)
+                stiff_df = scope_df[scope_df["stiffness_value"] == stiffness]
+                color = stiffness_colors.get(stiffness)
+                if not stiff_df.empty and stiff_df[angle_col].notna().sum() > 0:
+                    for _, trial in stiff_df.groupby(trial_cols, dropna=False):
+                        trial = trial.sort_values("duration_ms")
+                        ax.plot(
+                            trial["duration_ms"],
+                            trial[angle_col],
+                            color=color,
+                            alpha=0.035,
+                            linewidth=0.35,
+                            zorder=1,
+                        )
+                    summary = (
+                        stiff_df.groupby("trajectory_time_bin", as_index=False)
+                        .agg(
+                            t=("duration_ms", "mean"),
+                            mean_angle=(angle_col, _circ_mean_rad),
+                            median_angle=(angle_col, _circ_median_rad),
+                            p05_angle=(angle_col, lambda s: _circ_quantile_rad(s, 0.05)),
+                            p95_angle=(angle_col, lambda s: _circ_quantile_rad(s, 0.95)),
+                        )
+                        .sort_values("t")
+                    )
+                    ax.plot(
+                        summary["t"],
+                        summary["mean_angle"],
+                        color=color,
+                        linewidth=3.4,
+                        zorder=5,
+                    )
+                    ax.plot(
+                        summary["t"],
+                        summary["median_angle"],
+                        color=color,
+                        linewidth=2.4,
+                        linestyle="--",
+                        alpha=0.95,
+                        zorder=5,
+                    )
+                    lower = pd.to_numeric(summary["p05_angle"], errors="coerce")
+                    upper = pd.to_numeric(summary["p95_angle"], errors="coerce")
+                    no_wrap = lower <= upper
+                    if no_wrap.any():
+                        ax.fill_between(
+                            summary["t"].to_numpy(dtype=float),
+                            lower.to_numpy(dtype=float),
+                            upper.to_numpy(dtype=float),
+                            where=no_wrap.to_numpy(dtype=bool),
+                            color=color,
+                            alpha=0.055,
+                            linewidth=0,
+                            zorder=2,
+                        )
+                    ax.plot(
+                        summary["t"],
+                        lower,
+                        color=color,
+                        linewidth=0.8,
+                        linestyle=":",
+                        alpha=0.45,
+                        zorder=3,
+                    )
+                    ax.plot(
+                        summary["t"],
+                        upper,
+                        color=color,
+                        linewidth=0.8,
+                        linestyle=":",
+                        alpha=0.45,
+                        zorder=3,
+                    )
+                ax.set_title(f"Stiffness {stiffness:g}", fontsize=9)
+                if col == 0:
+                    ax.set_ylabel(angle_label)
+                ax.set_xlabel("Duration (ms)")
+                _set_pi_axis(ax)
+                ax.set_xlim(duration_p5, duration_p95)
+                ax.grid(alpha=0.18)
+            fig.suptitle(
+                f"{label}: {angle_label} by stiffness\n"
+                "thin=trial traces; solid=mean; dashed=median; shaded/dotted=P5-P95; "
+                "duration axis uses the global P5-P95 millisecond window; "
+                "subjects with _P_ are excluded",
+                y=0.99,
+            )
+            fig.tight_layout(rect=[0, 0.02, 1, 0.92])
+            out = subject_figure_path_for_scope(
+                fig_dir,
+                prefix,
+                f"movement_cycle_{safe_angle}_{prefix}.png",
+            )
+            fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
+            plt.close(fig)
+            paths.append(out)
+
+    save_csv(
+        pd.DataFrame({"figure": [str(p) for p in paths]}),
+        output_root,
+        "movement_cycle_hand_angle_figure_manifest.csv",
     )
     return paths
 
@@ -5965,9 +7375,10 @@ def save_kinematic_figures(
             ax.set_theta_zero_location("E")
             ax.set_theta_direction(-1)
             ax.set_title(f"Orientation pattern: {subject}")
-            out = (
-                polar_dir
-                / f"radiation_orientation_subject_{sanitize_name(subject)}.png"
+            out = subject_figure_path(
+                polar_dir,
+                subject,
+                f"radiation_orientation_subject_{sanitize_name(subject)}.png",
             )
             fig.savefig(out, dpi=fig_dpi)
             plt.close(fig)
@@ -6380,10 +7791,12 @@ def save_kinematic_figures(
 def analysis_manifest(output_root: Path) -> pd.DataFrame:
     expected = [
         "trial_file_manifest.csv",
+        "experiment_setup_context.csv",
         "kinematic_samples.csv",
         "pair_kinematic_summary.csv",
         "trial_kinematic_summary.csv",
         "trajectory_time_bins.csv",
+        "movement_cycle_hand_angle_figure_manifest.csv",
         "direction_success_summary.csv",
         "distance_success_summary.csv",
         "subject_kinematic_summary.csv",
@@ -6447,6 +7860,7 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
         "hand_orientation_plane_trials.csv",
         "hand_orientation_plane_summary.csv",
         "hand_orientation_plane_figure_manifest.csv",
+        "hand_orientation_axis_matrix_figure_manifest.csv",
         "success_failure_trajectory_distance.csv",
         "success_failure_trajectory_distance_summary.csv",
         "advanced_kinematic_figure_manifest.csv",

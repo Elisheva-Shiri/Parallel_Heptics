@@ -7,6 +7,7 @@ and figures under ``analysis/probing_analysis/results`` by default.
 from __future__ import annotations
 
 import argparse
+from itertools import combinations
 import math
 from pathlib import Path
 from typing import Any
@@ -18,9 +19,12 @@ import pandas as pd
 try:
     from analysis.group_comparisons import (
         add_experiment_group_columns,
+        expand_analysis_scopes,
         compute_analysis_scope_tables,
         compute_group_comparison_tables,
         compute_setup_factor_tables,
+        ANALYSIS_SCOPE_COLUMN,
+        ANALYSIS_SCOPE_VALUE_COLUMN,
         EXPERIMENT_GROUP_COLUMN,
     )
     from analysis.scope_plots import save_scope_summary_plots
@@ -30,12 +34,20 @@ except ModuleNotFoundError:  # pragma: no cover - supports running from analysis
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from analysis.group_comparisons import (
         add_experiment_group_columns,
+        expand_analysis_scopes,
         compute_analysis_scope_tables,
         compute_group_comparison_tables,
         compute_setup_factor_tables,
+        ANALYSIS_SCOPE_COLUMN,
+        ANALYSIS_SCOPE_VALUE_COLUMN,
         EXPERIMENT_GROUP_COLUMN,
     )
     from analysis.scope_plots import save_scope_summary_plots
+
+try:  # SciPy is available in the analysis environment but remains optional.
+    from scipy import stats as scipy_stats
+except ModuleNotFoundError:  # pragma: no cover - p-values become unavailable without SciPy.
+    scipy_stats = None
 
 DEFAULT_CENTER_RADIUS_PX = 25.0
 DEFAULT_SIDE_RADIUS_PX = 80.0
@@ -412,6 +424,9 @@ def summarize_probing(probing_trial_summary: pd.DataFrame, probing_event_log: pd
             "probing_analysis_scope_condition_metric_summary": pd.DataFrame(),
             "probing_within_analysis_scope_condition_comparisons": pd.DataFrame(),
             "probing_between_analysis_scope_metric_comparisons": pd.DataFrame(),
+            "probing_success_one_way_anova": pd.DataFrame(),
+            "probing_success_anova_factor_summary": pd.DataFrame(),
+            "probing_success_anova_pairwise": pd.DataFrame(),
         }
     pts = add_experiment_group_columns(probing_trial_summary.copy())
     for col in [
@@ -525,6 +540,7 @@ def summarize_probing(probing_trial_summary: pd.DataFrame, probing_event_log: pd
         ).reset_index()
 
     group_comparisons = compute_experiment_group_comparisons(pts)
+    anova_tables = compute_success_one_way_anova_tables(pts)
 
     return {
         "probing_subject_finger_stiffness_summary": _add_log_backtransform_columns(subject_finger_stiffness),
@@ -536,6 +552,7 @@ def summarize_probing(probing_trial_summary: pd.DataFrame, probing_event_log: pd
         "probing_subject_finger_correlations": correlations,
         "probing_direction_summary": direction_summary,
         **group_comparisons,
+        **anova_tables,
     }
 
 
@@ -557,6 +574,281 @@ PROBING_GROUP_METRICS = [
     "path_length_px",
     "mean_speed_px_s",
 ]
+
+
+ANOVA_FACTOR_SPECS = [
+    ("amount_of_probing", "probe_count_bin"),
+    ("stiffness_value", "stiffness_value"),
+    ("finger", "finger_condition"),
+]
+ANOVA_ALPHA = 0.05
+
+
+def _add_probe_count_bins(df: pd.DataFrame) -> pd.DataFrame:
+    """Add interpretable probe-amount categories with enough replication for ANOVA."""
+    out = df.copy()
+    counts = pd.to_numeric(out.get("probe_count"), errors="coerce")
+    labels = pd.Series(np.nan, index=out.index, dtype="object")
+    labels[counts == 0] = "0"
+    labels[counts == 1] = "1"
+    labels[counts == 2] = "2"
+    labels[counts == 3] = "3"
+    labels[counts >= 4] = "4+"
+    out["probe_count_bin"] = labels
+    return out
+
+
+def _clean_anova_input(df: pd.DataFrame, factor_col: str, outcome_col: str = "correct_response") -> pd.DataFrame:
+    if df.empty or factor_col not in df.columns or outcome_col not in df.columns:
+        return pd.DataFrame(columns=[factor_col, outcome_col])
+    out = df[[factor_col, outcome_col]].copy()
+    out[outcome_col] = pd.to_numeric(out[outcome_col], errors="coerce")
+    out = out[out[factor_col].notna() & out[outcome_col].notna()].copy()
+    out[factor_col] = out[factor_col].astype(str)
+    return out
+
+
+def _one_way_anova_row(
+    df: pd.DataFrame,
+    *,
+    factor_name: str,
+    factor_col: str,
+    outcome_col: str = "correct_response",
+) -> dict[str, Any]:
+    """Return a dependency-light one-factor ANOVA row for success by one factor."""
+    clean = _clean_anova_input(df, factor_col, outcome_col)
+    groups = [
+        pd.to_numeric(g[outcome_col], errors="coerce").dropna().to_numpy(dtype=float)
+        for _, g in clean.groupby(factor_col, dropna=False)
+    ]
+    groups = [g for g in groups if len(g) > 0]
+    n_observations = int(sum(len(g) for g in groups))
+    n_factor_levels = int(len(groups))
+    base = {
+        "factor": factor_name,
+        "factor_column": factor_col,
+        "outcome": outcome_col,
+        "n_observations": n_observations,
+        "n_factor_levels": n_factor_levels,
+        "df_between": np.nan,
+        "df_within": np.nan,
+        "ss_between": np.nan,
+        "ss_within": np.nan,
+        "f_statistic": np.nan,
+        "p_value": np.nan,
+        "eta_squared": np.nan,
+        "omega_squared": np.nan,
+        f"significant_alpha_{str(ANOVA_ALPHA).replace('.', '_')}": False,
+        "status": "insufficient_factor_levels",
+    }
+    if n_factor_levels < 2:
+        return base
+    if any(len(g) < 2 for g in groups) or n_observations <= n_factor_levels:
+        return {**base, "status": "insufficient_within_level_replication"}
+
+    all_values = np.concatenate(groups)
+    grand_mean = float(np.mean(all_values))
+    ss_between = float(sum(len(g) * (float(np.mean(g)) - grand_mean) ** 2 for g in groups))
+    ss_within = float(sum(np.sum((g - float(np.mean(g))) ** 2) for g in groups))
+    ss_total = ss_between + ss_within
+    df_between = n_factor_levels - 1
+    df_within = n_observations - n_factor_levels
+    ms_between = ss_between / df_between if df_between > 0 else np.nan
+    ms_within = ss_within / df_within if df_within > 0 else np.nan
+    if np.isfinite(ms_within) and ms_within > 0:
+        f_stat = float(ms_between / ms_within)
+    elif ss_between > 0 and ss_within == 0:
+        f_stat = np.inf
+    else:
+        f_stat = np.nan
+    p_value = float(scipy_stats.f.sf(f_stat, df_between, df_within)) if scipy_stats is not None and np.isfinite(f_stat) else np.nan
+    eta_squared = float(ss_between / ss_total) if ss_total > 0 else np.nan
+    omega_num = ss_between - df_between * ms_within if np.isfinite(ms_within) else np.nan
+    omega_den = ss_total + ms_within if np.isfinite(ms_within) else np.nan
+    omega_squared = float(omega_num / omega_den) if np.isfinite(omega_den) and omega_den > 0 else np.nan
+    significant = bool(np.isfinite(p_value) and p_value < ANOVA_ALPHA)
+    return {
+        **base,
+        "df_between": int(df_between),
+        "df_within": int(df_within),
+        "ss_between": ss_between,
+        "ss_within": ss_within,
+        "f_statistic": f_stat,
+        "p_value": p_value,
+        "eta_squared": eta_squared,
+        "omega_squared": omega_squared,
+        f"significant_alpha_{str(ANOVA_ALPHA).replace('.', '_')}": significant,
+        "status": "ok" if scipy_stats is not None else "ok_no_scipy_p_value",
+    }
+
+
+def _pairwise_success_rows(
+    df: pd.DataFrame,
+    *,
+    factor_name: str,
+    factor_col: str,
+    outcome_col: str = "correct_response",
+) -> list[dict[str, Any]]:
+    clean = _clean_anova_input(df, factor_col, outcome_col)
+    if clean.empty:
+        return []
+    levels = sorted(clean[factor_col].dropna().unique(), key=lambda x: str(x))
+    pairs = list(combinations(levels, 2))
+    rows: list[dict[str, Any]] = []
+    for level_a, level_b in pairs:
+        a = clean.loc[clean[factor_col] == level_a, outcome_col]
+        b = clean.loc[clean[factor_col] == level_b, outcome_col]
+        av = pd.to_numeric(a, errors="coerce").dropna()
+        bv = pd.to_numeric(b, errors="coerce").dropna()
+        p_value = np.nan
+        av_var = av.var(ddof=1) if len(av) >= 2 else np.nan
+        bv_var = bv.var(ddof=1) if len(bv) >= 2 else np.nan
+        if scipy_stats is not None and len(av) >= 2 and len(bv) >= 2 and av_var > 0 and bv_var > 0:
+            p_value = float(scipy_stats.ttest_ind(av, bv, equal_var=False, nan_policy="omit").pvalue)
+        pooled_d = _pooled_cohens_d_for_values(av, bv)
+        p_value_bonferroni = float(min(1.0, p_value * len(pairs))) if np.isfinite(p_value) else np.nan
+        rows.append(
+            {
+                "factor": factor_name,
+                "factor_column": factor_col,
+                "outcome": outcome_col,
+                "level_a": level_a,
+                "level_b": level_b,
+                "comparison": f"{level_b} - {level_a}",
+                "n_a": int(len(av)),
+                "n_b": int(len(bv)),
+                "mean_success_a": float(av.mean()) if len(av) else np.nan,
+                "mean_success_b": float(bv.mean()) if len(bv) else np.nan,
+                "mean_difference_b_minus_a": float(bv.mean() - av.mean()) if len(av) and len(bv) else np.nan,
+                "cohens_d_b_minus_a": pooled_d,
+                "p_value": p_value,
+                "p_value_bonferroni": p_value_bonferroni,
+                f"significant_bonferroni_alpha_{str(ANOVA_ALPHA).replace('.', '_')}": bool(
+                    np.isfinite(p_value_bonferroni) and p_value_bonferroni < ANOVA_ALPHA
+                ),
+            }
+        )
+    return rows
+
+
+def _pooled_cohens_d_for_values(a: pd.Series, b: pd.Series) -> float:
+    aa = pd.to_numeric(a, errors="coerce").dropna()
+    bb = pd.to_numeric(b, errors="coerce").dropna()
+    if len(aa) < 2 or len(bb) < 2:
+        return np.nan
+    pooled_var = ((len(aa) - 1) * aa.var(ddof=1) + (len(bb) - 1) * bb.var(ddof=1)) / (len(aa) + len(bb) - 2)
+    if not np.isfinite(pooled_var) or pooled_var <= 0:
+        return np.nan
+    return float((bb.mean() - aa.mean()) / math.sqrt(pooled_var))
+
+
+def _factor_summary_rows(
+    df: pd.DataFrame,
+    *,
+    factor_name: str,
+    factor_col: str,
+    outcome_col: str = "correct_response",
+) -> list[dict[str, Any]]:
+    if df.empty or factor_col not in df.columns:
+        return []
+    clean = df.copy()
+    clean[outcome_col] = pd.to_numeric(clean.get(outcome_col), errors="coerce")
+    clean = clean[clean[factor_col].notna() & clean[outcome_col].notna()]
+    rows: list[dict[str, Any]] = []
+    for level, g in clean.groupby(factor_col, dropna=False):
+        success = pd.to_numeric(g[outcome_col], errors="coerce").dropna()
+        lo, hi = _wilson_ci95_bounds(success)
+        rows.append(
+            {
+                "factor": factor_name,
+                "factor_column": factor_col,
+                "factor_level": level,
+                "n_observations": int(len(success)),
+                "mean_success_rate": float(success.mean()) if len(success) else np.nan,
+                "success_rate_ci95_lower": lo,
+                "success_rate_ci95_upper": hi,
+                "mean_probe_count": float(pd.to_numeric(g.get("probe_count"), errors="coerce").mean()) if "probe_count" in g else np.nan,
+                "mean_stiffness_value": float(pd.to_numeric(g.get("stiffness_value"), errors="coerce").mean()) if "stiffness_value" in g else np.nan,
+                "n_subjects": int(g["subject_id"].nunique()) if "subject_id" in g else np.nan,
+            }
+        )
+    return rows
+
+
+def compute_success_one_way_anova_tables(probing_trial_summary: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Compute one-way ANOVA of success by probe amount, stiffness, and finger.
+
+    The requested views are represented explicitly:
+    - ``analysis_scope=all`` for all participants.
+    - ``analysis_scope=experiment_group`` for groups such as ``N_E`` and ``L_E``.
+    - ``analysis_scope=participant`` for per-person tests.
+    - ``observation_level=trial`` for segment/trial rows.
+    - ``observation_level=participant_mean`` for group/all tests on participant-level
+      means, reducing trial-level pseudo-replication.
+    """
+    empty = {
+        "probing_success_one_way_anova": pd.DataFrame(),
+        "probing_success_anova_factor_summary": pd.DataFrame(),
+        "probing_success_anova_pairwise": pd.DataFrame(),
+    }
+    if probing_trial_summary.empty:
+        return empty
+
+    prepared = _add_probe_count_bins(add_experiment_group_columns(probing_trial_summary.copy()))
+    prepared["correct_response"] = pd.to_numeric(prepared["correct_response"], errors="coerce")
+    expanded = expand_analysis_scopes(prepared)
+    if expanded.empty:
+        return empty
+
+    anova_rows: list[dict[str, Any]] = []
+    summary_rows: list[dict[str, Any]] = []
+    pairwise_rows: list[dict[str, Any]] = []
+    scope_cols = [ANALYSIS_SCOPE_COLUMN, ANALYSIS_SCOPE_VALUE_COLUMN]
+
+    for scope_keys, scoped in expanded.groupby(scope_cols, dropna=False):
+        scope_keys = scope_keys if isinstance(scope_keys, tuple) else (scope_keys,)
+        scope_meta = dict(zip(scope_cols, scope_keys))
+        trial_df = scoped.copy()
+        datasets: list[tuple[str, pd.DataFrame]] = [("trial", trial_df)]
+
+        for factor_name, factor_col in ANOVA_FACTOR_SPECS:
+            if factor_col not in scoped.columns:
+                continue
+            agg_map: dict[str, tuple[str, str]] = {"correct_response": ("correct_response", "mean")}
+            if "probe_count" in scoped.columns and factor_col != "probe_count":
+                agg_map["probe_count"] = ("probe_count", "mean")
+            if "stiffness_value" in scoped.columns and factor_col != "stiffness_value":
+                agg_map["stiffness_value"] = ("stiffness_value", "mean")
+            participant_mean = (
+                scoped.dropna(subset=["subject_id", factor_col])
+                .groupby(["subject_id", factor_col], dropna=False)
+                .agg(**agg_map)
+                .reset_index()
+            )
+            datasets.append((f"participant_mean__{factor_name}", participant_mean))
+
+        for observation_level, data in datasets:
+            if observation_level.startswith("participant_mean__"):
+                allowed_factor = observation_level.split("__", 1)[1]
+                observation_label = "participant_mean"
+            else:
+                allowed_factor = None
+                observation_label = observation_level
+            for factor_name, factor_col in ANOVA_FACTOR_SPECS:
+                if allowed_factor is not None and factor_name != allowed_factor:
+                    continue
+                if factor_col not in data.columns:
+                    continue
+                meta = {**scope_meta, "observation_level": observation_label}
+                anova_rows.append({**meta, **_one_way_anova_row(data, factor_name=factor_name, factor_col=factor_col)})
+                summary_rows.extend({**meta, **row} for row in _factor_summary_rows(data, factor_name=factor_name, factor_col=factor_col))
+                pairwise_rows.extend({**meta, **row} for row in _pairwise_success_rows(data, factor_name=factor_name, factor_col=factor_col))
+
+    return {
+        "probing_success_one_way_anova": pd.DataFrame(anova_rows),
+        "probing_success_anova_factor_summary": pd.DataFrame(summary_rows),
+        "probing_success_anova_pairwise": pd.DataFrame(pairwise_rows),
+    }
 
 
 def compute_experiment_group_comparisons(probing_trial_summary: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -691,6 +983,112 @@ def save_figures(output_root: Path, tables: dict[str, pd.DataFrame], fig_dpi: in
         plt.close(fig)
         paths.append(out)
 
+    anova = tables.get("probing_success_one_way_anova", pd.DataFrame())
+    anova_summary = tables.get("probing_success_anova_factor_summary", pd.DataFrame())
+    if not anova.empty:
+        plot_anova = anova[
+            (anova["observation_level"] == "trial")
+            & (anova[ANALYSIS_SCOPE_COLUMN].isin(["all", "experiment_group"]))
+            & (anova["status"].astype(str).str.startswith("ok"))
+        ].copy()
+        if not plot_anova.empty:
+            plot_anova["scope_label"] = np.where(
+                plot_anova[ANALYSIS_SCOPE_COLUMN] == "all",
+                "all",
+                plot_anova[ANALYSIS_SCOPE_VALUE_COLUMN].astype(str),
+            )
+            plot_anova["neg_log10_p"] = -np.log10(pd.to_numeric(plot_anova["p_value"], errors="coerce").clip(lower=1e-300))
+            pivot = plot_anova.pivot_table(index="factor", columns="scope_label", values="neg_log10_p", aggfunc="first")
+            if not pivot.empty:
+                fig, ax = plt.subplots(figsize=(9, 5))
+                pivot.plot(kind="bar", ax=ax)
+                ax.axhline(-math.log10(ANOVA_ALPHA), color="red", linestyle="--", linewidth=1, label=f"p={ANOVA_ALPHA}")
+                ax.set_xlabel("One-way ANOVA factor")
+                ax.set_ylabel("-log10(p-value)")
+                ax.set_title("Success-rate one-way ANOVA significance by scope")
+                ax.legend(fontsize=8)
+                ax.grid(axis="y", alpha=0.25)
+                fig.tight_layout()
+                out = fig_dir / "success_anova_pvalues_by_scope.png"
+                fig.savefig(out, dpi=fig_dpi)
+                plt.close(fig)
+                paths.append(out)
+
+    if not anova_summary.empty:
+        summary_plot = anova_summary[
+            (anova_summary["observation_level"] == "trial")
+            & (anova_summary[ANALYSIS_SCOPE_COLUMN].isin(["all", "experiment_group"]))
+        ].copy()
+        if not summary_plot.empty:
+            summary_plot["scope_label"] = np.where(
+                summary_plot[ANALYSIS_SCOPE_COLUMN] == "all",
+                "all",
+                summary_plot[ANALYSIS_SCOPE_VALUE_COLUMN].astype(str),
+            )
+            fdat = summary_plot[summary_plot["factor"] == "amount_of_probing"].copy()
+            if not fdat.empty:
+                order = ["0", "1", "2", "3", "4+"]
+                fdat["factor_level"] = pd.Categorical(fdat["factor_level"].astype(str), categories=order, ordered=True)
+                pivot = fdat.pivot_table(index="factor_level", columns="scope_label", values="mean_success_rate", aggfunc="first", observed=False)
+                pivot = pivot.reindex([x for x in order if x in set(fdat["factor_level"].astype(str))])
+                if not pivot.empty:
+                    fig, ax = plt.subplots(figsize=(9, 5))
+                    pivot.plot(kind="bar", ax=ax)
+                    ax.set_xlabel("Probe count bin")
+                    ax.set_ylabel("Success rate")
+                    ax.set_ylim(-0.05, 1.05)
+                    ax.set_title("Success rate by amount of probing (ANOVA factor summary)")
+                    ax.legend(fontsize=8)
+                    ax.grid(axis="y", alpha=0.25)
+                    fig.tight_layout()
+                    out = fig_dir / "success_by_probe_count_anova.png"
+                    fig.savefig(out, dpi=fig_dpi)
+                    plt.close(fig)
+                    paths.append(out)
+
+            for factor_name, factor_col, filename, xlabel in [
+                ("stiffness_value", "stiffness_value", "success_by_stiffness_anova.png", "Stiffness value"),
+            ]:
+                fdat = summary_plot[summary_plot["factor"] == factor_name].copy()
+                if fdat.empty:
+                    continue
+                fdat["factor_level_numeric"] = pd.to_numeric(fdat["factor_level"], errors="coerce")
+                fdat = fdat[fdat["factor_level_numeric"].notna()].sort_values(["scope_label", "factor_level_numeric"])
+                if fdat.empty:
+                    continue
+                fig, ax = plt.subplots(figsize=(10, 5))
+                for scope_label, g in fdat.groupby("scope_label", dropna=False):
+                    ax.plot(g["factor_level_numeric"], g["mean_success_rate"], marker="o", label=str(scope_label))
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel("Success rate")
+                ax.set_ylim(-0.05, 1.05)
+                ax.set_title(f"Success rate by {xlabel.lower()} (ANOVA factor summary)")
+                ax.legend(fontsize=8)
+                ax.grid(alpha=0.25)
+                fig.tight_layout()
+                out = fig_dir / filename
+                fig.savefig(out, dpi=fig_dpi)
+                plt.close(fig)
+                paths.append(out)
+
+            fdat = summary_plot[summary_plot["factor"] == "finger"].copy()
+            if not fdat.empty:
+                pivot = fdat.pivot_table(index="factor_level", columns="scope_label", values="mean_success_rate", aggfunc="first")
+                if not pivot.empty:
+                    fig, ax = plt.subplots(figsize=(9, 5))
+                    pivot.plot(kind="bar", ax=ax)
+                    ax.set_xlabel("Finger")
+                    ax.set_ylabel("Success rate")
+                    ax.set_ylim(-0.05, 1.05)
+                    ax.set_title("Success rate by finger (ANOVA factor summary)")
+                    ax.legend(fontsize=8)
+                    ax.grid(axis="y", alpha=0.25)
+                    fig.tight_layout()
+                    out = fig_dir / "success_by_finger_anova.png"
+                    fig.savefig(out, dpi=fig_dpi)
+                    plt.close(fig)
+                    paths.append(out)
+
     subject_finger = tables.get("probing_subject_finger_stiffness_summary", pd.DataFrame())
     if not subject_finger.empty:
         heat = subject_finger.copy()
@@ -761,6 +1159,9 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
         "probing_analysis_scope_condition_metric_summary.csv",
         "probing_within_analysis_scope_condition_comparisons.csv",
         "probing_between_analysis_scope_metric_comparisons.csv",
+        "probing_success_one_way_anova.csv",
+        "probing_success_anova_factor_summary.csv",
+        "probing_success_anova_pairwise.csv",
         "probing_setup_balance.csv",
         "probing_setup_metric_summary.csv",
         "probing_setup_condition_metric_summary.csv",

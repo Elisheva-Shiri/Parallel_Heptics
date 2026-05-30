@@ -1,7 +1,7 @@
 """Smoke-test the protocol generator and the angle detector with synthetic frames.
 
 Run from the repo root:
-    python analysis/motor_response_experiment/_smoke_test.py
+    python analysis/motor_response_analizer_servo/_smoke_test.py
 """
 
 from __future__ import annotations
