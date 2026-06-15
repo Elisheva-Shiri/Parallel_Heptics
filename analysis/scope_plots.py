@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import json
 from pathlib import Path
@@ -180,6 +181,53 @@ def _x_columns(df: pd.DataFrame, grouping_cols: list[str]) -> list[str]:
     return [grouping_cols[-1], *condition_cols]
 
 
+def _save_one_plot_job(job: dict[str, Any]) -> dict[str, Any] | None:
+    """Render one scope-summary plot, possibly in a worker process.
+
+    matplotlib is already forced to the Agg backend at import. The parent
+    process renders these plots with seaborn's whitegrid theme active (set by
+    the figure helpers that run earlier in the same notebook cell); worker
+    processes do not inherit that global rcParams state, so replicate it here so
+    the PNGs stay pixel-identical to the serial version.
+    """
+    try:
+        import seaborn as sns  # type: ignore
+
+        sns.set_theme(style="whitegrid")
+    except Exception:  # pragma: no cover - seaborn optional
+        pass
+    return _save_one_plot(job["plot_df"], **job["kwargs"])
+
+
+def _scope_n_jobs(n_items: int, n_jobs: int | None) -> int:
+    if n_items <= 1:
+        return 1
+    if n_jobs is not None:
+        return max(1, min(int(n_jobs), n_items))
+    cpu = os.cpu_count() or 1
+    return max(1, min(cpu - 1, n_items))
+
+
+def _render_scope_jobs(jobs: list[dict[str, Any]], n_jobs: int | None) -> list[dict[str, Any] | None]:
+    """Render scope-plot jobs, in parallel across processes when worthwhile.
+
+    Each plot is independent and rendered deterministically (Agg), so the PNGs
+    and the returned manifest rows are identical to the serial version; job
+    order is preserved so the manifest order is unchanged.
+    """
+    if not jobs:
+        return []
+    n_jobs_eff = _scope_n_jobs(len(jobs), n_jobs)
+    if n_jobs_eff <= 1:
+        return [_save_one_plot_job(job) for job in jobs]
+    try:
+        from joblib import Parallel, delayed
+
+        return list(Parallel(n_jobs=n_jobs_eff)(delayed(_save_one_plot_job)(job) for job in jobs))
+    except Exception:  # pragma: no cover - joblib missing/unavailable -> serial
+        return [_save_one_plot_job(job) for job in jobs]
+
+
 def save_scope_summary_plots(
     tables: dict[str, pd.DataFrame],
     output_root: Path,
@@ -187,12 +235,23 @@ def save_scope_summary_plots(
     namespace: str,
     metrics: Iterable[str] | None = None,
     fig_dpi: int = 160,
+    n_jobs: int | None = None,
+    keep_only: Iterable[tuple[str, str, str]] | None = None,
 ) -> pd.DataFrame:
-    """Write summary plots and a manifest for all/group/setup/participant tables."""
+    """Write summary plots and a manifest for all/group/setup/participant tables.
+
+    When ``keep_only`` is given (an iterable of ``(source_table, summary_level,
+    metric)`` triples), ONLY those figures are produced and all other
+    combinations are skipped. This is how the notebook restricts the scope
+    summaries to the few headline figures instead of the full cross-product.
+    """
     fig_dir = output_root / "figures" / f"{sanitize_name(namespace)}_scope_summaries"
     fig_dir.mkdir(parents=True, exist_ok=True)
-    rows: list[dict[str, Any]] = []
+    keep_set = {tuple(t) for t in keep_only} if keep_only is not None else None
 
+    # Build every plot job first (preserving the original iteration order), then
+    # render them in one shared process pool.
+    jobs: list[dict[str, Any]] = []
     for table_name, df in tables.items():
         if df.empty:
             continue
@@ -205,30 +264,35 @@ def save_scope_summary_plots(
             metric_df = df[df["metric"].astype(str) == metric].copy()
             if summary_kind == "analysis_scope":
                 for scope, scoped in metric_df.groupby("analysis_scope", dropna=False):
-                    summary_level = str(scope)
-                    row = _save_one_plot(
-                        scoped,
-                        fig_dir=fig_dir,
-                        source_table=table_name,
-                        summary_level=summary_level,
-                        metric=metric,
-                        x_cols=x_cols,
-                        fig_dpi=fig_dpi,
-                    )
-                    if row:
-                        rows.append(row)
+                    if keep_set is not None and (table_name, str(scope), metric) not in keep_set:
+                        continue
+                    jobs.append({
+                        "plot_df": scoped.copy(),
+                        "kwargs": {
+                            "fig_dir": fig_dir,
+                            "source_table": table_name,
+                            "summary_level": str(scope),
+                            "metric": metric,
+                            "x_cols": x_cols,
+                            "fig_dpi": fig_dpi,
+                        },
+                    })
                 continue
-            row = _save_one_plot(
-                metric_df,
-                fig_dir=fig_dir,
-                source_table=table_name,
-                summary_level=summary_kind,
-                metric=metric,
-                x_cols=x_cols,
-                fig_dpi=fig_dpi,
-            )
-            if row:
-                rows.append(row)
+            if keep_set is not None and (table_name, summary_kind, metric) not in keep_set:
+                continue
+            jobs.append({
+                "plot_df": metric_df,
+                "kwargs": {
+                    "fig_dir": fig_dir,
+                    "source_table": table_name,
+                    "summary_level": summary_kind,
+                    "metric": metric,
+                    "x_cols": x_cols,
+                    "fig_dpi": fig_dpi,
+                },
+            })
+
+    rows = [row for row in _render_scope_jobs(jobs, n_jobs) if row]
 
     manifest = pd.DataFrame(rows, columns=["figure", "source_table", "summary_level", "metric", "rows_plotted"])
     output_root.mkdir(parents=True, exist_ok=True)

@@ -6,12 +6,52 @@ The functions in this module are intentionally conservative:
 - raw answer codes are converted to a canonical
   ``response_comparison_greater`` after determining which object was the
   comparison stimulus.
+
+Plotting/figure functions live in the sibling module ``twoafc_figures`` and are
+re-exported here (see the bottom of this file), so ``import twoafc_psychophysics
+as pf; pf.<plot_fn>`` keeps working unchanged.
+
+Psychometric model
+------------------
+The task is a yes/no-style stiffness comparison: on each trial the participant
+judges whether the *comparison* stimulus C is stiffer than the fixed *standard*
+S = 85. The fitted binary response is
+
+    y = 1  if the participant judged the comparison C stiffer than the standard S
+    y = 0  if the participant judged the standard S stiffer than the comparison C
+
+(stored in ``response_comparison_greater``; it is NOT percent-correct, side,
+order, or physical truth -- see ``canonicalize_trials``). Because this is a
+yes/no probability rather than a 2AFC percent-correct curve with a fixed guess
+rate, the fitted curve is a lapse-aware sigmoid with FOUR free parameters
+(mu, scale, lapse_low, lapse_high):
+
+    P(y = 1) = lapse_low + (1 - lapse_low - lapse_high) * F(delta; mu, scale)
+
+with ``delta = C - 85`` and ``F`` a monotonic logistic sigmoid (see
+``logistic4``). Two fitters are supported and the chosen one is recorded per fit
+in the ``fit_method`` / ``psignifit_status`` columns:
+  1. ``psignifit`` -- preferred, used when it is installed;
+  2. the custom lapse-aware maximum-likelihood fitter (``fit_with_scipy_logistic``)
+     -- the fallback used when psignifit is unavailable.
+
+Derived quantities (the fit is in comparison-stiffness units, so these are
+equivalent to the delta-space definitions):
+  - PSE  = comparison value where P(y=1) = 0.5  (delta_PSE = PSE - 85);
+  - Bias = PSE - 85 = delta at P(y=1) = 0.5  (``pse_delta_from_standard``);
+  - JND  = (x75 - x25) / 2, where x25/x75 are the values where the curve reaches
+    0.25/0.75. Because of the lapse parameters, 0.25/0.75 are only attainable when
+    they lie within ``[lapse_low, 1 - lapse_high]``; when they do not, the fitter
+    returns NaN (PSE/JND) and a ``fit_warning`` ("pse_outside_lapse_range" /
+    "jnd_quantile_outside_lapse_range") rather than a silently invalid value.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import re
+import shutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
@@ -21,6 +61,7 @@ import pandas as pd
 
 try:
     from analysis.group_comparisons import (
+        PILOT_ONBOARDING_TRIALS,
         add_experiment_group_columns,
         add_protocol_group_columns,
         add_setup_factor_columns,
@@ -35,6 +76,7 @@ except ModuleNotFoundError:  # pragma: no cover - supports running from analysis
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from analysis.group_comparisons import (
+        PILOT_ONBOARDING_TRIALS,
         add_experiment_group_columns,
         add_protocol_group_columns,
         add_setup_factor_columns,
@@ -55,10 +97,58 @@ MIN_BOOTSTRAP_FOR_CI = 30
 DEFAULT_CENTER_X = 320.0
 DEFAULT_CENTER_Y = 240.0
 STIFFNESS_MAX_FOR_STRETCH_PROXY = 175.0
-IGNORED_PATH_PATTERNS = ("old", "not finish", "not_finish", "not-finish", "unfinished", "notfinished")
+IGNORED_PATH_PATTERNS = (
+    "old",
+    "not finish",
+    "not_finish",
+    "not-finish",
+    "unfinished",
+    "notfinished",
+    "not include",
+    "not_include",
+    "not-include",
+    "notinclude",
+)
+SUBJECT_FOLDER_RE = re.compile(r"^(?P<setup>[LN])_(?P<protocol>[EP])_(?P<number>\d+)$", re.IGNORECASE)
+GROUP_SELECTIONS: dict[str, tuple[str, ...]] = {
+    "L_E": ("L_E",),
+    "L_P": ("L_P",),
+    "N_E": ("N_E",),
+    "N_P": ("N_P",),
+    # Combined L_E + N_E experiment cohort. Canonical key is ``L_N_E``;
+    # ``N+L_E``/``NL_E`` remain as backward-compatible aliases.
+    "L_N_E": ("L_E", "N_E"),
+    "N+L_E": ("L_E", "N_E"),
+    "NL_E": ("L_E", "N_E"),
+}
 PSYCHOMETRIC_DELTA_AXIS_LABEL = "G_comparison-G_standart"
 PSYCHOMETRIC_GREATER_Y_LABEL = "P(choose comparison > standard)"
 PSYCHOMETRIC_MEAN_GREATER_Y_LABEL = "Mean P(choose comparison > standard)"
+# Psychometric delta x-axis is centred on 0 (comparison == standard) and drawn
+# symmetric over +/- this half-range, i.e. the full tested stimulus span
+# (comparison 5..165 around the standard 85 -> delta -80..+80).
+PSYCHOMETRIC_DELTA_AXIS_LIMIT = 80.0
+# Group-analysis PSE validity band (absolute stiffness units). Fits whose PSE
+# falls outside this band are kept and flagged in the per-subject tables/curves
+# but excluded from every GROUP-level aggregation (band-pass / LPF+HPF on PSE).
+PSE_VALID_MIN_ABS = 25.0
+PSE_VALID_MAX_ABS = 145.0
+# The full table x metric x scope cross-product produced ~768 mostly-uninformative
+# scope-summary figures. Only these few headline figures are generated now (as
+# (source_table, summary_level, metric) triples). Edit this list to change which
+# scope summaries are drawn; see save_experiment_group_comparison_outputs.
+SCOPE_SUMMARY_FIGURE_WHITELIST = [
+    # PSE bias (comparison - standard) by experiment group, per finger.
+    ("psychophysics_fit_by_subject_finger_group_condition_metric_summary", "experiment_group", "pse_delta_from_standard"),
+    # JND (discrimination threshold) by experiment group, per finger.
+    ("psychophysics_fit_by_subject_finger_group_condition_metric_summary", "experiment_group", "jnd"),
+    # Weber fraction (JND / standard) by experiment group, per finger.
+    ("psychophysics_fit_by_subject_finger_group_condition_metric_summary", "experiment_group", "weber_fraction"),
+    # Accuracy (correct response rate) by experiment group, per finger.
+    ("psychophysics_trial_group_condition_metric_summary", "experiment_group", "correct_response"),
+    # PSE bias by workspace setup (L vs N), per finger.
+    ("psychophysics_fit_by_subject_finger_setup_condition_metric_summary", "setup_factor", "pse_delta_from_standard"),
+]
 WORKSPACE_SPECS_CM = {
     "N": {"width_cm": 40.0, "height_cm": 50.0, "label": "N workspace (40x50 cm)"},
     "L": {"width_cm": 60.0, "height_cm": 60.0, "label": "L workspace (60x60 cm)"},
@@ -198,6 +288,93 @@ def should_ignore_analysis_path(path: Path) -> bool:
     return any(pattern.replace("_", " ").replace("-", " ") in text for pattern in IGNORED_PATH_PATTERNS)
 
 
+def canonical_subject_id(value: Any) -> str:
+    """Return the canonical ``L_E_14``-style subject id embedded in a folder/name."""
+    text = str(value).strip()
+    match = re.search(r"([LN])_([EP])_(\d+)", text, flags=re.IGNORECASE)
+    if not match:
+        return text
+    return f"{match.group(1).upper()}_{match.group(2).upper()}_{int(match.group(3))}"
+
+
+def subject_group_code(subject_id: Any) -> str | None:
+    """Return ``L_E``/``L_P``/``N_E``/``N_P`` for canonical subject ids."""
+    canonical = canonical_subject_id(subject_id)
+    match = SUBJECT_FOLDER_RE.match(canonical)
+    if not match:
+        return None
+    return f"{match.group('setup').upper()}_{match.group('protocol').upper()}"
+
+
+def is_valid_subject_folder(path: Path) -> bool:
+    """Return True for new-architecture subject folders that should enter analysis."""
+    return path.is_dir() and SUBJECT_FOLDER_RE.match(canonical_subject_id(path.name)) is not None and not should_ignore_analysis_path(path)
+
+
+def normalize_data_selection(selection: Any) -> str:
+    """Normalize a notebook data-selection flag.
+
+    Valid group flags are ``L_E``, ``L_P``, ``N_E``, ``N_P``, and ``L_N_E``
+    (the combined L_E + N_E cohort; ``N+L_E``/``NL_E`` are accepted aliases).
+    A concrete subject id such as ``L_E_14`` is also accepted.
+    """
+    if isinstance(selection, (list, tuple, set)):
+        return "+".join(normalize_data_selection(item) for item in selection)
+    text = str(selection).strip().upper().replace(" ", "")
+    if text in {"L_N_E", "LN_E", "N_L_E", "N+L_E", "N_LE", "NL_E"}:
+        return "L_N_E"
+    group = subject_group_code(text)
+    if group and SUBJECT_FOLDER_RE.match(text):
+        return canonical_subject_id(text)
+    return text
+
+
+def selection_label(selection: Any) -> str:
+    if isinstance(selection, (list, tuple, set)):
+        return sanitize_name("custom_" + "_plus_".join(normalize_data_selection(item) for item in selection))
+    return sanitize_name(normalize_data_selection(selection).replace("+", "_plus_"))
+
+
+def subject_matches_selection(subject_id: Any, selection: Any) -> bool:
+    if isinstance(selection, (list, tuple, set)):
+        return any(subject_matches_selection(subject_id, item) for item in selection)
+    normalized = normalize_data_selection(selection)
+    subject = canonical_subject_id(subject_id)
+    group = subject_group_code(subject)
+    if normalized in GROUP_SELECTIONS:
+        return group in GROUP_SELECTIONS[normalized]
+    return subject == canonical_subject_id(normalized)
+
+
+def is_single_subject_selection(selection: Any, subject_ids: list[str] | None = None) -> bool:
+    """Return True when the run target is one concrete subject, not a group."""
+    if isinstance(selection, (list, tuple, set)):
+        return len(selection) == 1 and is_single_subject_selection(next(iter(selection)), subject_ids)
+    normalized = normalize_data_selection(selection)
+    is_subject = SUBJECT_FOLDER_RE.match(normalized) is not None
+    if not is_subject:
+        return False
+    if subject_ids is None:
+        return True
+    return len(subject_ids) == 1 and canonical_subject_id(subject_ids[0]) == normalized
+
+
+def reset_output_root(output_root: Path) -> Path:
+    """Delete and recreate a run-specific output folder."""
+    output_root = Path(output_root).resolve()
+    if output_root == Path(output_root.anchor).resolve() or output_root == Path.home().resolve():
+        raise ValueError(f"Refusing to reset unsafe output root: {output_root}")
+    if output_root.name.lower() in {"results", "result", "redults"}:
+        raise ValueError(
+            "Refusing to delete a broad results root directly. "
+            "Pass a run-specific child folder such as results/L_E."
+        )
+    if output_root.exists():
+        _rmtree_windows_retry(output_root, attempts=20, delay_seconds=0.35)
+    output_root.mkdir(parents=True, exist_ok=True)
+    return output_root
+
+
 def save_csv(df: pd.DataFrame, output_root: Path, filename: str, index: bool = False) -> Path:
     path = output_root / filename
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,22 +382,23 @@ def save_csv(df: pd.DataFrame, output_root: Path, filename: str, index: bool = F
     return path
 
 
-def _mean_ci95_lower(values: pd.Series) -> float:
+def _mean_ci95_bounds(values: pd.Series) -> tuple[float, float]:
     x = pd.to_numeric(values, errors="coerce").dropna()
     if x.empty:
-        return np.nan
+        return np.nan, np.nan
     if len(x) == 1:
-        return float(x.iloc[0])
-    return float(x.mean() - 1.96 * x.std(ddof=1) / math.sqrt(len(x)))
+        return float(x.iloc[0]), float(x.iloc[0])
+    half = 1.96 * x.std(ddof=1) / math.sqrt(len(x))
+    mean = x.mean()
+    return float(mean - half), float(mean + half)
+
+
+def _mean_ci95_lower(values: pd.Series) -> float:
+    return _mean_ci95_bounds(values)[0]
 
 
 def _mean_ci95_upper(values: pd.Series) -> float:
-    x = pd.to_numeric(values, errors="coerce").dropna()
-    if x.empty:
-        return np.nan
-    if len(x) == 1:
-        return float(x.iloc[0])
-    return float(x.mean() + 1.96 * x.std(ddof=1) / math.sqrt(len(x)))
+    return _mean_ci95_bounds(values)[1]
 
 
 def _wilson_ci95_bounds(values: pd.Series) -> tuple[float, float]:
@@ -324,31 +502,6 @@ def add_delta_and_less_response_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def set_psychometric_delta_axis(ax: Any, delta_values: Any = None) -> None:
-    """Use a centered comparison-standard delta axis for psychometric plots."""
-    ax.set_xlabel(PSYCHOMETRIC_DELTA_AXIS_LABEL)
-    if delta_values is None:
-        return
-    values = pd.to_numeric(pd.Series(delta_values), errors="coerce").dropna()
-    if values.empty:
-        return
-    observed_ticks = np.sort(values.unique().astype(float))
-    if 0.0 not in observed_ticks:
-        observed_ticks = np.sort(np.append(observed_ticks, 0.0))
-    if len(observed_ticks) > 25:
-        step = int(math.ceil(len(observed_ticks) / 25))
-        observed_ticks = observed_ticks[::step]
-        if 0.0 not in observed_ticks:
-            observed_ticks = np.sort(np.append(observed_ticks, 0.0))
-    x_min, x_max = float(observed_ticks.min()), float(observed_ticks.max())
-    span = x_max - x_min
-    if not np.isfinite(span):
-        return
-    padding = max(5.0, 0.06 * span)
-    ax.set_xlim(x_min - padding, x_max + padding)
-    ax.set_xticks(observed_ticks)
-
-
 def add_psychophysics_context_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Add transparent analysis context without changing raw answer values.
 
@@ -443,6 +596,26 @@ def norm_name(name: Any) -> str:
 
 def read_csv_flexible(path: Path, *, recover_malformed: bool = False) -> pd.DataFrame:
     errors = []
+    # Fast path (default reads only): the experiment answer logs are
+    # comma-separated, so try the C parser with an explicit comma before the
+    # ``sep=None`` calls below, which force the much slower python engine plus
+    # delimiter sniffing. The fast result is accepted only when it parses into
+    # more than one column (i.e. the comma really was the delimiter); otherwise
+    # we fall through to the original sniffing path unchanged. The
+    # malformed-recovery path (used for tracking logs) is left exactly as-is so
+    # this optimisation is scoped to the psychophysics answer files, and the
+    # golden-output regression check guards against any behavioural drift.
+    if not recover_malformed:
+        for encoding in ("utf-8-sig", "utf-8", "cp1255", "latin1"):
+            try:
+                fast = pd.read_csv(path, encoding=encoding, sep=",", engine="c")
+            except Exception as exc:  # pragma: no cover - diagnostic path
+                errors.append(f"{encoding} c-engine: {exc}")
+                continue
+            if fast.shape[1] > 1:
+                fast.attrs["csv_read_recovered"] = False
+                return fast
+            break
     for encoding in ("utf-8-sig", "utf-8", "cp1255", "latin1"):
         try:
             df = pd.read_csv(path, encoding=encoding, sep=None, engine="python")
@@ -538,16 +711,20 @@ def score_answer_csv(path: Path) -> int:
     return score
 
 
-def discover_answer_files(data_root: Path, output_root: Path) -> pd.DataFrame:
+def discover_answer_files(data_root: Path, output_root: Path, selection: Any | None = None) -> pd.DataFrame:
     validate_paths(data_root, output_root)
     rows = []
     subject_dirs = sorted(
-        [p for p in data_root.iterdir() if p.is_dir() and not should_ignore_analysis_path(p)],
-        key=lambda p: p.name.lower(),
+        [p for p in data_root.rglob("*") if is_valid_subject_folder(p)],
+        key=lambda p: (_subject_sort_key(canonical_subject_id(p.name)), str(p).lower()),
     )
+    if selection is not None:
+        subject_dirs = [p for p in subject_dirs if subject_matches_selection(p.name, selection)]
     if not subject_dirs:
-        raise RuntimeError(f"No subject folders found under {data_root}")
+        scope = f" for selection {selection!r}" if selection is not None else ""
+        raise RuntimeError(f"No valid subject folders found under {data_root}{scope}")
     for subject_dir in subject_dirs:
+        subject_id = canonical_subject_id(subject_dir.name)
         all_csvs = sorted(
             [p for p in subject_dir.rglob("*.csv") if not should_ignore_analysis_path(p)],
             key=lambda p: str(p).lower(),
@@ -559,6 +736,8 @@ def discover_answer_files(data_root: Path, output_root: Path) -> pd.DataFrame:
             rows.append(
                 {
                     "subject_id": subject_dir.name,
+                    "canonical_subject_id": subject_id,
+                    "subject_group_code": subject_group_code(subject_id),
                     "subject_folder": str(subject_dir),
                     "candidate_rank": rank,
                     "candidate_score": score,
@@ -574,6 +753,8 @@ def discover_answer_files(data_root: Path, output_root: Path) -> pd.DataFrame:
             rows.append(
                 {
                     "subject_id": subject_dir.name,
+                    "canonical_subject_id": subject_id,
+                    "subject_group_code": subject_group_code(subject_id),
                     "subject_folder": str(subject_dir),
                     "candidate_rank": np.nan,
                     "candidate_score": np.nan,
@@ -596,7 +777,7 @@ def load_selected_subject_csvs(discovery: pd.DataFrame) -> pd.DataFrame:
         df.insert(0, "_row_in_source", np.arange(len(df), dtype=int))
         df.insert(0, "_source_file_name", path.name)
         df.insert(0, "_source_file", str(path))
-        df.insert(0, "subject_id", row["subject_id"])
+        df.insert(0, "subject_id", row.get("canonical_subject_id", row["subject_id"]))
         df.insert(1, "_subject_folder", row["subject_folder"])
         frames.append(df)
     return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
@@ -726,7 +907,18 @@ def canonicalize_trials(
     cols: dict[str, Optional[str]],
     standard_value: float,
     standard_tolerance: float = STANDARD_ABS_TOLERANCE,
+    pilot_onboarding_trials: int = PILOT_ONBOARDING_TRIALS,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Canonicalise raw answer rows into one clean dataframe per trial.
+
+    The first ``pilot_onboarding_trials`` clean comparison trials per subject
+    are an onboarding/familiarisation phase and are excluded from the returned
+    ``clean`` table. They are appended to the ``flagged`` table with
+    ``flag_reason='pilot_onboarding_excluded'`` so the audit trail is preserved
+    while keeping them out of every downstream summary, fit, and comparison.
+    Pass ``pilot_onboarding_trials=0`` to keep all clean trials (useful for
+    unit tests and small synthetic fixtures).
+    """
     c_v1, c_v2 = cols.get("object_1_value"), cols.get("object_2_value")
     c_f1, c_f2 = cols.get("object_1_finger"), cols.get("object_2_finger")
     c_ans, c_rt = cols.get("answer"), cols.get("reaction_time")
@@ -817,6 +1009,14 @@ def canonicalize_trials(
         clean = clean.sort_values(["subject_id", "source_file", "row_in_source"]).reset_index(drop=True)
         clean["global_trial_order"] = clean.groupby("subject_id").cumcount() + 1
         clean["answer_chose_object_2"] = clean["answer_code"].astype(float)
+        if pilot_onboarding_trials and pilot_onboarding_trials > 0:
+            is_onboarding = clean["global_trial_order"] <= int(pilot_onboarding_trials)
+            if is_onboarding.any():
+                onboarding = clean.loc[is_onboarding].copy()
+                onboarding["excluded_from_fit"] = True
+                onboarding["flag_reason"] = "pilot_onboarding_excluded"
+                flagged = pd.concat([flagged, onboarding], ignore_index=True, sort=False)
+                clean = clean.loc[~is_onboarding].reset_index(drop=True)
     return clean, flagged
 
 
@@ -1425,7 +1625,13 @@ def compare_fingers_over_time_and_appearance(
                 "reaction_time_vs_within_finger_time_p_value": rt_fit["p_value"],
             }
         )
-        gb = _add_quantile_bins(g, "within_finger_trial_order", n_time_bins, "within_finger_time_bin")
+        # X-axis is the actual trial position within each finger block (1..64),
+        # not a coarse quantile bin. Each finger block is 8 stiffness levels x 8
+        # repetitions = 64 trials, so the raw within-finger trial order keeps all
+        # 64 points and aligns positions across subjects. (``n_time_bins`` is kept
+        # for backward compatibility but no longer bins the within-finger axis.)
+        gb = g.copy()
+        gb["within_finger_time_bin"] = gb["within_finger_trial_order"].astype(int)
         for b, bdf in gb.groupby("within_finger_time_bin", dropna=False):
             subject_bins.append(
                 {
@@ -1767,12 +1973,26 @@ def check_psignifit_available() -> tuple[bool, str]:
 
 
 def logistic4(x: np.ndarray, mu: float, scale: float, lapse_low: float, lapse_high: float) -> np.ndarray:
+    """Lapse-aware yes/no psychometric function (4 parameters).
+
+    ``P(y=1) = lapse_low + (1 - lapse_low - lapse_high) * sigmoid((x - mu)/scale)``.
+    ``mu`` is the 50%-of-the-sigmoid location, ``scale`` the spread, and
+    ``lapse_low``/``lapse_high`` the lower/upper asymptote lapses. This is a yes/no
+    model (P of judging the comparison stiffer), not a 2AFC percent-correct curve
+    with a fixed 0.5 guess rate.
+    """
     z = (np.asarray(x, dtype=float) - mu) / max(scale, 1e-12)
     s = np.where(z >= 0, 1 / (1 + np.exp(-z)), np.exp(z) / (1 + np.exp(z)))
     return lapse_low + (1 - lapse_low - lapse_high) * s
 
 
 def x_at_probability(q: float, mu: float, scale: float, lapse_low: float, lapse_high: float) -> float:
+    """Invert ``logistic4``: stimulus value where P(y=1) == ``q``.
+
+    Returns NaN when ``q`` is not attainable, i.e. outside the curve's reachable
+    range ``[lapse_low, 1 - lapse_high]`` (so PSE at q=0.5 and the x25/x75 used for
+    JND are flagged as non-estimable rather than reported as invalid).
+    """
     amp = 1 - lapse_low - lapse_high
     if amp <= 0:
         return np.nan
@@ -2146,67 +2366,172 @@ def fit_one_condition(
     return scipy_fit
 
 
+_FIT_PREFERRED_TAIL = [
+    "fit_method",
+    "pse",
+    "pse_se",
+    "pse_ci95_lower",
+    "pse_ci95_upper",
+    "pse_delta_from_standard",
+    "pse_delta_ci95_lower",
+    "pse_delta_ci95_upper",
+    "standard_inside_pse_ci95",
+    "pse_bias_p_value",
+    "jnd",
+    "jnd_se",
+    "jnd_ci95_lower",
+    "jnd_ci95_upper",
+    "weber_fraction",
+    "jnd_over_standard",
+    "x25",
+    "x75",
+    "slope_at_pse",
+    "lapse_rate",
+    "lapse_rate_ci95_lower",
+    "lapse_rate_ci95_upper",
+    "lapse_low",
+    "lapse_high",
+    "fit_quality",
+    "fit_warning",
+    "n_trials",
+    "n_stimulus_levels",
+    "n_bootstrap",
+    "bootstrap_method",
+    "deviance",
+    "aic",
+    "psignifit_status",
+]
+
+
+def _resolve_fit_n_jobs(n_items: int, n_jobs: Optional[int]) -> int:
+    """Number of worker processes for per-condition fits.
+
+    Bounded by the number of items and by the available cores. ``None`` (the
+    default) auto-selects ``cpu_count - 1``; pass ``1`` to force serial.
+    """
+    if n_items <= 1:
+        return 1
+    if n_jobs is not None:
+        return max(1, min(int(n_jobs), n_items))
+    cpu = os.cpu_count() or 1
+    return max(1, min(cpu - 1, n_items))
+
+
+def _fit_one_group(
+    keys: Any,
+    g: pd.DataFrame,
+    group_cols: list[str],
+    psignifit_available: bool,
+    n_bootstrap: int,
+) -> dict[str, Any]:
+    """Fit a single grouped condition and attach grouping/summary columns.
+
+    Pure function of its arguments: the bootstrap RNG is seeded with a fixed
+    constant inside ``_parametric_bootstrap_logistic_pse_jnd``, so the result is
+    identical whether this runs serially or inside a parallel worker process.
+    """
+    if not isinstance(keys, tuple):
+        keys = (keys,)
+    fit = fit_one_condition(g, psignifit_available, n_bootstrap=n_bootstrap)
+    for key, value in zip(group_cols, keys):
+        fit[key] = value
+    fit["n_trials"] = int(g["n_trials"].sum())
+    fit["n_stimulus_levels"] = int(g["comparison_value"].nunique())
+    if "standard_value" in g.columns and g["standard_value"].notna().any():
+        fit["standard_value"] = float(pd.to_numeric(g["standard_value"], errors="coerce").median())
+    fit["comparison_min"] = float(g["comparison_value"].min())
+    fit["comparison_max"] = float(g["comparison_value"].max())
+    return fit
+
+
+def _fit_flat_item(item: tuple[int, Any, pd.DataFrame, list[str]], psignifit_available: bool, n_bootstrap: int):
+    job_index, keys, g, group_cols = item
+    return job_index, _fit_one_group(keys, g, group_cols, psignifit_available, n_bootstrap)
+
+
+def _assemble_fit_table(rows: list[dict[str, Any]], group_cols: list[str]) -> pd.DataFrame:
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = add_fit_delta_columns(out)
+    preferred = group_cols + _FIT_PREFERRED_TAIL
+    return out[[c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]]
+
+
 def fit_conditions(
     agg: pd.DataFrame,
     group_cols: list[str],
     psignifit_available: bool = False,
     *,
     n_bootstrap: int = DEFAULT_FIT_BOOTSTRAP_N,
+    n_jobs: Optional[int] = None,
 ) -> pd.DataFrame:
-    rows = []
-    for keys, g in agg.groupby(group_cols, dropna=False):
-        if not isinstance(keys, tuple):
-            keys = (keys,)
-        fit = fit_one_condition(g, psignifit_available, n_bootstrap=n_bootstrap)
-        for key, value in zip(group_cols, keys):
-            fit[key] = value
-        fit["n_trials"] = int(g["n_trials"].sum())
-        fit["n_stimulus_levels"] = int(g["comparison_value"].nunique())
-        if "standard_value" in g.columns and g["standard_value"].notna().any():
-            fit["standard_value"] = float(pd.to_numeric(g["standard_value"], errors="coerce").median())
-        fit["comparison_min"] = float(g["comparison_value"].min())
-        fit["comparison_max"] = float(g["comparison_value"].max())
-        rows.append(fit)
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    out = add_fit_delta_columns(out)
-    preferred = group_cols + [
-        "fit_method",
-        "pse",
-        "pse_se",
-        "pse_ci95_lower",
-        "pse_ci95_upper",
-        "pse_delta_from_standard",
-        "pse_delta_ci95_lower",
-        "pse_delta_ci95_upper",
-        "standard_inside_pse_ci95",
-        "pse_bias_p_value",
-        "jnd",
-        "jnd_se",
-        "jnd_ci95_lower",
-        "jnd_ci95_upper",
-        "weber_fraction",
-        "jnd_over_standard",
-        "x25",
-        "x75",
-        "slope_at_pse",
-        "lapse_rate",
-        "lapse_rate_ci95_lower",
-        "lapse_rate_ci95_upper",
-        "lapse_low",
-        "lapse_high",
-        "fit_quality",
-        "fit_warning",
-        "n_trials",
-        "n_stimulus_levels",
-        "n_bootstrap",
-        "bootstrap_method",
-        "deviance",
-        "aic",
-        "psignifit_status",
+    """Fit a psychometric curve per group.
+
+    Groups are independent and each fit is deterministic (fixed-seed bootstrap),
+    so the per-group fits are distributed across worker processes when more than
+    one group is present. Output (values, row order, column order) is identical
+    to the previous serial implementation; pass ``n_jobs=1`` to force serial.
+    """
+    groups = list(agg.groupby(group_cols, dropna=False))
+    if not groups:
+        return pd.DataFrame()
+    n_jobs_eff = _resolve_fit_n_jobs(len(groups), n_jobs)
+    if n_jobs_eff <= 1:
+        rows = [_fit_one_group(keys, g, group_cols, psignifit_available, n_bootstrap) for keys, g in groups]
+    else:
+        try:
+            from joblib import Parallel, delayed
+
+            rows = Parallel(n_jobs=n_jobs_eff)(
+                delayed(_fit_one_group)(keys, g, group_cols, psignifit_available, n_bootstrap)
+                for keys, g in groups
+            )
+        except Exception:  # pragma: no cover - joblib missing/unavailable -> serial
+            rows = [_fit_one_group(keys, g, group_cols, psignifit_available, n_bootstrap) for keys, g in groups]
+    return _assemble_fit_table(rows, group_cols)
+
+
+def fit_conditions_many(
+    jobs: list[tuple[pd.DataFrame, list[str]]],
+    psignifit_available: bool = False,
+    *,
+    n_bootstrap: int = DEFAULT_FIT_BOOTSTRAP_N,
+    n_jobs: Optional[int] = None,
+) -> list[pd.DataFrame]:
+    """Fit several ``(agg, group_cols)`` jobs sharing one flat worker pool.
+
+    Each returned frame is identical to ``fit_conditions(agg, group_cols, ...)``
+    for the matching job, but every condition from every job is fitted in a
+    single pool so cores stay busy even when individual jobs have few groups
+    (e.g. the finger-pooled and all-pooled fits). Group order within and across
+    jobs is preserved, so each output matches the per-call version exactly.
+    """
+    flat: list[tuple[int, Any, pd.DataFrame, list[str]]] = []
+    for job_index, (agg, group_cols) in enumerate(jobs):
+        for keys, g in agg.groupby(group_cols, dropna=False):
+            flat.append((job_index, keys, g, group_cols))
+    if not flat:
+        return [pd.DataFrame() for _ in jobs]
+    n_jobs_eff = _resolve_fit_n_jobs(len(flat), n_jobs)
+    if n_jobs_eff <= 1:
+        fitted = [_fit_flat_item(item, psignifit_available, n_bootstrap) for item in flat]
+    else:
+        try:
+            from joblib import Parallel, delayed
+
+            fitted = Parallel(n_jobs=n_jobs_eff)(
+                delayed(_fit_flat_item)(item, psignifit_available, n_bootstrap) for item in flat
+            )
+        except Exception:  # pragma: no cover - joblib missing/unavailable -> serial
+            fitted = [_fit_flat_item(item, psignifit_available, n_bootstrap) for item in flat]
+    rows_by_job: list[list[dict[str, Any]]] = [[] for _ in jobs]
+    for job_index, fit in fitted:
+        rows_by_job[job_index].append(fit)
+    return [
+        _assemble_fit_table(rows_by_job[i], jobs[i][1]) if rows_by_job[i] else pd.DataFrame()
+        for i in range(len(jobs))
     ]
-    return out[[c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]]
 
 
 def subject_average_psychometric(clean: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
@@ -2328,64 +2653,17 @@ def predictions_from_fit_row(row: pd.Series, x_grid: np.ndarray) -> np.ndarray:
 FINGER_ORDER = ["I", "M", "R", "P"]
 FINGER_APPEARANCE_LABELS = {1: "first", 2: "second", 3: "third", 4: "fourth"}
 STIFFNESS_CMAP = "viridis"
+# Side-bias plots split each finger into the two presented objects: object 1 (the
+# first object in the data) on the left in orange, object 2 (the second) on the
+# right in blue.
+OBJECT1_COLOR = "#ff7f0e"  # orange  -> first object  (left column)
+OBJECT2_COLOR = "#1f77b4"  # blue    -> second object (right column)
 FINGER_STYLE = {
     "I": {"label": "Index", "color": "#1f77b4", "marker": "o"},   # blue
     "M": {"label": "Middle", "color": "#ff7f0e", "marker": "s"},  # orange
     "R": {"label": "Ring", "color": "#d62728", "marker": "D"},    # red
     "P": {"label": "Pinky", "color": "#2ca02c", "marker": "^"},   # green
 }
-
-
-def _finger_sort_key(value: Any) -> int:
-    order = {finger: i for i, finger in enumerate(FINGER_ORDER)}
-    return order.get(str(value), 99)
-
-
-def _finger_order_present(values: Any) -> list[Any]:
-    present = {str(v) for v in pd.Series(values).dropna().unique()}
-    ordered = [finger for finger in FINGER_ORDER if finger in present]
-    ordered.extend(sorted([v for v in present if v not in set(ordered)]))
-    return ordered
-
-
-def _finger_color(value: Any, default: str = "0.35") -> str:
-    return FINGER_STYLE.get(str(value), {}).get("color", default)
-
-
-def _finger_label(value: Any) -> str:
-    return FINGER_STYLE.get(str(value), {}).get("label", str(value))
-
-
-def _appearance_order(values: Any) -> list[int]:
-    numeric = pd.to_numeric(pd.Series(values), errors="coerce").dropna().astype(int)
-    present = set(numeric.unique())
-    ordered = [i for i in [1, 2, 3, 4] if i in present]
-    ordered.extend(sorted([i for i in present if i not in set(ordered)]))
-    return ordered
-
-
-def _appearance_tick_labels(order: list[Any]) -> list[str]:
-    labels = []
-    for value in order:
-        try:
-            labels.append(FINGER_APPEARANCE_LABELS.get(int(value), str(value)))
-        except Exception:
-            labels.append(str(value))
-    return labels
-
-
-def _subject_palette(subjects: Any) -> dict[str, Any]:
-    import matplotlib.pyplot as plt
-
-    ordered = sorted([str(s) for s in pd.Series(subjects).dropna().unique()], key=_subject_sort_key)
-    cmap = plt.get_cmap("tab20", max(1, len(ordered)))
-    return {subject: cmap(i % cmap.N) for i, subject in enumerate(ordered)}
-
-
-def _style_color(value: Any, style_col: Optional[str], palette: Optional[dict[str, Any]] = None) -> Any:
-    if style_col == "subject_id" and palette is not None:
-        return palette.get(str(value), "0.35")
-    return _finger_color(value)
 
 
 def _subject_sort_key(value: Any) -> tuple[int, int, str]:
@@ -2418,6 +2696,17 @@ def add_fit_delta_columns(fits: pd.DataFrame) -> pd.DataFrame:
         out["pse_delta_standard_minus_comparison"] = -out["pse_delta_comparison_minus_standard"]
         out["pse_delta_from_standard"] = out["pse_delta_comparison_minus_standard"]
         out["abs_pse_delta_from_standard"] = out["pse_delta_from_standard"].abs()
+        # Band-pass (LPF+HPF) on the PSE: a fit is valid for GROUP analysis only
+        # when its PSE sits inside the reliable stimulus band [25, 145]. Out-of-band
+        # (or un-estimated) fits are KEPT here and drawn individually but flagged so
+        # compute_experiment_group_comparisons can drop them from group aggregation.
+        out["pse_in_valid_band"] = (pse >= PSE_VALID_MIN_ABS) & (pse <= PSE_VALID_MAX_ABS)
+        out["excluded_from_group_analysis"] = ~out["pse_in_valid_band"]
+        out["group_exclusion_reason"] = np.where(
+            out["pse_in_valid_band"],
+            "",
+            np.where(pse.isna(), "pse_not_estimated", f"pse_outside_{PSE_VALID_MIN_ABS:g}-{PSE_VALID_MAX_ABS:g}"),
+        )
         if "pse_ci95_lower" in out and "pse_ci95_upper" in out:
             pse_ci_lower = pd.to_numeric(out["pse_ci95_lower"], errors="coerce")
             pse_ci_upper = pd.to_numeric(out["pse_ci95_upper"], errors="coerce")
@@ -2513,33 +2802,6 @@ def pse_bias_summary(fits: pd.DataFrame, group_cols: Optional[list[str]] = None)
     return out
 
 
-def _select_typical_subject_for_psychometric_overlay(
-    pse_jnd_by_subject_finger: pd.DataFrame,
-    preferred_subject: Optional[str] = None,
-) -> Optional[str]:
-    if pse_jnd_by_subject_finger.empty or "subject_id" not in pse_jnd_by_subject_finger:
-        return None
-    if preferred_subject and preferred_subject in set(pse_jnd_by_subject_finger["subject_id"].astype(str)):
-        return preferred_subject
-    fits = add_fit_delta_columns(pse_jnd_by_subject_finger)
-    summary = (
-        fits.groupby("subject_id", dropna=False)
-        .agg(
-            n_fits=("pse", lambda x: int(pd.to_numeric(x, errors="coerce").notna().sum())),
-            median_abs_pse_delta=("pse_delta_comparison_minus_standard", lambda x: float(pd.to_numeric(x, errors="coerce").abs().median())),
-            median_jnd=("jnd", lambda x: float(pd.to_numeric(x, errors="coerce").median())),
-        )
-        .reset_index()
-    )
-    summary = summary[summary["n_fits"] >= 3].copy()
-    if summary.empty:
-        return str(pse_jnd_by_subject_finger["subject_id"].iloc[0])
-    group_median = summary["median_abs_pse_delta"].median()
-    summary["distance_from_group_median"] = (summary["median_abs_pse_delta"] - group_median).abs()
-    summary = summary.sort_values(["distance_from_group_median", "median_jnd", "subject_id"])
-    return str(summary.iloc[0]["subject_id"])
-
-
 _METRIC_CI_COLUMN_HINTS: dict[str, tuple[str, str]] = {
     "pse": ("pse_ci95_lower", "pse_ci95_upper"),
     "pse_delta_comparison_minus_standard": ("pse_delta_ci95_lower", "pse_delta_ci95_upper"),
@@ -2548,139 +2810,6 @@ _METRIC_CI_COLUMN_HINTS: dict[str, tuple[str, str]] = {
     "jnd_over_standard": ("jnd_over_standard_ci95_lower", "jnd_over_standard_ci95_upper"),
     "weber_fraction": ("jnd_over_standard_ci95_lower", "jnd_over_standard_ci95_upper"),
 }
-
-
-def _metric_error_bars(plot_df: pd.DataFrame, metric_col: str) -> Optional[tuple[pd.Series, pd.Series]]:
-    """Return ``(lower_err, upper_err)`` for ``metric_col`` if CI columns exist."""
-    lower_col, upper_col = _METRIC_CI_COLUMN_HINTS.get(metric_col, (None, None))
-    if not lower_col or lower_col not in plot_df.columns or upper_col not in plot_df.columns:
-        return None
-    metric = pd.to_numeric(plot_df[metric_col], errors="coerce")
-    lower = pd.to_numeric(plot_df[lower_col], errors="coerce")
-    upper = pd.to_numeric(plot_df[upper_col], errors="coerce")
-    if lower.isna().all() or upper.isna().all():
-        return None
-    lower_err = (metric - lower).clip(lower=0)
-    upper_err = (upper - metric).clip(lower=0)
-    return lower_err, upper_err
-
-
-def _plot_article_style_metric_lines(
-    df: pd.DataFrame,
-    x_col: str,
-    metric_col: str,
-    title: str,
-    ylabel: str,
-    xlabel: str,
-    out_path: Path,
-    x_order: Optional[list[Any]] = None,
-    style_col: Optional[str] = "finger_condition",
-    fig_dpi: int = 160,
-) -> Optional[Path]:
-    import matplotlib.pyplot as plt
-
-    if df.empty or metric_col not in df or x_col not in df:
-        return None
-    plot_df = df.copy()
-    plot_df[metric_col] = pd.to_numeric(plot_df[metric_col], errors="coerce")
-    plot_df = plot_df.dropna(subset=[metric_col, x_col])
-    if plot_df.empty:
-        return None
-    if x_order is None:
-        if x_col == "finger_condition":
-            x_order = _finger_order_present(plot_df[x_col])
-        elif x_col == "finger_appearance_order":
-            x_order = _appearance_order(plot_df[x_col])
-        else:
-            x_order = sorted(plot_df[x_col].dropna().unique())
-    x_map = {value: i for i, value in enumerate(x_order)}
-    plot_df["_x_num"] = plot_df[x_col].map(x_map)
-    plot_df = plot_df.dropna(subset=["_x_num"])
-    if plot_df.empty:
-        return None
-
-    error_bars = _metric_error_bars(plot_df, metric_col)
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(6.8, 4.8))
-    style_palette = _subject_palette(plot_df["subject_id"]) if style_col == "subject_id" and "subject_id" in plot_df else None
-    for subject, g in plot_df.groupby("subject_id", dropna=False):
-        g = g.sort_values("_x_num")
-        line_color = style_palette.get(str(subject), "0.70") if style_palette is not None else "0.70"
-        ax.plot(g["_x_num"], g[metric_col], color=line_color, linewidth=1.1, alpha=0.70, zorder=1)
-        if error_bars is not None:
-            lower_err, upper_err = error_bars
-            err = np.vstack([lower_err.loc[g.index].fillna(0).to_numpy(), upper_err.loc[g.index].fillna(0).to_numpy()])
-            if np.any(err > 0):
-                ax.errorbar(
-                    g["_x_num"],
-                    g[metric_col],
-                    yerr=err,
-                    fmt="none",
-                    ecolor=line_color,
-                    alpha=0.45,
-                    elinewidth=0.8,
-                    capsize=2,
-                    zorder=1,
-                )
-        if style_col and style_col in g:
-            for _, row in g.iterrows():
-                style = FINGER_STYLE.get(str(row.get(style_col)), {})
-                color = _style_color(row.get(style_col), style_col, style_palette)
-                ax.scatter(
-                    row["_x_num"],
-                    row[metric_col],
-                    color=color,
-                    marker=style.get("marker", "o") if style_col != "subject_id" else "o",
-                    edgecolor="black",
-                    linewidth=0.3,
-                    s=45,
-                    alpha=0.9,
-                    zorder=2,
-                )
-        else:
-            ax.scatter(g["_x_num"], g[metric_col], color="0.35", s=35, alpha=0.8, zorder=2)
-    group = (
-        plot_df.groupby("_x_num", dropna=False)[metric_col]
-        .agg(["mean", "std", "count", "sem"])
-        .reset_index()
-    )
-    group["sem"] = group["sem"].fillna(group["std"])
-    group["ci95"] = np.where(group["count"] > 1, 1.96 * group["sem"], 0.0)
-    ax.errorbar(
-        group["_x_num"],
-        group["mean"],
-        yerr=group["ci95"],
-        color="black",
-        linestyle=":",
-        marker="o",
-        linewidth=2.5,
-        capsize=4,
-        label="Group mean (95% CI across subjects)",
-        zorder=3,
-    )
-    ax.axhline(0, color="0.35", linestyle="--", linewidth=1) if "PSE" in ylabel or "slope" in ylabel.lower() else None
-    ax.set_xticks(range(len(x_order)))
-    ax.set_xticklabels(_appearance_tick_labels(x_order) if x_col == "finger_appearance_order" else [str(x) for x in x_order])
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    if error_bars is not None and ("PSE" in ylabel or "JND" in ylabel):
-        ax.text(
-            0.02,
-            0.02,
-            "Subject error bars: per-fit 95% CI (parametric bootstrap)",
-            transform=ax.transAxes,
-            ha="left",
-            va="bottom",
-            fontsize=7,
-            color="0.35",
-        )
-    ax.legend(loc="best", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=fig_dpi)
-    plt.close(fig)
-    return out_path
 
 
 def save_article_style_psychophysics_figures(
@@ -2693,6 +2822,8 @@ def save_article_style_psychophysics_figures(
     finger_by_appearance_order: Optional[pd.DataFrame] = None,
     preferred_subject: Optional[str] = None,
     fig_dpi: int = 160,
+    include_workspace_comparison: bool = True,
+    write_csv_outputs: bool = True,
 ) -> tuple[list[Path], pd.DataFrame]:
     """Save Farajian/Nisky-inspired psychophysics figures adapted to this task.
 
@@ -2704,11 +2835,30 @@ def save_article_style_psychophysics_figures(
     import matplotlib.pyplot as plt
 
     paths: list[Path] = []
-    fig_root = output_root / "figures" / "article_style"
-    fig_root.mkdir(parents=True, exist_ok=True)
+    fig_root = output_root / "figures"
+
+    article_destinations = {
+        "group_psychometric_data_by_finger.png": "psychometric_curves",
+        "group_psychometric_curves_N_vs_L_by_finger.png": "psychometric_curves",
+        "psychometric_overlay_subject": "psychometric_curves",
+        "pse_article_style_by_finger.png": "psychometric_curves",
+        "jnd_article_style_by_finger.png": "psychometric_curves",
+        "success_article_style_by_appearance_order.png": "time_fatigue",
+        "time_slope_article_style_by_appearance_order.png": "time_fatigue",
+        "success_article_style_by_finger.png": "finger_time_appearance",
+        "success_time_slope_article_style_by_finger.png": "finger_time_appearance",
+    }
+
+    def article_path(filename: str) -> Path:
+        folder = article_destinations.get(filename, "psychometric_curves")
+        if filename.startswith("psychometric_overlay_subject"):
+            folder = article_destinations["psychometric_overlay_subject"]
+        out_path = fig_root / folder / filename
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        return out_path
 
     fits = add_fit_delta_columns(pse_jnd_by_subject_finger)
-    if not fits.empty:
+    if write_csv_outputs and not fits.empty:
         save_csv(fits, output_root, "pse_jnd_by_subject_finger_with_deltas.csv")
 
     selected_subject = _select_typical_subject_for_psychometric_overlay(fits, preferred_subject) if preferred_subject else None
@@ -2759,9 +2909,8 @@ def save_article_style_psychophysics_figures(
             ax.set_title(f"Article-style psychometric curves, participant {selected_subject}")
             ax.legend(loc="best", fontsize=8)
             fig.tight_layout()
-            out = fig_root / f"psychometric_overlay_subject_{sanitize_name(selected_subject)}.png"
-            fig.savefig(out, dpi=fig_dpi)
-            plt.close(fig)
+            out = article_path(f"psychometric_overlay_subject_{sanitize_name(selected_subject)}.png")
+            _finalize_fig(fig, out, fig_dpi)
             paths.append(out)
 
     if not psychometric_input_by_subject_finger.empty and not fits.empty:
@@ -2816,12 +2965,11 @@ def save_article_style_psychophysics_figures(
         ax.set_title("Group psychometric data by finger")
         ax.legend(loc="best", fontsize=8)
         fig.tight_layout()
-        out = fig_root / "group_psychometric_data_by_finger.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
+        out = article_path("group_psychometric_data_by_finger.png")
+        _finalize_fig(fig, out, fig_dpi)
         paths.append(out)
 
-        if "subject_id" in subject_agg and not fits.empty:
+        if include_workspace_comparison and "subject_id" in subject_agg and not fits.empty:
             fig, axes = plt.subplots(1, 2, figsize=(13.2, 5.0), sharey=True)
             for ax, setup in zip(axes, ["N", "L"]):
                 subj_panel = subject_agg[subject_agg["subject_id"].astype(str).str.upper().str.startswith(setup)].copy()
@@ -2875,9 +3023,8 @@ def save_article_style_psychophysics_figures(
             axes[1].legend(loc="best", fontsize=8)
             fig.suptitle("Psychometric curves by group (individual fits faded)")
             fig.tight_layout()
-            out = fig_root / "group_psychometric_curves_N_vs_L_by_finger.png"
-            fig.savefig(out, dpi=fig_dpi)
-            plt.close(fig)
+            out = article_path("group_psychometric_curves_N_vs_L_by_finger.png")
+            _finalize_fig(fig, out, fig_dpi)
             paths.append(out)
 
     metric_specs = [
@@ -2892,7 +3039,7 @@ def save_article_style_psychophysics_figures(
             title,
             ylabel,
             "Finger",
-            fig_root / filename,
+            article_path(filename),
             x_order=_finger_order_present(fits["finger_condition"]) if not fits.empty and "finger_condition" in fits else None,
             style_col="finger_condition",
             fig_dpi=fig_dpi,
@@ -2917,7 +3064,7 @@ def save_article_style_psychophysics_figures(
                 title,
                 ylabel,
                 "Finger",
-                fig_root / filename,
+                article_path(filename),
                 x_order=_finger_order_present(finger_time_subject_summary["finger_condition"]),
                 style_col="subject_id",
                 fig_dpi=fig_dpi,
@@ -2945,7 +3092,7 @@ def save_article_style_psychophysics_figures(
                     title,
                     ylabel,
                     "Finger appearance order",
-                    fig_root / filename,
+                    article_path(filename),
                     x_order=_appearance_order(appearance_df["finger_appearance_order"]),
                     style_col="subject_id",
                     fig_dpi=fig_dpi,
@@ -2960,7 +3107,8 @@ def save_article_style_psychophysics_figures(
             "style_source": "Farajian_Nisky_eLife_52653_Figure_7_adapted",
         }
     )
-    save_csv(manifest, output_root, "article_style_figure_manifest.csv")
+    if write_csv_outputs:
+        save_csv(manifest, output_root, "article_style_figure_manifest.csv")
     return paths, manifest
 
 
@@ -3174,120 +3322,688 @@ def compute_xy_probing_and_skin_stretch_analysis(
     }
 
 
-def save_xy_probing_skin_stretch_figures(
+def _save_table_if_not_empty(df: pd.DataFrame | None, root: Path, filename: str) -> Path | None:
+    if df is None or df.empty:
+        return None
+    return save_csv(df, root, filename)
+
+
+def _filter_subject(df: pd.DataFrame | None, subject: Any) -> pd.DataFrame:
+    if df is None or df.empty or "subject_id" not in df:
+        return pd.DataFrame()
+    return df[df["subject_id"].astype(str) == str(subject)].copy()
+
+
+def _qc_by_stiffness(clean: pd.DataFrame) -> pd.DataFrame:
+    if clean is None or clean.empty or "comparison_value" not in clean:
+        return pd.DataFrame()
+    trials = add_success_and_time_columns(clean)
+    return (
+        trials.groupby(["subject_id", "finger_condition", "comparison_value"], dropna=False)
+        .agg(
+            n_trials=("correct_response", "size"),
+            success_rate=("correct_response", "mean"),
+            p_comparison_greater=("response_comparison_greater", "mean"),
+            mean_reaction_time=("reaction_time", "mean"),
+        )
+        .reset_index()
+    )
+
+
+def _side_bias_by_stiffness(clean: pd.DataFrame) -> pd.DataFrame:
+    if clean is None or clean.empty or "answer_chose_object_2" not in clean:
+        return pd.DataFrame()
+    group_cols = ["subject_id", "finger_condition"]
+    if "comparison_value" in clean:
+        group_cols.append("comparison_value")
+    return (
+        clean.groupby(group_cols, dropna=False)
+        .agg(
+            p_chose_object2=("answer_chose_object_2", "mean"),
+            p_standard_on_object2=("standard_side", lambda x: float((x == "object_2").mean())) if "standard_side" in clean else ("answer_chose_object_2", "size"),
+            n_trials=("answer_chose_object_2", "size"),
+        )
+        .reset_index()
+    )
+
+
+def _rmtree_windows_retry(path: Path, *, attempts: int = 6, delay_seconds: float = 0.2) -> None:
+    """Remove a tree, retrying transient Windows/Dropbox file-handle locks."""
+    import gc
+    import os
+    import stat
+    import time
+
+    target = Path(path)
+    if not target.exists():
+        return
+
+    def _onerror(func: Any, failed_path: str, exc_info: Any) -> None:
+        try:
+            os.chmod(failed_path, stat.S_IWRITE)
+            func(failed_path)
+        except Exception:
+            raise
+
+    last_error: Exception | None = None
+    for _ in range(max(1, attempts)):
+        try:
+            shutil.rmtree(target, onerror=_onerror)
+            return
+        except (PermissionError, OSError) as exc:
+            last_error = exc
+            gc.collect()
+            time.sleep(delay_seconds)
+    if last_error is not None:
+        raise last_error
+
+
+def compute_psychophysics_group_aggregates(
+    clean: pd.DataFrame,
+    success_trials: pd.DataFrame,
+    psychometric_input_by_subject_finger: pd.DataFrame,
+    pse_jnd_by_subject_finger: pd.DataFrame,
+    *,
+    psignifit_available: bool = False,
+    n_jobs: int | None = None,
+) -> dict[str, Any]:
+    """Compute every group-level aggregate for one cohort of subjects.
+
+    Mirrors the notebook's group-aggregation cells so a cohort and any of its
+    sub-cohorts (e.g. the L_E and N_E halves of the combined ``L_N_E`` run) all
+    go through identical logic. Pooling uses only subject/finger fits that pass
+    the PSE reliability band (``excluded_from_group_analysis``); the per-subject
+    inputs are left untouched. Returns a dict whose keys match the corresponding
+    ``save_selected_analysis_tree`` keyword arguments, plus ``group_trials``,
+    ``psychometric_input_subject_pooled``, and ``pse_jnd_subject_pooled``.
+    """
+    valid_group_fits = pse_jnd_by_subject_finger.copy()
+    if "excluded_from_group_analysis" in valid_group_fits.columns:
+        valid_group_fits = valid_group_fits[~valid_group_fits["excluded_from_group_analysis"].astype(bool)]
+    valid_keys = set(
+        valid_group_fits["subject_id"].astype(str) + "||" + valid_group_fits["finger_condition"].astype(str)
+    )
+    trial_key = success_trials["subject_id"].astype(str) + "||" + success_trials["finger_condition"].astype(str)
+    group_trials = success_trials[trial_key.isin(valid_keys)].copy()
+
+    psychometric_input_subject_pooled = make_psychometric_input(group_trials, ["subject_id"])
+    psychometric_input_group_by_finger = make_psychometric_input(group_trials, ["finger_condition"])
+    all_pooled_trials = group_trials.copy()
+    all_pooled_trials["group"] = "all_pooled"
+    psychometric_input_group_all_pooled = make_psychometric_input(all_pooled_trials, ["group"])
+
+    (
+        pse_jnd_subject_pooled,
+        pse_jnd_group_by_finger,
+        pse_jnd_group_all_pooled,
+    ) = fit_conditions_many(
+        [
+            (psychometric_input_subject_pooled, ["subject_id"]),
+            (psychometric_input_group_by_finger, ["finger_condition"]),
+            (psychometric_input_group_all_pooled, ["group"]),
+        ],
+        psignifit_available,
+        n_jobs=n_jobs,
+    )
+
+    order_effects_summary, order_effects_binned = compute_order_effects(clean)
+    success_time_fatigue = compute_success_time_fatigue(success_trials, ["subject_id", "finger_condition"])
+    finger_time_appearance = compare_fingers_over_time_and_appearance(success_trials)
+
+    return {
+        "group_trials": group_trials,
+        "psychometric_input_subject_pooled": psychometric_input_subject_pooled,
+        "psychometric_input_group_by_finger": psychometric_input_group_by_finger,
+        "psychometric_input_group_all_pooled": psychometric_input_group_all_pooled,
+        "pse_jnd_subject_pooled": pse_jnd_subject_pooled,
+        "pse_jnd_group_by_finger": pse_jnd_group_by_finger,
+        "pse_jnd_group_all_pooled": pse_jnd_group_all_pooled,
+        "order_effects_summary": order_effects_summary,
+        "order_effects_binned": order_effects_binned,
+        "success_time_fatigue": success_time_fatigue,
+        "finger_time_appearance": finger_time_appearance,
+    }
+
+
+def save_selected_analysis_tree(
     output_root: Path,
-    xy_group_trajectory_bins: pd.DataFrame,
-    xy_trial_summary: pd.DataFrame,
-    xy_group_summary: pd.DataFrame,
+    selection: Any,
+    *,
+    clean: pd.DataFrame,
+    flagged: pd.DataFrame | None = None,
+    success_trials: pd.DataFrame | None = None,
+    qc_summary: pd.DataFrame | None = None,
+    psychometric_input_by_subject_finger: pd.DataFrame,
+    pse_jnd_by_subject_finger: pd.DataFrame,
+    psychometric_input_group_by_finger: pd.DataFrame | None = None,
+    pse_jnd_group_by_finger: pd.DataFrame | None = None,
+    psychometric_input_group_all_pooled: pd.DataFrame | None = None,
+    pse_jnd_group_all_pooled: pd.DataFrame | None = None,
+    order_effects_summary: pd.DataFrame | None = None,
+    order_effects_binned: pd.DataFrame | None = None,
+    success_time_fatigue: dict[str, pd.DataFrame] | None = None,
+    finger_time_appearance: dict[str, pd.DataFrame] | None = None,
+    psychophysics_group_comparisons: dict[str, pd.DataFrame] | None = None,
     fig_dpi: int = 160,
-) -> list[Path]:
-    """Save figures replacing article grip-force panels with XY/stretch panels."""
-    import matplotlib.pyplot as plt
+    write_subjects: bool = True,
+) -> pd.DataFrame:
+    """Save the requested subject/all tree for a selected cohort.
 
-    paths: list[Path] = []
-    fig_root = output_root / "figures" / "xy_probing_skin_stretch"
-    fig_root.mkdir(parents=True, exist_ok=True)
+    Tree layout:
+    - group/all outputs stay under ``output_root`` (for example ``results/L_E``);
+    - per-subject outputs are sibling folders of ``output_root`` (for example
+      ``results/L_E_1``, ``results/L_E_2``), not nested inside the group folder.
 
-    if not xy_group_trajectory_bins.empty:
-        fig, ax = plt.subplots(figsize=(6.2, 6.0))
-        for finger in sorted(xy_group_trajectory_bins["finger_condition"].dropna().unique(), key=_finger_sort_key):
-            style = FINGER_STYLE.get(str(finger), {})
-            g = xy_group_trajectory_bins[xy_group_trajectory_bins["finger_condition"] == finger].sort_values("time_fraction")
-            ax.plot(
-                g["mean_object_dx_from_center_px"],
-                g["mean_object_dy_from_center_px"],
-                color=style.get("color", None),
-                linewidth=2,
-                label=style.get("label", str(finger)),
-            )
-            ax.scatter(g["mean_object_dx_from_center_px"].iloc[0], g["mean_object_dy_from_center_px"].iloc[0], color=style.get("color", None), marker="o", s=35)
-            ax.scatter(g["mean_object_dx_from_center_px"].iloc[-1], g["mean_object_dy_from_center_px"].iloc[-1], color=style.get("color", None), marker="x", s=45)
-        ax.axhline(0, color="0.7", linewidth=1)
-        ax.axvline(0, color="0.7", linewidth=1)
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel("Object/probing X from center (px)")
-        ax.set_ylabel("Object/probing Y from center (px)")
-        ax.set_title("XY probing trajectory from center by finger")
-        ax.legend(loc="best", fontsize=8)
-        fig.tight_layout()
-        out = fig_root / "xy_center_trajectory_by_finger.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
+    Set ``write_subjects=False`` to write only the group/all folder and skip the
+    per-subject sibling folders. This is used by the pooled ``L_N_E`` tree, whose
+    subject folders are already written identically by the L_E and N_E sub-cohort
+    trees. It is ignored for single-subject selections (the subject is always
+    written there).
+    """
+    output_root = Path(output_root)
+    subject_output_base = output_root.parent
 
-        for y_col, y_label, filename, title in [
-            ("mean_center_distance_px", "Distance from center (px)", "center_distance_trajectory_by_finger.png", "Probing distance from center over time"),
-            (
-                "mean_skin_stretch_command_proxy_px",
-                "Skin-stretch command proxy (px x gain/175)",
-                "skin_stretch_proxy_trajectory_by_finger.png",
-                "Skin-stretch command proxy over probing time",
+    success_trials = success_trials if success_trials is not None else add_success_and_time_columns(clean)
+    flagged = flagged if flagged is not None else pd.DataFrame()
+    qc_summary = qc_summary if qc_summary is not None else make_qc_summary(clean, flagged)
+    success_time_fatigue = success_time_fatigue or compute_success_time_fatigue(success_trials, ["subject_id", "finger_condition"])
+    finger_time_appearance = finger_time_appearance or compare_fingers_over_time_and_appearance(success_trials)
+    subject_ids = sorted(clean["subject_id"].dropna().astype(str).unique(), key=_subject_sort_key)
+    subject_only = is_single_subject_selection(selection, subject_ids)
+    fig_all_root = output_root / "figures" / "all"
+    csv_all_root = output_root / "csv" / "all"
+    if not subject_only:
+        for root in [fig_all_root, csv_all_root]:
+            root.mkdir(parents=True, exist_ok=True)
+    manifest_rows: list[dict[str, Any]] = []
+
+    def record(scope: Any, statistic: str, kind: str, path: Any) -> None:
+        if path:
+            manifest_rows.append({"scope": scope, "statistic": statistic, "kind": kind, "path": str(path)})
+
+    # Shared all-group CSVs.
+    if not subject_only:
+        shared_all_csv = csv_all_root / "shared"
+        shared_tables = {
+            "clean_trials.csv": clean,
+            "flagged_trials.csv": flagged,
+            "success_trials.csv": success_trials,
+            "qc_summary.csv": qc_summary,
+            "psychometric_input_by_subject_finger.csv": psychometric_input_by_subject_finger,
+            "pse_jnd_by_subject_finger.csv": pse_jnd_by_subject_finger,
+            "psychometric_input_group_by_finger.csv": psychometric_input_group_by_finger,
+            "pse_jnd_group_by_finger.csv": pse_jnd_group_by_finger,
+            "psychometric_input_group_all_pooled.csv": psychometric_input_group_all_pooled,
+            "pse_jnd_group_all_pooled.csv": pse_jnd_group_all_pooled,
+            "order_effects_summary.csv": order_effects_summary,
+            "order_effects_binned.csv": order_effects_binned,
+        }
+        for name, table in shared_tables.items():
+            path = _save_table_if_not_empty(table, shared_all_csv, name)
+            record("all", "shared", "csv", path)
+        for prefix, tables in [("time_fatigue", success_time_fatigue), ("finger_time_appearance", finger_time_appearance), ("group_comparisons", psychophysics_group_comparisons or {})]:
+            for name, table in tables.items():
+                path = _save_table_if_not_empty(table, shared_all_csv / prefix, f"{sanitize_name(name)}.csv")
+                record("all", "shared", "csv", path)
+
+    for subject in (subject_ids if (write_subjects or subject_only) else []):
+        subject_root = subject_output_base / sanitize_name(subject)
+        sfig = subject_root / "figures"
+        scsv = subject_root / "csv"
+        s_clean = _filter_subject(clean, subject)
+        s_success = _filter_subject(success_trials, subject)
+        s_flagged = _filter_subject(flagged, subject)
+        s_qc = _filter_subject(qc_summary, subject)
+        s_psy = _filter_subject(psychometric_input_by_subject_finger, subject)
+        s_fits = _filter_subject(pse_jnd_by_subject_finger, subject)
+        s_order_summary = _filter_subject(order_effects_summary, subject)
+        s_order_binned = _filter_subject(order_effects_binned, subject)
+        s_tf = {k: _filter_subject(v, subject) for k, v in success_time_fatigue.items()}
+        s_fa = {k: _filter_subject(v, subject) for k, v in finger_time_appearance.items()}
+
+        for name, table in {
+            "clean_trials.csv": s_clean,
+            "flagged_trials.csv": s_flagged,
+            "success_trials.csv": s_success,
+            "qc_summary.csv": s_qc,
+            "psychometric_input_by_subject_finger.csv": s_psy,
+            "pse_jnd_by_subject_finger.csv": s_fits,
+            "order_effects_summary.csv": s_order_summary,
+            "order_effects_binned.csv": s_order_binned,
+        }.items():
+            path = _save_table_if_not_empty(table, scsv, name)
+            record(subject, "subject", "csv", path)
+        for prefix, tables in [("time_fatigue", s_tf), ("finger_time_appearance", s_fa)]:
+            for name, table in tables.items():
+                path = _save_table_if_not_empty(table, scsv / prefix, f"{sanitize_name(name)}.csv")
+                record(subject, "subject", "csv", path)
+
+        for path in _save_subject_psychometric_curves(sfig, s_psy, s_fits, subject=subject, fig_dpi=fig_dpi):
+            manifest_rows.append({"scope": subject, "statistic": "subject", "kind": "figure", "path": str(path)})
+        subject_curve_path, subject_curve_summary = _save_group_curves_plot(
+            s_psy,
+            out_path=sfig / "psychometric_curves" / "group_curves_mean.png",
+            statistic="mean",
+            title=f"Psychometric curves across four fingers: {subject}",
+            fig_dpi=fig_dpi,
+        )
+        csv_path = _save_table_if_not_empty(subject_curve_summary, scsv / "psychometric_curves", "group_curves_mean_source.csv")
+        record(subject, "subject", "csv", csv_path)
+        record(subject, "subject", "figure", subject_curve_path)
+        for path in [
+            _save_subject_article_summary(sfig, s_psy, s_fits, subject=subject, fig_dpi=fig_dpi),
+            _save_appearance_plot(
+                s_fa.get("subject_finger_summary", pd.DataFrame()),
+                out_path=sfig / "success_by_finger_appearance_order.png",
+                title=f"Success by finger appearance order: {subject}",
+                fig_dpi=fig_dpi,
+            ),
+            _save_time_fatigue_line_plot(
+                s_tf.get("order_bins", pd.DataFrame()),
+                x_col="order_bin",
+                y_col="success_rate",
+                out_path=sfig / "time_fatigue" / "success_by_trial_order_bin.png",
+                title=f"Time/fatigue: success across order bins ({subject})",
+                fig_dpi=fig_dpi,
+            ),
+            _save_time_fatigue_line_plot(
+                s_tf.get("reaction_time_bins", pd.DataFrame()),
+                x_col="reaction_time_bin",
+                y_col="success_rate",
+                out_path=sfig / "time_fatigue" / "success_by_reaction_time_bin.png",
+                title=f"Answer duration vs success ({subject})",
+                fig_dpi=fig_dpi,
+            ),
+            _save_order_effects_plot(
+                s_order_binned,
+                out_path=sfig / "order_effects.png",
+                title=f"Order effects: {subject}",
+                fig_dpi=fig_dpi,
             ),
         ]:
-            if y_col not in xy_group_trajectory_bins or xy_group_trajectory_bins[y_col].dropna().empty:
-                continue
-            fig, ax = plt.subplots(figsize=(7.2, 4.8))
-            for finger in sorted(xy_group_trajectory_bins["finger_condition"].dropna().unique(), key=_finger_sort_key):
-                style = FINGER_STYLE.get(str(finger), {})
-                g = xy_group_trajectory_bins[xy_group_trajectory_bins["finger_condition"] == finger].sort_values("time_fraction")
-                ax.plot(g["time_fraction"], g[y_col], color=style.get("color", None), linewidth=2, label=style.get("label", str(finger)))
-                sem_col = "sem_" + y_col.replace("mean_", "")
-                if sem_col in g:
-                    ax.fill_between(g["time_fraction"], g[y_col] - g[sem_col], g[y_col] + g[sem_col], color=style.get("color", None), alpha=0.15)
-            ax.set_xlabel("Normalized time within tracked trial")
-            ax.set_ylabel(y_label)
-            ax.set_title(title)
-            ax.legend(loc="best", fontsize=8)
-            fig.tight_layout()
-            out = fig_root / filename
-            fig.savefig(out, dpi=fig_dpi)
-            plt.close(fig)
-            paths.append(out)
+            record(subject, "subject", "figure", path)
 
-    if not xy_trial_summary.empty and "max_skin_stretch_command_proxy_px" in xy_trial_summary:
-        fig, ax = plt.subplots(figsize=(7.0, 4.8))
-        plot_df = xy_trial_summary[xy_trial_summary["tracking_exists"]].dropna(subset=["max_skin_stretch_command_proxy_px", "correct_response"]).copy()
-        for finger, g in plot_df.groupby("finger_condition", dropna=False):
-            style = FINGER_STYLE.get(str(finger), {})
-            ax.scatter(g["max_skin_stretch_command_proxy_px"], g["correct_response"], alpha=0.35, s=20, color=style.get("color", None), label=style.get("label", str(finger)))
-        ax.set_ylim(-0.08, 1.08)
-        ax.set_xlabel("Max skin-stretch command proxy (px × gain/175)")
-        ax.set_ylabel("Correct response")
-        ax.set_title("Success vs skin-stretch command proxy")
-        ax.legend(loc="best", fontsize=8)
-        fig.tight_layout()
-        out = fig_root / "success_vs_skin_stretch_proxy.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
+        subject_article_paths, subject_article_manifest = save_article_style_psychophysics_figures(
+            subject_root,
+            s_clean,
+            s_psy,
+            s_fits,
+            s_fa.get("subject_finger_summary", pd.DataFrame()),
+            s_fa.get("appearance_order_summary", pd.DataFrame()),
+            s_fa.get("finger_by_appearance_order", pd.DataFrame()),
+            preferred_subject=subject,
+            fig_dpi=fig_dpi,
+            include_workspace_comparison=False,
+            write_csv_outputs=False,
+        )
+        path = _save_table_if_not_empty(subject_article_manifest, scsv, "article_style_figure_manifest.csv")
+        record(subject, "subject", "csv", path)
+        for path in subject_article_paths:
+            manifest_rows.append({"scope": subject, "statistic": "subject", "kind": "figure", "path": str(path)})
 
-    if not xy_group_summary.empty:
-        fig, ax = plt.subplots(figsize=(7.2, 4.8))
-        for finger, g in xy_group_summary.groupby("finger_condition", dropna=False):
-            style = FINGER_STYLE.get(str(finger), {})
-            ax.scatter(
-                g["mean_max_center_distance_px"],
-                g["success_rate"],
-                color=style.get("color", None),
-                marker=style.get("marker", "o"),
-                edgecolor="black",
-                linewidth=0.3,
-                s=55,
-                label=style.get("label", str(finger)),
+        s_qc_stiffness = _qc_by_stiffness(s_clean)
+        _save_table_if_not_empty(s_qc_stiffness, scsv, "qc_by_stiffness.csv")
+        path = _plot_finger_columns_stiffness_dots(
+            s_qc_stiffness,
+            y_col="success_rate",
+            y_label="Success rate",
+            title=f"QC summary by stiffness: {subject}",
+            out_path=sfig / "qc_summary_plots.png",
+            fig_dpi=fig_dpi,
+        )
+        record(subject, "subject", "figure", path)
+
+        s_side = _side_bias_by_stiffness(s_clean)
+        _save_table_if_not_empty(s_side, scsv, "side_bias_by_stiffness.csv")
+        path = _plot_side_bias_object_columns(
+            s_side,
+            title=f"Side bias by stiffness: {subject}",
+            out_path=sfig / "side_bias_stiffnesses.png",
+            fig_dpi=fig_dpi,
+        )
+        record(subject, "subject", "figure", path)
+
+    if subject_only:
+        manifest = pd.DataFrame(manifest_rows)
+        save_csv(manifest, output_root, "analysis_tree_manifest.csv")
+        return manifest
+
+    # All-group figures and CSVs. Mean/median used to duplicate the same visual
+    # information, so group outputs are now written once under figures/all and
+    # csv/all. Keep subject folders unchanged.
+    froot = fig_all_root
+    croot = csv_all_root
+
+    legacy_tmp = output_root / "_all_legacy_tmp"
+    if legacy_tmp.exists():
+        _rmtree_windows_retry(legacy_tmp)
+    legacy_tmp.mkdir(parents=True, exist_ok=True)
+    legacy_paths: list[Path] = []
+    legacy_paths.extend(
+        save_all_figures(
+            legacy_tmp,
+            clean,
+            qc_summary,
+            psychometric_input_by_subject_finger,
+            pse_jnd_by_subject_finger,
+            psychometric_input_group_by_finger if psychometric_input_group_by_finger is not None else pd.DataFrame(),
+            pse_jnd_group_by_finger if pse_jnd_group_by_finger is not None else pd.DataFrame(),
+            psychometric_input_group_all_pooled if psychometric_input_group_all_pooled is not None else pd.DataFrame(),
+            pse_jnd_group_all_pooled if pse_jnd_group_all_pooled is not None else pd.DataFrame(),
+            order_effects_binned if order_effects_binned is not None else pd.DataFrame(),
+            fig_dpi,
+        )
+    )
+    legacy_paths.extend(
+        save_time_fatigue_figures(
+            legacy_tmp,
+            success_time_fatigue.get("reaction_time_bins", pd.DataFrame()),
+            success_time_fatigue.get("order_bins", pd.DataFrame()),
+            success_time_fatigue.get("first_second", pd.DataFrame()),
+            success_time_fatigue.get("subject_summary", pd.DataFrame()),
+            success_time_fatigue.get("slopes", pd.DataFrame()),
+            fig_dpi,
+        )
+    )
+    legacy_paths.extend(
+        save_finger_time_appearance_figures(
+            legacy_tmp,
+            finger_time_appearance.get("group_finger_time_bins", pd.DataFrame()),
+            finger_time_appearance.get("appearance_order_summary", pd.DataFrame()),
+            finger_time_appearance.get("finger_by_appearance_order", pd.DataFrame()),
+            finger_time_appearance.get("finger_slope_summary", pd.DataFrame()),
+            fig_dpi,
+            stiffness_time_slope_summary=finger_time_appearance.get("stiffness_slope_summary", pd.DataFrame()),
+            subject_finger_time_bins=finger_time_appearance.get("subject_finger_time_bins", pd.DataFrame()),
+        )
+    )
+    legacy_paths.extend(
+        save_success_by_stiffness_repetition_figures(
+            legacy_tmp,
+            finger_time_appearance.get("trials", pd.DataFrame()),
+            fig_dpi,
+        )
+    )
+    article_paths, article_manifest = save_article_style_psychophysics_figures(
+        legacy_tmp,
+        clean,
+        psychometric_input_by_subject_finger,
+        pse_jnd_by_subject_finger,
+        finger_time_appearance.get("subject_finger_summary", pd.DataFrame()),
+        finger_time_appearance.get("appearance_order_summary", pd.DataFrame()),
+        finger_time_appearance.get("finger_by_appearance_order", pd.DataFrame()),
+        preferred_subject=None,
+        fig_dpi=fig_dpi,
+    )
+    legacy_paths.extend(article_paths)
+    _save_table_if_not_empty(article_manifest, croot, "article_style_figure_manifest.csv")
+
+    legacy_figures_root = legacy_tmp / "figures"
+    for src in sorted(set(Path(p) for p in legacy_paths if Path(p).exists()), key=lambda p: str(p).lower()):
+        try:
+            rel = src.relative_to(legacy_figures_root)
+        except ValueError:
+            rel = Path(src.name)
+        dst = froot / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+        manifest_rows.append({"scope": "all", "statistic": "all", "kind": "figure", "path": str(dst)})
+    if legacy_tmp.exists():
+        _rmtree_windows_retry(legacy_tmp)
+
+    group_curve_dir = froot / "group_curves"
+    if group_curve_dir.exists():
+        psychometric_dir = froot / "psychometric_curves"
+        psychometric_dir.mkdir(parents=True, exist_ok=True)
+        for src in sorted(group_curve_dir.glob("group_finger_*.png"), key=lambda p: p.name):
+            dst = psychometric_dir / src.name
+            if dst.exists():
+                dst.unlink()
+            shutil.move(str(src), str(dst))
+            manifest_rows[:] = [
+                ({**row, "path": str(dst)} if str(row.get("path", "")) == str(src) else row)
+                for row in manifest_rows
+            ]
+            if not any(str(row.get("path", "")) == str(dst) for row in manifest_rows):
+                manifest_rows.append({"scope": "all", "statistic": "all", "kind": "figure", "path": str(dst)})
+
+    _remove_all_only_legacy_plot(froot / "subject_finger_curves", manifest_rows)
+    _remove_all_only_legacy_plot(froot / "group_curves", manifest_rows)
+    if normalize_data_selection(selection) != "L_N_E":
+        _remove_all_only_legacy_plot(froot / "psychometric_curves" / "group_psychometric_curves_N_vs_L_by_finger.png", manifest_rows)
+
+    finger_subject_summary = finger_time_appearance.get("subject_finger_summary", pd.DataFrame())
+    article_dirs = {
+        "success_time_slope_article_style_by_finger.png": froot / "finger_time_appearance",
+        "time_slope_article_style_by_appearance_order.png": froot / "time_fatigue",
+        "success_article_style_by_finger.png": froot / "finger_time_appearance",
+        "success_article_style_by_appearance_order.png": froot / "time_fatigue",
+        "jnd_article_style_by_finger.png": froot / "psychometric_curves",
+        "pse_article_style_by_finger.png": froot / "psychometric_curves",
+        "group_psychometric_data_by_finger.png": froot / "psychometric_curves",
+    }
+
+    def all_article_path(filename: str) -> Path:
+        return article_dirs.get(filename, froot / "psychometric_curves") / filename
+
+    for metric, ylabel, title, filename, x_col, xlabel, x_order in [
+        (
+            "success_vs_within_finger_time_slope",
+            "Success slope over within-finger time",
+            "Within-finger time trend by finger",
+            "success_time_slope_article_style_by_finger.png",
+            "finger_condition",
+            "Finger",
+            _finger_order_present(finger_subject_summary["finger_condition"]) if not finger_subject_summary.empty and "finger_condition" in finger_subject_summary else None,
+        ),
+        (
+            "success_vs_within_finger_time_slope",
+            "Success slope over within-finger time",
+            "Time trend by finger appearance order",
+            "time_slope_article_style_by_appearance_order.png",
+            "finger_appearance_order",
+            "Finger appearance order",
+            _appearance_order(finger_subject_summary["finger_appearance_order"]) if not finger_subject_summary.empty and "finger_appearance_order" in finger_subject_summary else None,
+        ),
+        (
+            "success_rate",
+            "Success rate",
+            "Success by finger",
+            "success_article_style_by_finger.png",
+            "finger_condition",
+            "Finger",
+            _finger_order_present(finger_subject_summary["finger_condition"]) if not finger_subject_summary.empty and "finger_condition" in finger_subject_summary else None,
+        ),
+        (
+            "success_rate",
+            "Success rate",
+            "Success by finger appearance order",
+            "success_article_style_by_appearance_order.png",
+            "finger_appearance_order",
+            "Finger appearance order",
+            _appearance_order(finger_subject_summary["finger_appearance_order"]) if not finger_subject_summary.empty and "finger_appearance_order" in finger_subject_summary else None,
+        ),
+    ]:
+        out = all_article_path(filename)
+        if not out.exists():
+            fallback = _plot_article_style_metric_lines(
+                finger_subject_summary,
+                x_col,
+                metric,
+                title,
+                ylabel,
+                xlabel,
+                out,
+                x_order=x_order,
+                style_col="subject_id",
+                fig_dpi=fig_dpi,
             )
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_xlabel("Mean max probing distance from center (px)")
-        ax.set_ylabel("Success rate")
-        ax.set_title("Participant/finger success vs probing distance")
-        ax.legend(loc="best", fontsize=8)
-        fig.tight_layout()
-        out = fig_root / "success_vs_xy_probing_distance.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
+            if fallback is None and metric == "success_vs_within_finger_time_slope":
+                fallback = _save_article_metric_fallback_plot(
+                    finger_subject_summary,
+                    x_col=x_col,
+                    metric_col=metric,
+                    title=title,
+                    ylabel=ylabel,
+                    xlabel=xlabel,
+                    out_path=out,
+                    fig_dpi=fig_dpi,
+                )
+            record("all", "all", "figure", fallback)
 
-    save_csv(pd.DataFrame({"figure": [str(p) for p in paths]}), output_root, "xy_probing_skin_stretch_figure_manifest.csv")
-    return paths
+    # All-scope-only visual corrections requested after restoring the legacy
+    # plot set. These overwrite all-level files only; subject folders are left
+    # untouched.
+    fit_df = add_fit_delta_columns(pse_jnd_by_subject_finger) if pse_jnd_by_subject_finger is not None and not pse_jnd_by_subject_finger.empty else pd.DataFrame()
+    pse_metric = "pse_delta_comparison_minus_standard" if "pse_delta_comparison_minus_standard" in fit_df else "pse"
+    _append_all_figure_manifest(
+        manifest_rows,
+        _save_all_fit_metric_by_subject_finger(
+            fit_df,
+            metric_col="jnd",
+            out_path=froot / "jnd_per_subject_and_finger.png",
+            title="JND per participant and finger",
+            ylabel="JND",
+            fig_dpi=fig_dpi,
+        ),
+    )
+    _append_all_figure_manifest(
+        manifest_rows,
+        _save_all_fit_metric_by_subject_finger(
+            fit_df,
+            metric_col=pse_metric,
+            out_path=froot / "pse_per_subject_and_finger.png",
+            title="PSE per participant and finger",
+            ylabel="PSE shift (comparison - standard)" if pse_metric != "pse" else "PSE",
+            fig_dpi=fig_dpi,
+        ),
+    )
+    _append_all_figure_manifest(
+        manifest_rows,
+        _save_all_subject_background_metric_plot(
+            fit_df,
+            x_col="finger_condition",
+            y_col="jnd",
+            out_path=all_article_path("jnd_article_style_by_finger.png"),
+            title="JND by finger",
+            xlabel="Finger",
+            ylabel="JND",
+            line_color="subject",
+            dot_color="subject",
+            fig_dpi=fig_dpi,
+        ),
+    )
+    _append_all_figure_manifest(
+        manifest_rows,
+        _save_all_subject_background_metric_plot(
+            finger_subject_summary,
+            x_col="finger_condition",
+            y_col="success_rate",
+            out_path=all_article_path("success_article_style_by_finger.png"),
+            title="Success by finger",
+            xlabel="Finger",
+            ylabel="Success rate",
+            line_color="subject",
+            dot_color="subject",
+            fig_dpi=fig_dpi,
+        ),
+    )
+    _append_all_figure_manifest(
+        manifest_rows,
+        _save_all_subject_background_metric_plot(
+            finger_subject_summary,
+            x_col="finger_appearance_order",
+            y_col="success_rate",
+            out_path=all_article_path("success_article_style_by_appearance_order.png"),
+            title="Success by finger appearance order",
+            xlabel="Finger appearance order",
+            ylabel="Success rate",
+            line_color="subject",
+            dot_color="finger",
+            fig_dpi=fig_dpi,
+        ),
+    )
+    _append_all_figure_manifest(
+        manifest_rows,
+        _save_all_subject_background_metric_plot(
+            finger_subject_summary,
+            x_col="finger_appearance_order",
+            y_col="success_rate",
+            out_path=froot / "finger_time_appearance" / "success_by_finger_appearance_order.png",
+            title="Success by finger appearance order",
+            xlabel="Finger appearance order",
+            ylabel="Success rate",
+            line_color="subject",
+            dot_color="finger",
+            fig_dpi=fig_dpi,
+        ),
+    )
+    _append_all_figure_manifest(
+        manifest_rows,
+        _save_all_subject_background_metric_plot(
+            finger_subject_summary,
+            x_col="finger_appearance_order",
+            y_col="success_rate",
+            out_path=froot / "finger_time_appearance" / "success_by_finger_identity_and_appearance_order.png",
+            title="Finger identity x appearance-order success",
+            xlabel="Finger appearance order",
+            ylabel="Success rate",
+            line_color="subject",
+            dot_color="finger",
+            fig_dpi=fig_dpi,
+        ),
+    )
+    _append_all_figure_manifest(
+        manifest_rows,
+        _save_all_finger_time_plot(
+            finger_time_appearance.get("subject_finger_time_bins", pd.DataFrame()),
+            finger_time_appearance.get("group_finger_time_bins", pd.DataFrame()),
+            out_path=froot / "finger_time_appearance" / "success_by_finger_over_within_finger_time.png",
+            fig_dpi=fig_dpi,
+        ),
+    )
+    _append_all_figure_manifest(
+        manifest_rows,
+        _save_all_success_order_slopes(
+            success_time_fatigue.get("slopes", pd.DataFrame()),
+            out_path=froot / "time_fatigue" / "success_order_slopes_by_finger.png",
+            fig_dpi=fig_dpi,
+        ),
+    )
+
+    if psychophysics_group_comparisons:
+        scope_tmp = froot / "_scope_tmp"
+        scope_manifest = save_scope_summary_plots(
+            psychophysics_group_comparisons,
+            scope_tmp,
+            namespace="psychophysics",
+            metrics=[*PSYCHOPHYSICS_GROUP_METRICS, *PSYCHOPHYSICS_FIT_GROUP_METRICS],
+            keep_only=SCOPE_SUMMARY_FIGURE_WHITELIST,
+        )
+        if not scope_manifest.empty:
+            scope_dir = froot / "psychophysics_scope_summaries"
+            scope_dir.mkdir(parents=True, exist_ok=True)
+            moved_figures = []
+            for figure in scope_manifest["figure"].astype(str):
+                src = Path(figure)
+                dst = scope_dir / src.name
+                if src.exists():
+                    shutil.move(str(src), str(dst))
+                    moved_figures.append(str(dst))
+                else:
+                    moved_figures.append(str(src))
+            scope_manifest = scope_manifest.copy()
+            scope_manifest["figure"] = moved_figures
+        if scope_tmp.exists():
+            _rmtree_windows_retry(scope_tmp)
+        path = _save_table_if_not_empty(scope_manifest, croot, "psychophysics_scope_figure_manifest.csv")
+        record("all", "all", "csv", path)
+        for _, row in scope_manifest.iterrows():
+            manifest_rows.append({"scope": "all", "statistic": "all", "kind": "figure", "path": row["figure"]})
+
+    manifest = pd.DataFrame(manifest_rows)
+    save_csv(manifest, output_root, "analysis_tree_manifest.csv")
+    return manifest
 
 
 # ---------------------------------------------------------------------------
@@ -3460,9 +4176,21 @@ def _one_way_anova_rows(df: pd.DataFrame, source: str, metrics: list[str], facto
             ss_total = ss_between + ss_within
             df_between = len(groups) - 1
             df_within = sum(len(g) for g in groups) - len(groups)
-            if ss_within <= 0 or df_within <= 0:
+            group_means = np.array([float(np.mean(g)) for g in groups], dtype=float)
+            all_groups_constant = all(np.allclose(g, g[0], rtol=1e-12, atol=1e-12) for g in groups if len(g) > 0)
+            if df_within <= 0:
                 f_value, p_value = np.nan, np.nan
-                status = "zero_within_group_variance"
+                status = "insufficient_error_degrees_of_freedom"
+            elif all_groups_constant:
+                f_value, p_value = np.nan, np.nan
+                status = (
+                    "constant_input_all_groups_same_mean"
+                    if np.allclose(group_means, group_means[0], rtol=1e-12, atol=1e-12)
+                    else "constant_input_all_groups_different_means"
+                )
+            elif ss_within <= 1e-12:
+                f_value, p_value = np.nan, np.nan
+                status = "near_zero_within_group_variance"
             elif scipy_stats is not None:
                 f_value, p_value = scipy_stats.f_oneway(*groups)
                 status = "ok"
@@ -3709,6 +4437,11 @@ def compute_experiment_group_comparisons(
         source = fit_df if fit_df is not None else pd.DataFrame()
         if not source.empty:
             source = add_fit_delta_columns(source)
+            # PSE band-pass: out-of-band fits are excluded from every group-level
+            # aggregation/comparison below. They are still present (and flagged)
+            # in the per-subject fit tables and individual psychometric curves.
+            if "excluded_from_group_analysis" in source.columns:
+                source = source[~source["excluded_from_group_analysis"].astype(bool)].copy()
         source_experiment = _experiment_only_rows(source)
         source_protocol = _protocol_only_rows(source)
         fit_experiment_sources[prefix] = source_experiment
@@ -3788,24 +4521,10 @@ def save_experiment_group_comparison_outputs(
         output_root,
         namespace="psychophysics",
         metrics=[*PSYCHOPHYSICS_GROUP_METRICS, *PSYCHOPHYSICS_FIT_GROUP_METRICS],
+        keep_only=SCOPE_SUMMARY_FIGURE_WHITELIST,
     )
     tables["psychophysics_scope_figure_manifest"] = figure_manifest
     return tables
-
-
-def save_subject_level_outputs(output_root: Path, clean: pd.DataFrame, flagged: pd.DataFrame, subject_fits: pd.DataFrame, subject_pooled_fits: pd.DataFrame) -> None:
-    subjects_dir = output_root / "subjects"
-    subjects_dir.mkdir(parents=True, exist_ok=True)
-    for subject, g in clean.groupby("subject_id", dropna=False):
-        sdir = subjects_dir / sanitize_name(subject)
-        sdir.mkdir(parents=True, exist_ok=True)
-        g.to_csv(sdir / "clean_trials.csv", index=False)
-        if not flagged.empty:
-            flagged[flagged["subject_id"] == subject].to_csv(sdir / "flagged_trials.csv", index=False)
-        if not subject_fits.empty:
-            subject_fits[subject_fits["subject_id"] == subject].to_csv(sdir / "pse_jnd_by_finger.csv", index=False)
-        if not subject_pooled_fits.empty:
-            subject_pooled_fits[subject_pooled_fits["subject_id"] == subject].to_csv(sdir / "pse_jnd_pooled.csv", index=False)
 
 
 def analysis_manifest(output_root: Path) -> pd.DataFrame:
@@ -3890,626 +4609,52 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
     return pd.DataFrame({"output": required, "exists": [(output_root / f).exists() for f in required], "path": [str(output_root / f) for f in required]})
 
 
-def plot_fit_curve(
-    agg: pd.DataFrame,
-    fit_row: pd.Series,
-    title: str,
-    out_path: Path,
-    fig_dpi: int = 160,
-    background_agg: Optional[pd.DataFrame] = None,
-    background_fits: Optional[pd.DataFrame] = None,
-    curve_color: Optional[str] = None,
-):
-    import matplotlib.pyplot as plt
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(6.5, 4.5))
-    finger = fit_row.get("finger_condition", None)
-    curve_color = curve_color or _finger_color(finger, "black")
-
-    if background_agg is not None and background_fits is not None and not background_agg.empty and not background_fits.empty:
-        for _, bg_fit in background_fits.iterrows():
-            bg = add_delta_and_less_response_columns(background_agg)
-            if "subject_id" in bg and "subject_id" in bg_fit:
-                bg = bg[bg["subject_id"].astype(str) == str(bg_fit["subject_id"])]
-            if "finger_condition" in bg and "finger_condition" in bg_fit:
-                bg = bg[bg["finger_condition"].astype(str) == str(bg_fit["finger_condition"])]
-            bg = bg.dropna(subset=["delta_comparison_minus_standard", "p_comparison_greater"])
-            if len(bg) < 2:
-                continue
-            x_bg = np.linspace(float(bg["delta_comparison_minus_standard"].min()), float(bg["delta_comparison_minus_standard"].max()), 200)
-            std_bg = float(pd.to_numeric(bg["standard_value"], errors="coerce").median())
-            y_bg = _fit_row_to_delta_predictions(bg_fit, std_bg, x_bg)
-            if np.isfinite(y_bg).any():
-                ax.plot(x_bg, y_bg, color=_finger_color(bg_fit.get("finger_condition", finger), "0.45"), alpha=0.12, linewidth=0.9, zorder=1)
-
-    agg = add_delta_and_less_response_columns(agg).sort_values("delta_comparison_minus_standard").copy()
-    if {"p_comparison_greater_ci95_lower", "p_comparison_greater_ci95_upper"}.issubset(agg.columns):
-        yerr = np.vstack([
-            agg["p_comparison_greater"] - agg["p_comparison_greater_ci95_lower"],
-            agg["p_comparison_greater_ci95_upper"] - agg["p_comparison_greater"],
-        ])
-        ax.errorbar(agg["delta_comparison_minus_standard"], agg["p_comparison_greater"], yerr=yerr, fmt="none", ecolor="0.35", alpha=0.65, capsize=3, zorder=2)
-
-    delta_values = pd.to_numeric(agg["delta_comparison_minus_standard"], errors="coerce")
-    scatter = ax.scatter(
-        agg["delta_comparison_minus_standard"],
-        agg["p_comparison_greater"],
-        c=delta_values,
-        cmap=STIFFNESS_CMAP,
-        s=42,
-        edgecolor="black",
-        linewidth=0.35,
-        alpha=0.9,
-        label="Observed mean",
-        zorder=3,
-    )
-    if delta_values.nunique(dropna=True) > 1:
-        cbar = fig.colorbar(scatter, ax=ax, pad=0.02)
-        cbar.set_label(PSYCHOMETRIC_DELTA_AXIS_LABEL)
-
-    if len(agg) >= 2:
-        x_grid = np.linspace(float(agg["delta_comparison_minus_standard"].min()), float(agg["delta_comparison_minus_standard"].max()), 300)
-        std = float(pd.to_numeric(agg["standard_value"], errors="coerce").median())
-        y_grid = _fit_row_to_delta_predictions(fit_row, std, x_grid)
-        if np.isfinite(y_grid).any():
-            ax.plot(x_grid, y_grid, color=curve_color, linewidth=2.2, label="Fit", zorder=4)
-    pse = pd.to_numeric(pd.Series([fit_row.get("pse_delta_comparison_minus_standard", np.nan)]), errors="coerce").iloc[0]
-    if not np.isfinite(pse) and "pse" in fit_row and "standard_value" in agg and agg["standard_value"].notna().any():
-        fit_pse = pd.to_numeric(pd.Series([fit_row.get("pse")]), errors="coerce").iloc[0]
-        pse = fit_pse - float(pd.to_numeric(agg["standard_value"], errors="coerce").median())
-    pse_ci_lower_delta = pd.to_numeric(pd.Series([fit_row.get("pse_delta_ci95_lower", np.nan)]), errors="coerce").iloc[0]
-    pse_ci_upper_delta = pd.to_numeric(pd.Series([fit_row.get("pse_delta_ci95_upper", np.nan)]), errors="coerce").iloc[0]
-    if (not (np.isfinite(pse_ci_lower_delta) and np.isfinite(pse_ci_upper_delta))) and "standard_value" in agg and agg["standard_value"].notna().any():
-        std_for_ci = float(pd.to_numeric(agg["standard_value"], errors="coerce").median())
-        pse_ci_lower_raw = pd.to_numeric(pd.Series([fit_row.get("pse_ci95_lower", np.nan)]), errors="coerce").iloc[0]
-        pse_ci_upper_raw = pd.to_numeric(pd.Series([fit_row.get("pse_ci95_upper", np.nan)]), errors="coerce").iloc[0]
-        if np.isfinite(pse_ci_lower_raw):
-            pse_ci_lower_delta = pse_ci_lower_raw - std_for_ci
-        if np.isfinite(pse_ci_upper_raw):
-            pse_ci_upper_delta = pse_ci_upper_raw - std_for_ci
-    standard_inside_ci = bool(np.isfinite(pse_ci_lower_delta) and np.isfinite(pse_ci_upper_delta) and pse_ci_lower_delta <= 0 <= pse_ci_upper_delta)
-    if np.isfinite(pse):
-        pse_label = f"PSE shift={pse:.2f}"
-        if np.isfinite(pse_ci_lower_delta) and np.isfinite(pse_ci_upper_delta):
-            pse_label += f" [{pse_ci_lower_delta:.2f}, {pse_ci_upper_delta:.2f}]"
-        ax.axvline(float(pse), color=curve_color, linestyle="--", linewidth=1.5, label=pse_label)
-        if np.isfinite(pse_ci_lower_delta) and np.isfinite(pse_ci_upper_delta):
-            ax.axvspan(float(pse_ci_lower_delta), float(pse_ci_upper_delta), color=curve_color, alpha=0.10, zorder=0)
-            ax.errorbar(
-                [float(pse)],
-                [0.5],
-                xerr=[[max(0.0, float(pse) - float(pse_ci_lower_delta))], [max(0.0, float(pse_ci_upper_delta) - float(pse))]],
-                fmt="o",
-                color=curve_color,
-                ecolor=curve_color,
-                elinewidth=1.6,
-                capsize=4,
-                markersize=5,
-                zorder=5,
-                label="95% CI on PSE",
-            )
-        bias_p = pd.to_numeric(pd.Series([fit_row.get("pse_bias_p_value", np.nan)]), errors="coerce").iloc[0]
-        bias_text_lines = [f"standard {'INSIDE' if standard_inside_ci else 'OUTSIDE'} 95% CI"]
-        if np.isfinite(bias_p):
-            bias_text_lines.append(f"Wald p={bias_p:.3g}")
-        ax.text(
-            0.02,
-            0.98,
-            "\n".join(bias_text_lines),
-            transform=ax.transAxes,
-            ha="left",
-            va="top",
-            fontsize=8,
-            color="black",
-            bbox=dict(facecolor="white", alpha=0.7, edgecolor="0.6", linewidth=0.5),
-        )
-    ax.axvline(0, color="black", linestyle=":", linewidth=1, label="standard (delta=0)")
-    ax.axhline(0.5, color="gray", linestyle=":", linewidth=1)
-    ax.set_ylim(-0.05, 1.05)
-    set_psychometric_delta_axis(ax, agg["delta_comparison_minus_standard"])
-    ax.set_ylabel(PSYCHOMETRIC_GREATER_Y_LABEL)
-    ax.set_title(title)
-    ax.legend(loc="best", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=fig_dpi)
-    return fig, ax
-
-
-def save_all_figures(
-    output_root: Path,
-    clean: pd.DataFrame,
-    qc_summary: pd.DataFrame,
-    psychometric_input_by_subject_finger: pd.DataFrame,
-    pse_jnd_by_subject_finger: pd.DataFrame,
-    psychometric_input_group_by_finger: pd.DataFrame,
-    pse_jnd_group_by_finger: pd.DataFrame,
-    psychometric_input_group_all_pooled: pd.DataFrame,
-    pse_jnd_group_all_pooled: pd.DataFrame,
-    order_effects_binned: pd.DataFrame,
-    fig_dpi: int = 160,
-) -> list[Path]:
-    import matplotlib.pyplot as plt
-
-    try:
-        import seaborn as sns  # type: ignore
-        sns.set_theme(style="whitegrid")
-    except Exception:  # pragma: no cover
-        sns = None
-
-    paths: list[Path] = []
-    fig_root = output_root / "figures"
-    fig_root.mkdir(parents=True, exist_ok=True)
-
-    if not psychometric_input_by_subject_finger.empty and not pse_jnd_by_subject_finger.empty:
-        for _, fit_row in pse_jnd_by_subject_finger.iterrows():
-            subject, finger = fit_row["subject_id"], fit_row["finger_condition"]
-            agg = psychometric_input_by_subject_finger[
-                (psychometric_input_by_subject_finger["subject_id"] == subject)
-                & (psychometric_input_by_subject_finger["finger_condition"] == finger)
-            ]
-            out = fig_root / "subject_finger_curves" / sanitize_name(subject) / f"psychometric_{sanitize_name(subject)}_{sanitize_name(finger)}.png"
-            fig, _ = plot_fit_curve(agg, fit_row, f"Subject {subject} – finger {finger}", out, fig_dpi, curve_color=_finger_color(finger))
-            plt.close(fig)
-            paths.append(out)
-
-    if not psychometric_input_group_by_finger.empty and not pse_jnd_group_by_finger.empty:
-        for _, fit_row in pse_jnd_group_by_finger.iterrows():
-            finger = fit_row["finger_condition"]
-            agg = psychometric_input_group_by_finger[psychometric_input_group_by_finger["finger_condition"] == finger]
-            out = fig_root / "group_curves" / f"group_finger_{sanitize_name(finger)}.png"
-            bg_agg = psychometric_input_by_subject_finger[psychometric_input_by_subject_finger["finger_condition"].astype(str) == str(finger)]
-            bg_fits = pse_jnd_by_subject_finger[pse_jnd_by_subject_finger["finger_condition"].astype(str) == str(finger)]
-            fig, _ = plot_fit_curve(
-                agg,
-                fit_row,
-                f"Group pooled – finger {finger}",
-                out,
-                fig_dpi,
-                background_agg=bg_agg,
-                background_fits=bg_fits,
-                curve_color=_finger_color(finger),
-            )
-            plt.close(fig)
-            paths.append(out)
-
-    if not psychometric_input_group_all_pooled.empty and not pse_jnd_group_all_pooled.empty:
-        out = fig_root / "group_curves" / "group_all_pooled.png"
-        fig, _ = plot_fit_curve(
-            psychometric_input_group_all_pooled,
-            pse_jnd_group_all_pooled.iloc[0],
-            "Group all-pooled",
-            out,
-            fig_dpi,
-            background_agg=psychometric_input_by_subject_finger,
-            background_fits=pse_jnd_by_subject_finger,
-            curve_color="black",
-        )
-        plt.close(fig)
-        paths.append(out)
-
-    if not pse_jnd_by_subject_finger.empty:
-        for metric, ylabel, filename in [("pse", "PSE", "pse_per_subject_and_finger.png"), ("jnd", "JND", "jnd_per_subject_and_finger.png")]:
-            fig, ax = plt.subplots(figsize=(8, 4.8))
-            plot_df = pse_jnd_by_subject_finger.copy()
-            order = _finger_order_present(plot_df["finger_condition"])
-            x_map = {finger: i for i, finger in enumerate(order)}
-            plot_df["_x_num"] = plot_df["finger_condition"].map(x_map)
-            for subject, g in plot_df.groupby("subject_id", dropna=False):
-                g = g.sort_values("_x_num")
-                ax.plot(g["_x_num"], g[metric], color="0.75", linewidth=0.8, alpha=0.45, zorder=1)
-            values = pd.to_numeric(plot_df[metric], errors="coerce")
-            scatter = ax.scatter(
-                plot_df["_x_num"],
-                values,
-                c=values,
-                cmap=STIFFNESS_CMAP,
-                s=48,
-                edgecolor="black",
-                linewidth=0.3,
-                alpha=0.9,
-                zorder=2,
-            )
-            group = plot_df.groupby("_x_num", dropna=False)[metric].agg(["mean", "std"]).reset_index()
-            ax.errorbar(group["_x_num"], group["mean"], yerr=group["std"], color="black", marker="o", linewidth=2, capsize=4, label="Mean ± SD", zorder=3)
-            if values.nunique(dropna=True) > 1:
-                cbar = fig.colorbar(scatter, ax=ax, pad=0.02)
-                cbar.set_label(ylabel)
-            ax.set_xticks(range(len(order)))
-            ax.set_xticklabels(order)
-            ax.legend(loc="best", fontsize=8)
-            ax.set_ylabel(ylabel)
-            ax.set_xlabel("Finger condition")
-            ax.set_title(f"{ylabel} per subject and finger")
-            fig.tight_layout()
-            out = fig_root / filename
-            fig.savefig(out, dpi=fig_dpi)
-            plt.close(fig)
-            paths.append(out)
-
-    if not order_effects_binned.empty:
-        fingers = _finger_order_present(order_effects_binned["finger_condition"])
-        fig, axes = plt.subplots(len(fingers), 1, figsize=(8.5, 2.4 * len(fingers)), sharex=True, sharey=True)
-        axes = np.atleast_1d(axes)
-        for ax, finger in zip(axes, fingers):
-            color = _finger_color(finger)
-            g = order_effects_binned[order_effects_binned["finger_condition"].astype(str) == str(finger)].copy()
-            for _, sg in g.groupby("subject_id", dropna=False):
-                sg = sg.sort_values("mean_global_trial_order")
-                ax.plot(sg["mean_global_trial_order"], sg["p_comparison_greater"], color=color, alpha=0.18, linewidth=0.8, zorder=1)
-            group = (
-                g.groupby("order_bin", dropna=False)
-                .agg(
-                    mean_global_trial_order=("mean_global_trial_order", "mean"),
-                    p_comparison_greater=("p_comparison_greater", "mean"),
-                    sem=("p_comparison_greater", _sem),
-                )
-                .reset_index()
-                .sort_values("mean_global_trial_order")
-            )
-            ax.errorbar(group["mean_global_trial_order"], group["p_comparison_greater"], yerr=group["sem"], color=color, marker="o", linewidth=2, capsize=3, zorder=2)
-            ax.axhline(0.5, color="0.4", linestyle=":", linewidth=1)
-            ax.set_ylim(-0.05, 1.05)
-            ax.set_ylabel(_finger_label(finger))
-        axes[-1].set_xlabel("Global trial order")
-        fig.supylabel(PSYCHOMETRIC_GREATER_Y_LABEL)
-        fig.suptitle("Order/fatigue trend by finger (individuals faded, mean bold)")
-        fig.tight_layout()
-        out = fig_root / "order_effects.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
-
-    if not clean.empty:
-        side = clean.groupby(["subject_id", "finger_condition"]).agg(
-            p_chose_object2=("answer_chose_object_2", "mean"),
-            p_standard_on_object2=("standard_side", lambda x: float((x == "object_2").mean())),
-            n_trials=("answer_chose_object_2", "size"),
-        ).reset_index()
-        side.to_csv(output_root / "side_bias_summary.csv", index=False)
-        fig, ax = plt.subplots(figsize=(8, 4.8))
-        if sns is not None:
-            sns.barplot(data=side, x="finger_condition", y="p_chose_object2", errorbar="sd", ax=ax)
-            sns.stripplot(data=side, x="finger_condition", y="p_chose_object2", color="black", alpha=0.6, ax=ax)
-        else:
-            ax.bar(side["finger_condition"].astype(str), side["p_chose_object2"])
-        ax.axhline(0.5, color="red", linestyle="--", linewidth=1)
-        ax.set_ylim(0, 1)
-        ax.set_ylabel("P(chose object 2)")
-        ax.set_xlabel("Finger condition")
-        ax.set_title("Side bias")
-        fig.tight_layout()
-        out = fig_root / "side_bias.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
-
-    if not qc_summary.empty:
-        fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-        ax = axes[0]
-        if sns is not None:
-            sns.scatterplot(data=qc_summary, x="n_stimulus_levels", y="n_clean_trials", hue="finger_condition", hue_order=_finger_order_present(qc_summary["finger_condition"]), palette={f: _finger_color(f) for f in _finger_order_present(qc_summary["finger_condition"])}, style="qc_warnings", ax=ax)
-        else:
-            ax.scatter(qc_summary["n_stimulus_levels"], qc_summary["n_clean_trials"])
-        ax.set_title("QC: trials and levels")
-        ax.set_xlabel("Number of stimulus levels")
-        ax.set_ylabel("Clean trials")
-        ax = axes[1]
-        plot_qc = qc_summary.copy()
-        order = _finger_order_present(plot_qc["finger_condition"])
-        if sns is not None:
-            sns.barplot(data=plot_qc, x="finger_condition", y="apparent_error_rate", order=order, errorbar="sd", ax=ax, color="0.85")
-            sns.stripplot(
-                data=plot_qc,
-                x="finger_condition",
-                y="apparent_error_rate",
-                order=order,
-                hue="finger_condition",
-                hue_order=order,
-                palette={f: _finger_color(f) for f in order},
-                dodge=False,
-                jitter=0.18,
-                size=5,
-                alpha=0.85,
-                edgecolor="black",
-                linewidth=0.3,
-                ax=ax,
-            )
-            if ax.legend_:
-                ax.legend_.remove()
-        else:
-            x_map = {f: i for i, f in enumerate(order)}
-            ax.scatter(plot_qc["finger_condition"].map(x_map), plot_qc["apparent_error_rate"], c=[_finger_color(f) for f in plot_qc["finger_condition"]])
-            ax.set_xticks(range(len(order)))
-            ax.set_xticklabels(order)
-        ax.axhline(0.35, color="red", linestyle="--", linewidth=1)
-        ax.set_ylim(0, 1)
-        ax.set_title("QC: apparent error rate")
-        fig.tight_layout()
-        out = fig_root / "qc_summary_plots.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
-
-    return paths
-
-
-def save_time_fatigue_figures(
-    output_root: Path,
-    success_by_reaction_time_bin: pd.DataFrame,
-    success_by_order_bin: pd.DataFrame,
-    fatigue_first_second_summary: pd.DataFrame,
-    success_summary_by_subject: pd.DataFrame,
-    success_trend_slopes: pd.DataFrame,
-    fig_dpi: int = 160,
-) -> list[Path]:
-    """Save figures for response-duration and fatigue/order success analyses."""
-    import matplotlib.pyplot as plt
-
-    try:
-        import seaborn as sns  # type: ignore
-
-        sns.set_theme(style="whitegrid")
-    except Exception:  # pragma: no cover
-        sns = None
-
-    paths: list[Path] = []
-    fig_root = output_root / "figures" / "time_fatigue"
-    fig_root.mkdir(parents=True, exist_ok=True)
-
-    if not success_by_reaction_time_bin.empty:
-        fig, ax = plt.subplots(figsize=(8, 4.8))
-        plot_df = success_by_reaction_time_bin.copy()
-        order = _finger_order_present(plot_df["finger_condition"])
-        if sns is not None:
-            sns.lineplot(data=plot_df, x="reaction_time_bin", y="success_rate", hue="finger_condition", hue_order=order, palette={f: _finger_color(f) for f in order}, marker="o", errorbar="se", ax=ax)
-        else:
-            for finger, g in plot_df.groupby("finger_condition"):
-                ax.plot(g["reaction_time_bin"], g["success_rate"], marker="o", label=str(finger))
-            ax.legend()
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_xlabel("Reaction-time quartile within participant/finger")
-        ax.set_ylabel("Success rate")
-        ax.set_title("Effect of answer duration on success")
-        fig.tight_layout()
-        out = fig_root / "success_by_reaction_time_bin.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
-
-    if not success_by_order_bin.empty:
-        fig, ax = plt.subplots(figsize=(8, 4.8))
-        plot_df = success_by_order_bin.copy()
-        order = _finger_order_present(plot_df["finger_condition"])
-        if sns is not None:
-            sns.lineplot(data=plot_df, x="order_bin", y="success_rate", hue="finger_condition", hue_order=order, palette={f: _finger_color(f) for f in order}, marker="o", errorbar="se", ax=ax)
-        else:
-            for finger, g in plot_df.groupby("finger_condition"):
-                ax.plot(g["order_bin"], g["success_rate"], marker="o", label=str(finger))
-            ax.legend()
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_xlabel("Trial-order bin within participant/finger")
-        ax.set_ylabel("Success rate")
-        ax.set_title("Fatigue/learning proxy: success across session order")
-        fig.tight_layout()
-        out = fig_root / "success_by_trial_order_bin.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
-
-    if not fatigue_first_second_summary.empty and "success_rate_second_minus_first" in fatigue_first_second_summary:
-        fig, ax = plt.subplots(figsize=(9, 4.8))
-        plot_df = fatigue_first_second_summary.copy()
-        plot_df["subject_finger"] = plot_df["subject_id"].astype(str) + "-" + plot_df["finger_condition"].astype(str)
-        order = _finger_order_present(plot_df["finger_condition"])
-        if sns is not None:
-            sns.barplot(data=plot_df, x="subject_finger", y="success_rate_second_minus_first", hue="finger_condition", hue_order=order, palette={f: _finger_color(f) for f in order}, dodge=False, ax=ax)
-        else:
-            ax.bar(plot_df["subject_finger"], plot_df["success_rate_second_minus_first"])
-        ax.axhline(0, color="black", linewidth=1)
-        ax.set_ylabel("Second-half minus first-half success rate")
-        ax.set_xlabel("Participant-finger")
-        ax.set_title("Within-participant fatigue/learning direction")
-        ax.tick_params(axis="x", rotation=90)
-        fig.tight_layout()
-        out = fig_root / "fatigue_second_minus_first_by_subject_finger.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
-
-    if not success_summary_by_subject.empty:
-        for x_col, xlabel, filename in [
-            ("mean_reaction_time", "Mean answer duration (s)", "between_subject_success_vs_mean_reaction_time.png"),
-            ("session_duration_min", "Session elapsed duration (min)", "between_subject_success_vs_session_duration.png"),
-        ]:
-            if x_col not in success_summary_by_subject:
-                continue
-            fig, ax = plt.subplots(figsize=(6.8, 4.8))
-            plot_df = success_summary_by_subject.copy()
-            if sns is not None:
-                sns.scatterplot(data=plot_df, x=x_col, y="success_rate", hue="subject_group_label", s=80, ax=ax)
-                sns.regplot(data=plot_df, x=x_col, y="success_rate", scatter=False, color="black", ax=ax)
-            else:
-                ax.scatter(plot_df[x_col], plot_df["success_rate"])
-            for _, row in plot_df.iterrows():
-                ax.annotate(str(row["subject_id"]), (row[x_col], row["success_rate"]), fontsize=8, xytext=(4, 4), textcoords="offset points")
-            ax.set_ylim(-0.05, 1.05)
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel("Participant success rate")
-            ax.set_title(xlabel + " vs success (between participants)")
-            fig.tight_layout()
-            out = fig_root / filename
-            fig.savefig(out, dpi=fig_dpi)
-            plt.close(fig)
-            paths.append(out)
-
-    if not success_trend_slopes.empty and "success_vs_order_slope" in success_trend_slopes:
-        fig, ax = plt.subplots(figsize=(8, 4.8))
-        plot_df = success_trend_slopes.copy()
-        order = _finger_order_present(plot_df["finger_condition"])
-        if sns is not None:
-            sns.stripplot(data=plot_df, x="finger_condition", y="success_vs_order_slope", order=order, hue="finger_condition", hue_order=order, palette={f: _finger_color(f) for f in order}, dodge=False, ax=ax)
-            ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=7)
-        else:
-            ax.scatter(plot_df["finger_condition"].astype(str), plot_df["success_vs_order_slope"])
-        ax.axhline(0, color="black", linewidth=1)
-        ax.set_ylabel("Within participant success slope over session")
-        ax.set_xlabel("Finger condition")
-        ax.set_title("Success trend slopes: positive=improves, negative=fatigue")
-        fig.tight_layout()
-        out = fig_root / "success_order_slopes_by_finger.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
-
-    return paths
-
-
-def save_finger_time_appearance_figures(
-    output_root: Path,
-    finger_time_group_bins: pd.DataFrame,
-    finger_appearance_order_summary: pd.DataFrame,
-    finger_by_appearance_order: pd.DataFrame,
-    finger_time_slope_summary: pd.DataFrame,
-    fig_dpi: int = 160,
-    stiffness_time_slope_summary: Optional[pd.DataFrame] = None,
-) -> list[Path]:
-    """Save figures for finger-by-time and finger-appearance-order analyses."""
-    import matplotlib.pyplot as plt
-
-    try:
-        import seaborn as sns  # type: ignore
-
-        sns.set_theme(style="whitegrid")
-    except Exception:  # pragma: no cover
-        sns = None
-
-    paths: list[Path] = []
-    fig_root = output_root / "figures" / "finger_time_appearance"
-    fig_root.mkdir(parents=True, exist_ok=True)
-
-    if not finger_time_group_bins.empty:
-        fig, ax = plt.subplots(figsize=(8.5, 5.0))
-        plot_df = finger_time_group_bins.copy()
-        order = _finger_order_present(plot_df["finger_condition"])
-        if sns is not None:
-            sns.lineplot(data=plot_df, x="within_finger_time_bin", y="mean_success_rate", hue="finger_condition", hue_order=order, palette={f: _finger_color(f) for f in order}, marker="o", ax=ax)
-        else:
-            for finger, g in plot_df.groupby("finger_condition"):
-                ax.plot(g["within_finger_time_bin"], g["mean_success_rate"], marker="o", color=_finger_color(finger), label=str(finger))
-            ax.legend()
-        for finger, g in plot_df.groupby("finger_condition"):
-            if "sem_success_rate" in g:
-                ax.errorbar(g["within_finger_time_bin"], g["mean_success_rate"], yerr=g["sem_success_rate"], fmt="none", color=_finger_color(finger), alpha=0.35)
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_xlabel("Time bin within each 64-trial finger block")
-        ax.set_ylabel("Mean success rate across participants")
-        ax.set_title("Within-block learning/fatigue by finger")
-        fig.tight_layout()
-        out = fig_root / "success_by_finger_over_within_finger_time.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
-
-    if not finger_appearance_order_summary.empty:
-        fig, ax = plt.subplots(figsize=(7.2, 4.8))
-        plot_df = finger_appearance_order_summary.copy()
-        order = _appearance_order(plot_df["finger_appearance_order"])
-        ax.plot(plot_df["finger_appearance_order"], plot_df["mean_success_rate"], color="0.25", linewidth=1.5, alpha=0.7)
-        ax.errorbar(
-            plot_df["finger_appearance_order"],
-            plot_df["mean_success_rate"],
-            yerr=plot_df.get("sem_success_rate"),
-            fmt="none",
-            color="0.25",
-            linewidth=2,
-            capsize=4,
-        )
-        ax.scatter(
-            plot_df["finger_appearance_order"],
-            plot_df["mean_success_rate"],
-            c=plot_df["finger_appearance_order"],
-            cmap=STIFFNESS_CMAP,
-            s=70,
-            edgecolor="black",
-            linewidth=0.4,
-            zorder=3,
-        )
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_xticks(order)
-        ax.set_xticklabels(_appearance_tick_labels(order))
-        ax.set_xlabel("Finger appearance order in session")
-        ax.set_ylabel("Mean success rate")
-        ax.set_title("Success by protocol appearance position (pooled across finger identity)")
-        fig.tight_layout()
-        out = fig_root / "success_by_finger_appearance_order.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
-
-    if not finger_by_appearance_order.empty:
-        fig, ax = plt.subplots(figsize=(8.5, 5.0))
-        plot_df = finger_by_appearance_order.copy()
-        order = _finger_order_present(plot_df["finger_condition"])
-        if sns is not None:
-            sns.lineplot(data=plot_df, x="finger_appearance_order", y="mean_success_rate", hue="finger_condition", hue_order=order, palette={f: _finger_color(f) for f in order}, marker="o", ax=ax)
-        else:
-            for finger, g in plot_df.groupby("finger_condition"):
-                ax.plot(g["finger_appearance_order"], g["mean_success_rate"], marker="o", color=_finger_color(finger), label=str(finger))
-            ax.legend()
-        ax.set_ylim(-0.05, 1.05)
-        app_order = _appearance_order(plot_df["finger_appearance_order"])
-        ax.set_xticks(app_order)
-        ax.set_xticklabels(_appearance_tick_labels(app_order))
-        ax.set_xlabel("Finger appearance order in session")
-        ax.set_ylabel("Mean success rate")
-        ax.set_title("Finger identity x appearance-order success")
-        fig.tight_layout()
-        out = fig_root / "success_by_finger_identity_and_appearance_order.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
-
-    if not finger_time_slope_summary.empty:
-        n_panels = 2 if stiffness_time_slope_summary is not None and not stiffness_time_slope_summary.empty else 1
-        fig, axes = plt.subplots(1, n_panels, figsize=(7.2 * n_panels, 4.8))
-        axes = np.atleast_1d(axes)
-        ax = axes[0]
-        plot_df = finger_time_slope_summary.copy()
-        plot_df["finger_condition"] = pd.Categorical(plot_df["finger_condition"].astype(str), categories=FINGER_ORDER, ordered=True)
-        plot_df = plot_df.sort_values("finger_condition")
-        ax.bar(
-            plot_df["finger_condition"].astype(str),
-            plot_df["mean_success_slope"],
-            yerr=plot_df.get("sem_success_slope"),
-            color=[_finger_color(f) for f in plot_df["finger_condition"].astype(str)],
-            capsize=4,
-        )
-        ax.axhline(0, color="black", linewidth=1)
-        ax.set_xlabel("Finger")
-        ax.set_ylabel("Mean success slope over within-finger time")
-        ax.set_title("By finger")
-        if n_panels == 2:
-            ax2 = axes[1]
-            stiff_df = stiffness_time_slope_summary.copy()
-            values = pd.to_numeric(stiff_df["comparison_value"], errors="coerce")
-            ax2.bar(
-                stiff_df["comparison_value"].astype(str),
-                stiff_df["mean_success_slope"],
-                yerr=stiff_df.get("sem_success_slope"),
-                color=plt.get_cmap(STIFFNESS_CMAP)((values - values.min()) / max(float(values.max() - values.min()), 1e-12)),
-                capsize=4,
-            )
-            ax2.axhline(0, color="black", linewidth=1)
-            ax2.set_xlabel("Comparison stiffness")
-            ax2.set_ylabel("Mean success slope over session time")
-            ax2.set_title("By stiffness")
-            ax2.tick_params(axis="x", rotation=45)
-        fig.suptitle("Success time trend: positive=improves, negative=declines")
-        fig.tight_layout()
-        out = fig_root / "success_time_slope_by_finger.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
-
-    return paths
+# Re-export the plotting / figure-generation API that now lives in twoafc_figures so
+# that ``import twoafc_psychophysics as pf`` keeps exposing every plot function (the
+# notebook, tests, probing_analysis.py, and summary scripts call ``pf.<name>``). This
+# import sits at the very end so all core names referenced by twoafc_figures are already
+# defined; an explicit name list is used because ``import *`` skips underscore names.
+from twoafc_figures import (  # noqa: E402,F401  -- re-export plotting API
+    _appearance_order,
+    _appearance_tick_labels,
+    _append_all_figure_manifest,
+    _axis_order_and_labels,
+    _finalize_fig,
+    _finger_color,
+    _finger_label,
+    _finger_order_present,
+    _finger_sort_key,
+    _group_curve_background_fits,
+    _group_curve_summary,
+    _metric_error_bars,
+    _plot_article_style_metric_lines,
+    _plot_finger_columns_stiffness_dots,
+    _plot_side_bias_object_columns,
+    _remove_all_only_legacy_plot,
+    _render_fit_curve_job,
+    _render_fit_curve_jobs,
+    _save_all_finger_time_plot,
+    _save_all_fit_metric_by_subject_finger,
+    _save_all_subject_background_metric_plot,
+    _save_all_success_order_slopes,
+    _save_appearance_plot,
+    _save_article_metric_fallback_plot,
+    _save_group_curves_plot,
+    _save_order_effects_plot,
+    _save_subject_article_summary,
+    _save_subject_psychometric_curves,
+    _save_time_fatigue_line_plot,
+    _select_typical_subject_for_psychometric_overlay,
+    _shade_for_workspace,
+    _stiffness_colors,
+    _style_color,
+    _subject_palette,
+    _workspace_letter,
+    plot_fit_curve,
+    save_all_figures,
+    save_finger_time_appearance_figures,
+    save_success_by_stiffness_repetition_figures,
+    save_time_fatigue_figures,
+    save_xy_probing_skin_stretch_figures,
+    set_psychometric_delta_axis,
+)

@@ -7,6 +7,11 @@ The main study-level experiment groups are:
 Protocol/pilot groups (``*_P`` such as ``N_P`` and ``L_P``) are intentionally
 kept out of the main experiment-group analyses because they can use different
 stimulus values. Use the protocol-group helpers for their separate summaries.
+
+Per-participant onboarding: the first ``PILOT_ONBOARDING_TRIALS`` comparison
+trials in each participant's session are an onboarding/familiarisation phase
+where the participant learns to use the device. They are excluded from every
+downstream analysis (psychophysics, kinematics, probing, group comparisons).
 """
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+PILOT_ONBOARDING_TRIALS = 12
 EXPERIMENT_GROUP_COLUMN = "experiment_group"
 EXPERIMENT_GROUP_LABEL_COLUMN = "experiment_group_label"
 PROTOCOL_GROUP_COLUMN = "protocol_group"
