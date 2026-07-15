@@ -109,6 +109,10 @@ IGNORED_PATH_PATTERNS = (
     "not-include",
     "notinclude",
 )
+FILTER_PATH_PATTERNS = (
+    "filter",
+    "filtered",
+)
 SUBJECT_FOLDER_RE = re.compile(r"^(?P<setup>[LN])_(?P<protocol>[EP])_(?P<number>\d+)$", re.IGNORECASE)
 GROUP_SELECTIONS: dict[str, tuple[str, ...]] = {
     "L_E": ("L_E",),
@@ -121,6 +125,7 @@ GROUP_SELECTIONS: dict[str, tuple[str, ...]] = {
     "N+L_E": ("L_E", "N_E"),
     "NL_E": ("L_E", "N_E"),
 }
+FILTER_ONLY_SELECTION = "FILTER_ONLY"
 PSYCHOMETRIC_DELTA_AXIS_LABEL = "G_comparison-G_standart"
 PSYCHOMETRIC_GREATER_Y_LABEL = "P(choose comparison > standard)"
 PSYCHOMETRIC_MEAN_GREATER_Y_LABEL = "Mean P(choose comparison > standard)"
@@ -288,6 +293,23 @@ def should_ignore_analysis_path(path: Path) -> bool:
     return any(pattern.replace("_", " ").replace("-", " ") in text for pattern in IGNORED_PATH_PATTERNS)
 
 
+def should_filter_analysis_path(path: Path | str) -> bool:
+    """Return True for paths marked as manually filtered.
+
+    Filtered paths are controlled by the notebook-level cohort flag; archived
+    and unfinished paths remain handled by ``should_ignore_analysis_path``.
+    """
+    normalized_parts = [
+        str(part).lower().replace("_", " ").replace("-", " ")
+        for part in Path(path).parts
+    ]
+    text = " ".join(normalized_parts)
+    return any(
+        re.search(rf"\b{re.escape(pattern)}\b", text)
+        for pattern in FILTER_PATH_PATTERNS
+    )
+
+
 def canonical_subject_id(value: Any) -> str:
     """Return the canonical ``L_E_14``-style subject id embedded in a folder/name."""
     text = str(value).strip()
@@ -306,9 +328,60 @@ def subject_group_code(subject_id: Any) -> str | None:
     return f"{match.group('setup').upper()}_{match.group('protocol').upper()}"
 
 
-def is_valid_subject_folder(path: Path) -> bool:
+def is_valid_subject_folder(path: Path, *, exclude_filter_folders: bool = False) -> bool:
     """Return True for new-architecture subject folders that should enter analysis."""
-    return path.is_dir() and SUBJECT_FOLDER_RE.match(canonical_subject_id(path.name)) is not None and not should_ignore_analysis_path(path)
+    return (
+        path.is_dir()
+        and SUBJECT_FOLDER_RE.match(canonical_subject_id(path.name)) is not None
+        and not should_ignore_analysis_path(path)
+        and not (exclude_filter_folders and should_filter_analysis_path(Path(path.name)))
+    )
+
+
+def _normalize_filter_only_selection_text(text: str) -> str | None:
+    """Normalize DATA_SELECTION tokens that request only ``filter`` folders."""
+    t = (
+        str(text)
+        .strip()
+        .upper()
+        .replace(" ", "")
+        .replace("(FILTERED)", "_FILTERED")
+        .replace("(FILTER)", "_FILTER")
+        .replace("-", "_")
+    )
+    if t in {"FILTER", "FILTERED", "FILTER_ONLY", "ONLY_FILTER", "ONLY_FILTERED"}:
+        return FILTER_ONLY_SELECTION
+    for suffix in ("_FILTER_ONLY", "_ONLY_FILTER", "_FILTERED", "_FILTER"):
+        if t.endswith(suffix):
+            base = t[: -len(suffix)]
+            if not base:
+                return FILTER_ONLY_SELECTION
+            return f"{normalize_data_selection(base)}_{FILTER_ONLY_SELECTION}"
+    for prefix in ("FILTER_ONLY_", "ONLY_FILTER_", "FILTERED_", "FILTER_"):
+        if t.startswith(prefix):
+            base = t[len(prefix) :]
+            if not base:
+                return FILTER_ONLY_SELECTION
+            return f"{normalize_data_selection(base)}_{FILTER_ONLY_SELECTION}"
+    return None
+
+
+def _filter_only_selection_base(normalized_selection: str) -> str | None:
+    normalized = str(normalized_selection)
+    if normalized == FILTER_ONLY_SELECTION:
+        return ""
+    suffix = f"_{FILTER_ONLY_SELECTION}"
+    if normalized.endswith(suffix):
+        return normalized[: -len(suffix)]
+    return None
+
+
+def selection_requests_filter_only(selection: Any) -> bool:
+    if selection is None:
+        return False
+    if isinstance(selection, (list, tuple, set)):
+        return any(selection_requests_filter_only(item) for item in selection)
+    return _filter_only_selection_base(normalize_data_selection(selection)) is not None
 
 
 def normalize_data_selection(selection: Any) -> str:
@@ -316,11 +389,17 @@ def normalize_data_selection(selection: Any) -> str:
 
     Valid group flags are ``L_E``, ``L_P``, ``N_E``, ``N_P``, and ``L_N_E``
     (the combined L_E + N_E cohort; ``N+L_E``/``NL_E`` are accepted aliases).
-    A concrete subject id such as ``L_E_14`` is also accepted.
+    A concrete subject id such as ``L_E_14`` is also accepted. Use
+    ``FILTER_ONLY`` for only folders marked ``filter`` across all groups, or
+    ``L_E_FILTER_ONLY`` / ``N_E_FILTER_ONLY`` for only filtered folders inside
+    one group.
     """
     if isinstance(selection, (list, tuple, set)):
         return "+".join(normalize_data_selection(item) for item in selection)
     text = str(selection).strip().upper().replace(" ", "")
+    filter_only = _normalize_filter_only_selection_text(text)
+    if filter_only is not None:
+        return filter_only
     if text in {"L_N_E", "LN_E", "N_L_E", "N+L_E", "N_LE", "NL_E"}:
         return "L_N_E"
     group = subject_group_code(text)
@@ -335,15 +414,62 @@ def selection_label(selection: Any) -> str:
     return sanitize_name(normalize_data_selection(selection).replace("+", "_plus_"))
 
 
+def _selection_is_cohort_scope(selection: Any) -> bool:
+    """True for group/cohort selections, false for concrete subjects/filter-only."""
+    if selection is None:
+        return True
+    if selection_requests_filter_only(selection):
+        return False
+    if selection_is_explicit_subject_only(selection):
+        return False
+    if isinstance(selection, (list, tuple, set)):
+        return not selection_is_explicit_subject_only(selection)
+    normalized = normalize_data_selection(selection)
+    return normalized in GROUP_SELECTIONS
+
+
+def selection_output_label(
+    selection: Any, *, exclude_filter_folders: bool = False
+) -> str:
+    """Folder-safe run label that marks pre-filter cohort outputs.
+
+    When ``EXCLUDE_FILTER_FOLDERS`` is False for a group/cohort selection, the
+    run includes folders marked ``filter``. Those outputs are labelled
+    ``<selection>_before_filter`` so they cannot be confused with the clean
+    post-filter cohort. Explicit single subjects and ``FILTER_ONLY`` selections
+    keep their direct labels.
+    """
+    base = selection_label(selection) if selection is not None else "all_subjects"
+    if not exclude_filter_folders and _selection_is_cohort_scope(selection):
+        return f"{base}_before_filter"
+    return base
+
+
 def subject_matches_selection(subject_id: Any, selection: Any) -> bool:
     if isinstance(selection, (list, tuple, set)):
         return any(subject_matches_selection(subject_id, item) for item in selection)
     normalized = normalize_data_selection(selection)
+    filter_only_base = _filter_only_selection_base(normalized)
+    if filter_only_base is not None:
+        if not should_filter_analysis_path(subject_id):
+            return False
+        return True if not filter_only_base else subject_matches_selection(subject_id, filter_only_base)
     subject = canonical_subject_id(subject_id)
     group = subject_group_code(subject)
     if normalized in GROUP_SELECTIONS:
         return group in GROUP_SELECTIONS[normalized]
     return subject == canonical_subject_id(normalized)
+
+
+def selection_is_explicit_subject_only(selection: Any) -> bool:
+    """True when the user explicitly requested concrete subject id(s)."""
+    if selection is None:
+        return False
+    if isinstance(selection, (list, tuple, set)):
+        return bool(selection) and all(
+            selection_is_explicit_subject_only(item) for item in selection
+        )
+    return SUBJECT_FOLDER_RE.match(normalize_data_selection(selection)) is not None
 
 
 def is_single_subject_selection(selection: Any, subject_ids: list[str] | None = None) -> bool:
@@ -711,11 +837,28 @@ def score_answer_csv(path: Path) -> int:
     return score
 
 
-def discover_answer_files(data_root: Path, output_root: Path, selection: Any | None = None) -> pd.DataFrame:
+def discover_answer_files(
+    data_root: Path,
+    output_root: Path,
+    selection: Any | None = None,
+    *,
+    exclude_filter_folders: bool = False,
+) -> pd.DataFrame:
     validate_paths(data_root, output_root)
     rows = []
+    skip_filter_folders = (
+        exclude_filter_folders
+        and not selection_is_explicit_subject_only(selection)
+        and not selection_requests_filter_only(selection)
+    )
     subject_dirs = sorted(
-        [p for p in data_root.rglob("*") if is_valid_subject_folder(p)],
+        [
+            p
+            for p in data_root.rglob("*")
+            if is_valid_subject_folder(
+                p, exclude_filter_folders=skip_filter_folders
+            )
+        ],
         key=lambda p: (_subject_sort_key(canonical_subject_id(p.name)), str(p).lower()),
     )
     if selection is not None:
@@ -726,7 +869,15 @@ def discover_answer_files(data_root: Path, output_root: Path, selection: Any | N
     for subject_dir in subject_dirs:
         subject_id = canonical_subject_id(subject_dir.name)
         all_csvs = sorted(
-            [p for p in subject_dir.rglob("*.csv") if not should_ignore_analysis_path(p)],
+            [
+                p
+                for p in subject_dir.rglob("*.csv")
+                if not should_ignore_analysis_path(p)
+                and not (
+                    skip_filter_folders
+                    and should_filter_analysis_path(p.relative_to(subject_dir))
+                )
+            ],
             key=lambda p: str(p).lower(),
         )
         csvs = [p for p in all_csvs if is_answer_csv_candidate(p)]
@@ -2661,8 +2812,8 @@ OBJECT2_COLOR = "#1f77b4"  # blue    -> second object (right column)
 FINGER_STYLE = {
     "I": {"label": "Index", "color": "#1f77b4", "marker": "o"},   # blue
     "M": {"label": "Middle", "color": "#ff7f0e", "marker": "s"},  # orange
-    "R": {"label": "Ring", "color": "#d62728", "marker": "D"},    # red
-    "P": {"label": "Pinky", "color": "#2ca02c", "marker": "^"},   # green
+    "R": {"label": "Ring", "color": "#2ca02c", "marker": "D"},    # green
+    "P": {"label": "Pinky", "color": "#d62728", "marker": "^"},   # red
 }
 
 
@@ -2860,6 +3011,14 @@ def save_article_style_psychophysics_figures(
     fits = add_fit_delta_columns(pse_jnd_by_subject_finger)
     if write_csv_outputs and not fits.empty:
         save_csv(fits, output_root, "pse_jnd_by_subject_finger_with_deltas.csv")
+    style_fig, _style_csv = save_thesis_plot_style_code(
+        output_root,
+        _collect_subject_ids(clean, psychometric_input_by_subject_finger, pse_jnd_by_subject_finger, finger_time_subject_summary),
+        fig_dpi=fig_dpi,
+        write_csv=write_csv_outputs,
+    )
+    if style_fig:
+        paths.append(style_fig)
 
     selected_subject = _select_typical_subject_for_psychometric_overlay(fits, preferred_subject) if preferred_subject else None
     if selected_subject and not psychometric_input_by_subject_finger.empty:
@@ -3032,6 +3191,8 @@ def save_article_style_psychophysics_figures(
         ("jnd", "JND", "JND by finger", "jnd_article_style_by_finger.png"),
     ]
     for metric, ylabel, title, filename in metric_specs:
+        is_pse_article = filename == "pse_article_style_by_finger.png"
+        is_jnd_article = filename == "jnd_article_style_by_finger.png"
         path = _plot_article_style_metric_lines(
             fits,
             "finger_condition",
@@ -3041,8 +3202,12 @@ def save_article_style_psychophysics_figures(
             "Finger",
             article_path(filename),
             x_order=_finger_order_present(fits["finger_condition"]) if not fits.empty and "finger_condition" in fits else None,
-            style_col="finger_condition",
+            style_col="subject_id",
             fig_dpi=fig_dpi,
+            abs_value_filter=250.0 if (is_pse_article or is_jnd_article) else None,
+            filter_metric_label=("PSE shift" if is_pse_article else "JND" if is_jnd_article else None),
+            focus_ylim=is_pse_article or is_jnd_article,
+            finger_fill_subject_edge=True,
         )
         if path:
             paths.append(path)
@@ -3068,6 +3233,7 @@ def save_article_style_psychophysics_figures(
                 x_order=_finger_order_present(finger_time_subject_summary["finger_condition"]),
                 style_col="subject_id",
                 fig_dpi=fig_dpi,
+                finger_fill_subject_edge=True,
             )
             if path:
                 paths.append(path)
@@ -3096,6 +3262,7 @@ def save_article_style_psychophysics_figures(
                     x_order=_appearance_order(appearance_df["finger_appearance_order"]),
                     style_col="subject_id",
                     fig_dpi=fig_dpi,
+                    finger_fill_subject_edge=True,
                 )
                 if path:
                     paths.append(path)
@@ -3535,8 +3702,6 @@ def save_selected_analysis_tree(
             "pse_jnd_group_by_finger.csv": pse_jnd_group_by_finger,
             "psychometric_input_group_all_pooled.csv": psychometric_input_group_all_pooled,
             "pse_jnd_group_all_pooled.csv": pse_jnd_group_all_pooled,
-            "order_effects_summary.csv": order_effects_summary,
-            "order_effects_binned.csv": order_effects_binned,
         }
         for name, table in shared_tables.items():
             path = _save_table_if_not_empty(table, shared_all_csv, name)
@@ -3556,8 +3721,6 @@ def save_selected_analysis_tree(
         s_qc = _filter_subject(qc_summary, subject)
         s_psy = _filter_subject(psychometric_input_by_subject_finger, subject)
         s_fits = _filter_subject(pse_jnd_by_subject_finger, subject)
-        s_order_summary = _filter_subject(order_effects_summary, subject)
-        s_order_binned = _filter_subject(order_effects_binned, subject)
         s_tf = {k: _filter_subject(v, subject) for k, v in success_time_fatigue.items()}
         s_fa = {k: _filter_subject(v, subject) for k, v in finger_time_appearance.items()}
 
@@ -3568,8 +3731,6 @@ def save_selected_analysis_tree(
             "qc_summary.csv": s_qc,
             "psychometric_input_by_subject_finger.csv": s_psy,
             "pse_jnd_by_subject_finger.csv": s_fits,
-            "order_effects_summary.csv": s_order_summary,
-            "order_effects_binned.csv": s_order_binned,
         }.items():
             path = _save_table_if_not_empty(table, scsv, name)
             record(subject, "subject", "csv", path)
@@ -3592,12 +3753,6 @@ def save_selected_analysis_tree(
         record(subject, "subject", "figure", subject_curve_path)
         for path in [
             _save_subject_article_summary(sfig, s_psy, s_fits, subject=subject, fig_dpi=fig_dpi),
-            _save_appearance_plot(
-                s_fa.get("subject_finger_summary", pd.DataFrame()),
-                out_path=sfig / "success_by_finger_appearance_order.png",
-                title=f"Success by finger appearance order: {subject}",
-                fig_dpi=fig_dpi,
-            ),
             _save_time_fatigue_line_plot(
                 s_tf.get("order_bins", pd.DataFrame()),
                 x_col="order_bin",
@@ -3612,12 +3767,6 @@ def save_selected_analysis_tree(
                 y_col="success_rate",
                 out_path=sfig / "time_fatigue" / "success_by_reaction_time_bin.png",
                 title=f"Answer duration vs success ({subject})",
-                fig_dpi=fig_dpi,
-            ),
-            _save_order_effects_plot(
-                s_order_binned,
-                out_path=sfig / "order_effects.png",
-                title=f"Order effects: {subject}",
                 fig_dpi=fig_dpi,
             ),
         ]:
@@ -3690,7 +3839,7 @@ def save_selected_analysis_tree(
             pse_jnd_group_by_finger if pse_jnd_group_by_finger is not None else pd.DataFrame(),
             psychometric_input_group_all_pooled if psychometric_input_group_all_pooled is not None else pd.DataFrame(),
             pse_jnd_group_all_pooled if pse_jnd_group_all_pooled is not None else pd.DataFrame(),
-            order_effects_binned if order_effects_binned is not None else pd.DataFrame(),
+            pd.DataFrame(),
             fig_dpi,
         )
     )
@@ -3703,6 +3852,7 @@ def save_selected_analysis_tree(
             success_time_fatigue.get("subject_summary", pd.DataFrame()),
             success_time_fatigue.get("slopes", pd.DataFrame()),
             fig_dpi,
+            subject_finger_success_summary=finger_time_appearance.get("subject_finger_summary", pd.DataFrame()),
         )
     )
     legacy_paths.extend(
@@ -3865,6 +4015,9 @@ def save_selected_analysis_tree(
             title="JND per participant and finger",
             ylabel="JND",
             fig_dpi=fig_dpi,
+            abs_value_filter=250.0,
+            filter_metric_label="JND",
+            focus_ylim=True,
         ),
     )
     _append_all_figure_manifest(
@@ -3876,6 +4029,9 @@ def save_selected_analysis_tree(
             title="PSE per participant and finger",
             ylabel="PSE shift (comparison - standard)" if pse_metric != "pse" else "PSE",
             fig_dpi=fig_dpi,
+            abs_value_filter=250.0,
+            filter_metric_label="PSE shift" if pse_metric != "pse" else "PSE",
+            focus_ylim=True,
         ),
     )
     _append_all_figure_manifest(
@@ -3889,8 +4045,11 @@ def save_selected_analysis_tree(
             xlabel="Finger",
             ylabel="JND",
             line_color="subject",
-            dot_color="subject",
+            dot_color="finger_fill_subject_edge",
             fig_dpi=fig_dpi,
+            abs_value_filter=250.0,
+            filter_metric_label="JND",
+            focus_ylim=True,
         ),
     )
     _append_all_figure_manifest(
@@ -3904,7 +4063,7 @@ def save_selected_analysis_tree(
             xlabel="Finger",
             ylabel="Success rate",
             line_color="subject",
-            dot_color="subject",
+            dot_color="finger_fill_subject_edge",
             fig_dpi=fig_dpi,
         ),
     )
@@ -3919,37 +4078,7 @@ def save_selected_analysis_tree(
             xlabel="Finger appearance order",
             ylabel="Success rate",
             line_color="subject",
-            dot_color="finger",
-            fig_dpi=fig_dpi,
-        ),
-    )
-    _append_all_figure_manifest(
-        manifest_rows,
-        _save_all_subject_background_metric_plot(
-            finger_subject_summary,
-            x_col="finger_appearance_order",
-            y_col="success_rate",
-            out_path=froot / "finger_time_appearance" / "success_by_finger_appearance_order.png",
-            title="Success by finger appearance order",
-            xlabel="Finger appearance order",
-            ylabel="Success rate",
-            line_color="subject",
-            dot_color="finger",
-            fig_dpi=fig_dpi,
-        ),
-    )
-    _append_all_figure_manifest(
-        manifest_rows,
-        _save_all_subject_background_metric_plot(
-            finger_subject_summary,
-            x_col="finger_appearance_order",
-            y_col="success_rate",
-            out_path=froot / "finger_time_appearance" / "success_by_finger_identity_and_appearance_order.png",
-            title="Finger identity x appearance-order success",
-            xlabel="Finger appearance order",
-            ylabel="Success rate",
-            line_color="subject",
-            dot_color="finger",
+            dot_color="finger_fill_subject_edge",
             fig_dpi=fig_dpi,
         ),
     )
@@ -4545,7 +4674,6 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
         "pse_bias_subject_pooled.csv",
         "pse_bias_group_by_finger.csv",
         "pse_bias_group_all_pooled.csv",
-        "order_effects_summary.csv",
         "success_summary_by_subject.csv",
         "success_summary_by_subject_finger.csv",
         "success_trend_slopes_by_subject_finger.csv",
@@ -4564,6 +4692,7 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
         "finger_time_slope_contrasts.csv",
         "finger_appearance_order_contrasts.csv",
         "pse_jnd_by_subject_finger_with_deltas.csv",
+        "thesis_plot_style_code.csv",
         "article_style_figure_manifest.csv",
         "psychophysics_trial_group_metric_summary.csv",
         "psychophysics_trial_group_condition_metric_summary.csv",
@@ -4614,11 +4743,31 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
 # notebook, tests, probing_analysis.py, and summary scripts call ``pf.<name>``). This
 # import sits at the very end so all core names referenced by twoafc_figures are already
 # defined; an explicit name list is used because ``import *`` skips underscore names.
+#
+# Jupyter note: notebook users commonly reload only this module (``pf``) after edits.
+# Without refreshing the sibling plotting module, ``pf`` can re-export an old in-memory
+# helper signature and then fail on newly added keyword arguments. Reload it here so a
+# reload of ``pf`` also refreshes the plotting surface from disk.
+import importlib as _importlib  # noqa: E402
+import sys as _sys  # noqa: E402
+
+# Let the sibling plotting module's historical absolute import work when this
+# file is imported as a package module (analysis.psychophysics.twoafc_psychophysics).
+_sys.modules.setdefault("twoafc_psychophysics", _sys.modules[__name__])
+
+try:  # keep both notebook top-level and package imports working.
+    import twoafc_figures as _twoafc_figures  # type: ignore[no-redef]  # noqa: E402
+except ModuleNotFoundError:  # package import: analysis.psychophysics.twoafc_psychophysics
+    from . import twoafc_figures as _twoafc_figures  # type: ignore[no-redef]  # noqa: E402
+    _sys.modules.setdefault("twoafc_figures", _twoafc_figures)
+
+_importlib.reload(_twoafc_figures)
 from twoafc_figures import (  # noqa: E402,F401  -- re-export plotting API
     _appearance_order,
     _appearance_tick_labels,
     _append_all_figure_manifest,
     _axis_order_and_labels,
+    _collect_subject_ids,
     _finalize_fig,
     _finger_color,
     _finger_label,
@@ -4654,7 +4803,9 @@ from twoafc_figures import (  # noqa: E402,F401  -- re-export plotting API
     save_all_figures,
     save_finger_time_appearance_figures,
     save_success_by_stiffness_repetition_figures,
+    save_thesis_plot_style_code,
     save_time_fatigue_figures,
     save_xy_probing_skin_stretch_figures,
     set_psychometric_delta_axis,
+    thesis_plot_style_code_table,
 )

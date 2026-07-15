@@ -11,7 +11,7 @@ matplotlib.use("Agg")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "analysis" / "psychophysics_analysis"))
+sys.path.insert(0, str(ROOT / "analysis" / "psychophysics"))
 
 import twoafc_psychophysics as psych  # noqa: E402
 

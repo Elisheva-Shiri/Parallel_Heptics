@@ -149,10 +149,226 @@ def _subject_palette(subjects: Any) -> dict[str, Any]:
     cmap = plt.get_cmap("tab20", max(1, len(ordered)))
     return {subject: cmap(i % cmap.N) for i, subject in enumerate(ordered)}
 
+def _collect_subject_ids(*frames: pd.DataFrame | None) -> list[str]:
+    """Collect sorted subject ids from any data frames that include subject_id."""
+    subjects: set[str] = set()
+    for frame in frames:
+        if frame is None or frame.empty or "subject_id" not in frame:
+            continue
+        subjects.update(frame["subject_id"].dropna().astype(str).unique())
+    return sorted(subjects, key=_subject_sort_key)
+
+def thesis_plot_style_code_table(subject_ids: Any = None) -> pd.DataFrame:
+    """Return the fixed thesis visual-code table for psychophysics figures."""
+    rows: list[dict[str, Any]] = []
+    marker_names = {"o": "circle", "s": "square", "D": "diamond", "^": "triangle"}
+    for finger in FINGER_ORDER:
+        style = FINGER_STYLE.get(str(finger), {})
+        rows.append(
+            {
+                "encoding": "finger_condition",
+                "code": finger,
+                "meaning": style.get("label", finger),
+                "marker_shape": marker_names.get(style.get("marker", ""), style.get("marker", "")),
+                "marker_symbol": style.get("marker", ""),
+                "outline_color": "subject_id color",
+                "inner_fill_color": style.get("color", ""),
+                "use_in_thesis": "Finger is encoded by inner fill color and marker shape; outline is reserved for subject identity.",
+            }
+        )
+    if subject_ids is not None:
+        subject_series = pd.Series(subject_ids).dropna().astype(str)
+        palette = _subject_palette(subject_series)
+        for subject in sorted(subject_series.unique(), key=_subject_sort_key):
+            rgba = palette.get(subject, "0.35")
+            try:
+                import matplotlib.colors as mcolors
+
+                fill = mcolors.to_hex(rgba)
+            except Exception:  # pragma: no cover - cosmetic fallback only
+                fill = str(rgba)
+            rows.append(
+                {
+                    "encoding": "subject_id",
+                    "code": subject,
+                    "meaning": f"Participant {subject}",
+                    "marker_shape": "varies by finger",
+                    "marker_symbol": "finger marker",
+                    "outline_color": fill,
+                    "inner_fill_color": "finger_condition color",
+                    "use_in_thesis": "Subject is encoded by marker outline colour.",
+                }
+            )
+    return pd.DataFrame(rows)
+
+def save_thesis_plot_style_code(
+    output_root: Path,
+    subject_ids: Any = None,
+    *,
+    fig_dpi: int = 160,
+    write_csv: bool = True,
+) -> tuple[Path | None, Path | None]:
+    """Save a standalone thesis legend for the shared subject/finger code."""
+    import matplotlib.pyplot as plt
+
+    subjects = sorted(pd.Series(subject_ids if subject_ids is not None else []).dropna().astype(str).unique(), key=_subject_sort_key)
+    style_table = thesis_plot_style_code_table(subjects)
+    csv_path: Path | None = None
+    if write_csv:
+        csv_path = save_csv(style_table, output_root, "thesis_plot_style_code.csv")
+
+    fig_path = output_root / "figures" / "thesis_plot_style_code.png"
+    fig_path.parent.mkdir(parents=True, exist_ok=True)
+    n_subject_rows = max(1, int(math.ceil(len(subjects) / 4))) if subjects else 1
+    fig_height = max(3.8, 2.5 + 0.34 * n_subject_rows)
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, fig_height), gridspec_kw={"width_ratios": [1.0, 1.4]})
+    ax_finger, ax_subject = axes
+    ax_finger.axis("off")
+    ax_subject.axis("off")
+
+    ax_finger.set_title("Finger code: fill + shape", loc="left", fontsize=11, fontweight="bold")
+    for i, finger in enumerate(FINGER_ORDER):
+        style = FINGER_STYLE.get(str(finger), {})
+        y = 0.86 - i * 0.18
+        ax_finger.scatter(
+            0.10,
+            y,
+            s=115,
+            marker=style.get("marker", "o"),
+            facecolor=style.get("color", "white"),
+            edgecolor="0.25",
+            linewidth=2.0,
+            transform=ax_finger.transAxes,
+            clip_on=False,
+        )
+        ax_finger.text(
+            0.20,
+            y,
+            f"{style.get('label', finger)} ({finger}) - {style.get('color', '')}",
+            transform=ax_finger.transAxes,
+            va="center",
+            fontsize=9,
+        )
+
+    ax_subject.set_title("Subject code: outline colour", loc="left", fontsize=11, fontweight="bold")
+    if subjects:
+        palette = _subject_palette(subjects)
+        ncols = 4
+        max_display = ncols * 7
+        for i, subject in enumerate(subjects[:max_display]):
+            col = i % ncols
+            row = i // ncols
+            x = 0.05 + col * 0.24
+            y = 0.86 - row * 0.12
+            ax_subject.scatter(
+                x,
+                y,
+                s=75,
+                marker="o",
+                facecolor="white",
+                edgecolor=palette.get(subject, "0.35"),
+                linewidth=0.6,
+                transform=ax_subject.transAxes,
+                clip_on=False,
+            )
+            ax_subject.text(x + 0.035, y, subject, transform=ax_subject.transAxes, va="center", fontsize=8)
+        if len(subjects) > max_display:
+            ax_subject.text(
+                0.05,
+                0.04,
+                "Complete subject colour list is saved in thesis_plot_style_code.csv",
+                transform=ax_subject.transAxes,
+                fontsize=8,
+                color="0.35",
+            )
+    else:
+        ax_subject.text(0.05, 0.70, "No subject ids supplied.", transform=ax_subject.transAxes, fontsize=9)
+
+    fig.suptitle(
+        "Psychophysics thesis figure code: inner fill = finger; outline colour = participant; marker shape = finger",
+        fontsize=12,
+        fontweight="bold",
+    )
+    fig.text(
+        0.02,
+        0.02,
+        "Use this legend in thesis captions for all subject/finger psychophysics plots.",
+        fontsize=8,
+        color="0.35",
+    )
+    fig.tight_layout(rect=(0, 0.04, 1, 0.93))
+    _finalize_fig(fig, fig_path, fig_dpi)
+    return fig_path, csv_path
+
+def _format_display_filter_note(
+    removed: pd.DataFrame,
+    *,
+    metric_col: str,
+    metric_label: str,
+    threshold: float,
+    max_items: int = 4,
+) -> str:
+    """Compact figure footnote describing rows removed by a display-only filter."""
+    if removed is None or removed.empty:
+        return f"Display filter: |{metric_label}| <= {threshold:g}; removed 0 fits."
+    items: list[str] = []
+    for _, row in removed.head(max_items).iterrows():
+        subject = str(row.get("subject_id", "?"))
+        finger = str(row.get("finger_condition", "?"))
+        value = pd.to_numeric(pd.Series([row.get(metric_col)]), errors="coerce").iloc[0]
+        value_text = f"{float(value):.1f}" if np.isfinite(value) else "nan"
+        items.append(f"{subject}/{_finger_label(finger)} ({value_text})")
+    suffix = "" if len(removed) <= max_items else f", +{len(removed) - max_items} more"
+    return f"Display filter: |{metric_label}| <= {threshold:g}; removed {len(removed)} fit(s): {', '.join(items)}{suffix}."
+
+def _apply_focus_ylim(
+    ax: Any,
+    values: Any,
+    *,
+    symmetric: bool = False,
+    lower_bound: float | None = None,
+    minimum_half_range: float = 1.0,
+    maximum_half_range: float | None = None,
+) -> None:
+    """Set readable y-limits from displayed values, ignoring huge hidden/errorbar tails."""
+    numeric = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
+    if numeric.empty:
+        return
+    if symmetric:
+        half = max(float(numeric.abs().max()) * 1.15, minimum_half_range)
+        if maximum_half_range is not None:
+            half = min(half, maximum_half_range)
+        ax.set_ylim(-half, half)
+        return
+    lo, hi = float(numeric.min()), float(numeric.max())
+    span = max(hi - lo, minimum_half_range)
+    pad = span * 0.15
+    bottom = lo - pad
+    top = hi + pad
+    if lower_bound is not None:
+        bottom = min(lower_bound, bottom) if lo < lower_bound else lower_bound
+    ax.set_ylim(bottom, top)
+
 def _style_color(value: Any, style_col: Optional[str], palette: Optional[dict[str, Any]] = None) -> Any:
     if style_col == "subject_id" and palette is not None:
         return palette.get(str(value), "0.35")
     return _finger_color(value)
+
+def _finger_fill_subject_edge_style(
+    subject: Any,
+    finger: Any,
+    subject_palette: Optional[dict[str, Any]] = None,
+    *,
+    default_subject_edge: str = "0.35",
+) -> dict[str, Any]:
+    """Shared thesis marker code: fill=finger, outline=subject, shape=finger."""
+    finger_key = str(finger)
+    return {
+        "facecolor": _finger_color(finger_key, "0.75"),
+        "edgecolor": (subject_palette or {}).get(str(subject), default_subject_edge),
+        "marker": FINGER_STYLE.get(finger_key, {}).get("marker", "o"),
+        "linewidth": 1.1,
+    }
 
 def _select_typical_subject_for_psychometric_overlay(
     pse_jnd_by_subject_finger: pd.DataFrame,
@@ -205,6 +421,10 @@ def _plot_article_style_metric_lines(
     x_order: Optional[list[Any]] = None,
     style_col: Optional[str] = "finger_condition",
     fig_dpi: int = 160,
+    finger_fill_subject_edge: bool = False,
+    abs_value_filter: Optional[float] = None,
+    filter_metric_label: Optional[str] = None,
+    focus_ylim: bool = False,
 ) -> Optional[Path]:
     import matplotlib.pyplot as plt
 
@@ -215,6 +435,20 @@ def _plot_article_style_metric_lines(
     plot_df = plot_df.dropna(subset=[metric_col, x_col])
     if plot_df.empty:
         return None
+    filter_note = ""
+    if abs_value_filter is not None:
+        threshold = float(abs_value_filter)
+        keep_mask = plot_df[metric_col].abs() <= threshold
+        removed = plot_df.loc[~keep_mask].copy()
+        plot_df = plot_df.loc[keep_mask].copy()
+        filter_note = _format_display_filter_note(
+            removed,
+            metric_col=metric_col,
+            metric_label=filter_metric_label or metric_col,
+            threshold=threshold,
+        )
+        if plot_df.empty:
+            return None
     if x_order is None:
         if x_col == "finger_condition":
             x_order = _finger_order_present(plot_df[x_col])
@@ -255,14 +489,24 @@ def _plot_article_style_metric_lines(
         if style_col and style_col in g:
             for _, row in g.iterrows():
                 style = FINGER_STYLE.get(str(row.get(style_col)), {})
-                color = _style_color(row.get(style_col), style_col, style_palette)
+                if finger_fill_subject_edge and style_palette is not None and "finger_condition" in row:
+                    marker_style = _finger_fill_subject_edge_style(subject, row.get("finger_condition"), style_palette)
+                    face_color = marker_style["facecolor"]
+                    edge_color = marker_style["edgecolor"]
+                    line_width = marker_style["linewidth"]
+                    marker = marker_style["marker"]
+                else:
+                    face_color = _style_color(row.get(style_col), style_col, style_palette)
+                    edge_color = "black"
+                    line_width = 0.3
+                    marker = style.get("marker", "o") if style_col != "subject_id" else "o"
                 ax.scatter(
                     row["_x_num"],
                     row[metric_col],
-                    color=color,
-                    marker=style.get("marker", "o") if style_col != "subject_id" else "o",
-                    edgecolor="black",
-                    linewidth=0.3,
+                    facecolor=face_color,
+                    edgecolor=edge_color,
+                    marker=marker,
+                    linewidth=line_width,
                     s=45,
                     alpha=0.9,
                     zorder=2,
@@ -289,16 +533,30 @@ def _plot_article_style_metric_lines(
         zorder=3,
     )
     ax.axhline(0, color="0.35", linestyle="--", linewidth=1) if "PSE" in ylabel or "slope" in ylabel.lower() else None
+    if focus_ylim:
+        _apply_focus_ylim(
+            ax,
+            plot_df[metric_col],
+            symmetric=("PSE" in ylabel or "shift" in ylabel.lower() or "slope" in ylabel.lower()),
+            lower_bound=0.0 if "JND" in ylabel else None,
+            minimum_half_range=60.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else 25.0,
+            maximum_half_range=250.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else None,
+        )
     ax.set_xticks(range(len(x_order)))
     ax.set_xticklabels(_appearance_tick_labels(x_order) if x_col == "finger_appearance_order" else [str(x) for x in x_order])
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
+    footnotes: list[str] = []
     if error_bars is not None and ("PSE" in ylabel or "JND" in ylabel):
+        footnotes.append("Subject error bars: per-fit 95% CI (parametric bootstrap)")
+    if filter_note:
+        footnotes.append(filter_note)
+    if footnotes:
         ax.text(
             0.02,
             0.02,
-            "Subject error bars: per-fit 95% CI (parametric bootstrap)",
+            "\n".join(footnotes),
             transform=ax.transAxes,
             ha="left",
             va="bottom",
@@ -831,7 +1089,7 @@ def _save_time_fatigue_line_plot(
     fig, ax = plt.subplots(figsize=(8.2, 4.8))
     for finger, g in plot_df.groupby("finger_condition", dropna=False):
         g = g.sort_values(x_col)
-        ax.plot(g[x_col], g[y_col], marker="o", linewidth=2.2, color=_finger_color(finger), label=_finger_label(finger))
+        ax.plot(g[x_col], g[y_col], marker=FINGER_STYLE.get(str(finger), {}).get("marker", "o"), linewidth=2.2, color=_finger_color(finger), label=_finger_label(finger))
     ax.set_ylim(-0.05, 1.05)
     ax.set_xlabel(x_col.replace("_", " "))
     ax.set_ylabel("Success rate")
@@ -1023,6 +1281,9 @@ def _save_all_subject_background_metric_plot(
     dot_color: str = "subject",
     group_y_col: str | None = None,
     fig_dpi: int,
+    abs_value_filter: float | None = None,
+    filter_metric_label: str | None = None,
+    focus_ylim: bool = False,
 ) -> Path | None:
     """All-scope metric plot with subject background and explicit color ownership."""
     if df is None or df.empty or x_col not in df or y_col not in df:
@@ -1034,6 +1295,19 @@ def _save_all_subject_background_metric_plot(
     plot_df = plot_df.dropna(subset=[x_col, y_col])
     if plot_df.empty:
         return None
+    filter_note = ""
+    if abs_value_filter is not None:
+        keep_mask = plot_df[y_col].abs() <= float(abs_value_filter)
+        removed = plot_df.loc[~keep_mask].copy()
+        plot_df = plot_df.loc[keep_mask].copy()
+        filter_note = _format_display_filter_note(
+            removed,
+            metric_col=y_col,
+            metric_label=filter_metric_label or y_col,
+            threshold=float(abs_value_filter),
+        )
+        if plot_df.empty:
+            return None
     order, labels = _axis_order_and_labels(plot_df, x_col)
     x_map = {value: i for i, value in enumerate(order)}
     plot_df["_x_num"] = plot_df[x_col].map(x_map)
@@ -1050,13 +1324,34 @@ def _save_all_subject_background_metric_plot(
             lc = subject_colors.get(subject, "0.55") if line_color == "subject" else "0.65"
             ax.plot(g["_x_num"], g[y_col], color=lc, linewidth=1.0, alpha=0.45, zorder=1)
             for _, row in g.iterrows():
-                if dot_color == "finger":
+                if dot_color == "finger_fill_subject_edge":
+                    marker_style = _finger_fill_subject_edge_style(subject, row.get("finger_condition"), subject_colors)
+                    fc = marker_style["facecolor"]
+                    ec = marker_style["edgecolor"]
+                    lw = marker_style["linewidth"]
+                elif dot_color == "finger":
                     fc = _finger_color(row.get("finger_condition"), "0.35")
+                    ec = "black"
+                    lw = 0.35
                 elif dot_color == "subject":
                     fc = subject_colors.get(subject, "0.35")
+                    ec = "black"
+                    lw = 0.35
                 else:
                     fc = "0.35"
-                ax.scatter(row["_x_num"], row[y_col], s=38, facecolor=fc, edgecolor="black", linewidth=0.35, alpha=0.82, zorder=2)
+                    ec = "black"
+                    lw = 0.35
+                ax.scatter(
+                    row["_x_num"],
+                    row[y_col],
+                    s=38,
+                    facecolor=fc,
+                    edgecolor=ec,
+                    marker=FINGER_STYLE.get(str(row.get("finger_condition")), {}).get("marker", "o"),
+                    linewidth=lw,
+                    alpha=0.82,
+                    zorder=2,
+                )
 
     summary_col = group_y_col if group_y_col and group_y_col in plot_df else y_col
     group = plot_df.groupby("_x_num", dropna=False)[summary_col].mean().reset_index()
@@ -1065,11 +1360,22 @@ def _save_all_subject_background_metric_plot(
         ax.set_ylim(-0.05, 1.05)
     if y_col.endswith("_slope"):
         ax.axhline(0, color="0.35", linestyle="--", linewidth=1)
+    if focus_ylim:
+        _apply_focus_ylim(
+            ax,
+            plot_df[y_col],
+            symmetric=("PSE" in ylabel or "shift" in ylabel.lower() or y_col.endswith("_slope")),
+            lower_bound=0.0 if "JND" in ylabel else None,
+            minimum_half_range=60.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else 25.0,
+            maximum_half_range=250.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else None,
+        )
     ax.set_xticks(range(len(order)))
     ax.set_xticklabels(labels)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
+    if filter_note:
+        ax.text(0.02, 0.02, filter_note, transform=ax.transAxes, ha="left", va="bottom", fontsize=7, color="0.35")
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     _finalize_fig(fig, out_path, fig_dpi)
@@ -1083,8 +1389,11 @@ def _save_all_fit_metric_by_subject_finger(
     title: str,
     ylabel: str,
     fig_dpi: int,
+    abs_value_filter: float | None = None,
+    filter_metric_label: str | None = None,
+    focus_ylim: bool = False,
 ) -> Path | None:
-    """All-scope PSE/JND plot: finger-coloured columns, participant-coloured dots."""
+    """All-scope PSE/JND plot: finger columns and finger-filled, participant-outlined dots."""
     if fits is None or fits.empty or "finger_condition" not in fits or metric_col not in fits:
         return None
     import matplotlib.pyplot as plt
@@ -1094,6 +1403,19 @@ def _save_all_fit_metric_by_subject_finger(
     plot_df = plot_df.dropna(subset=["finger_condition", metric_col])
     if plot_df.empty:
         return None
+    filter_note = ""
+    if abs_value_filter is not None:
+        keep_mask = plot_df[metric_col].abs() <= float(abs_value_filter)
+        removed = plot_df.loc[~keep_mask].copy()
+        plot_df = plot_df.loc[keep_mask].copy()
+        filter_note = _format_display_filter_note(
+            removed,
+            metric_col=metric_col,
+            metric_label=filter_metric_label or metric_col,
+            threshold=float(abs_value_filter),
+        )
+        if plot_df.empty:
+            return None
     order = _finger_order_present(plot_df["finger_condition"])
     x_map = {finger: i for i, finger in enumerate(order)}
     subjects = sorted(plot_df["subject_id"].dropna().astype(str).unique(), key=_subject_sort_key) if "subject_id" in plot_df else []
@@ -1101,8 +1423,18 @@ def _save_all_fit_metric_by_subject_finger(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8.0, 4.9))
-    for idx, finger in enumerate(order):
-        ax.axvspan(idx - 0.45, idx + 0.45, color=_finger_color(finger), alpha=0.12, zorder=0)
+    medians = plot_df.groupby("finger_condition", dropna=False)[metric_col].median().reindex(order)
+    ax.bar(
+        range(len(order)),
+        medians.values,
+        width=0.78,
+        color=[_finger_color(f) for f in order],
+        alpha=0.16,
+        edgecolor=[_finger_color(f) for f in order],
+        linewidth=1.0,
+        label="Finger median",
+        zorder=0,
+    )
     if subjects:
         for subject, g in plot_df.groupby("subject_id", dropna=False):
             subject = str(subject)
@@ -1117,15 +1449,52 @@ def _save_all_fit_metric_by_subject_finger(
                 if x is None:
                     continue
                 jitter = (((_stable_hash(subject, finger) % 100) / 100.0) - 0.5) * 0.22
-                ax.scatter(x + jitter, row[metric_col], s=44, facecolor=subject_colors.get(subject, "0.35"), edgecolor="black", linewidth=0.35, alpha=0.9, zorder=3)
+                ax.scatter(
+                    x + jitter,
+                    row[metric_col],
+                    s=44,
+                    facecolor=_finger_fill_subject_edge_style(subject, finger, subject_colors)["facecolor"],
+                    edgecolor=_finger_fill_subject_edge_style(subject, finger, subject_colors)["edgecolor"],
+                    marker=_finger_fill_subject_edge_style(subject, finger, subject_colors)["marker"],
+                    linewidth=_finger_fill_subject_edge_style(subject, finger, subject_colors)["linewidth"],
+                    alpha=0.9,
+                    zorder=3,
+                )
     means = plot_df.groupby("finger_condition", dropna=False)[metric_col].mean().reindex(order)
-    ax.plot(range(len(order)), means.values, color="black", marker="D", linewidth=2.6, label="Group mean", zorder=4)
+    ax.plot(range(len(order)), means.values, color="black", marker="o", linewidth=2.2, label="Mean", zorder=4)
     ax.axhline(0, color="0.35", linestyle="--", linewidth=1)
+    if focus_ylim:
+        _apply_focus_ylim(
+            ax,
+            plot_df[metric_col],
+            symmetric=("PSE" in ylabel or "shift" in ylabel.lower()),
+            lower_bound=0.0 if "JND" in ylabel else None,
+            minimum_half_range=60.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else 25.0,
+            maximum_half_range=250.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else None,
+        )
     ax.set_xticks(range(len(order)))
     ax.set_xticklabels([_finger_label(f) for f in order])
     ax.set_xlabel("Finger")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
+    median_text = "\n".join(
+        f"{_finger_label(f)} median: {medians.loc[f]:.2f}"
+        for f in order
+        if f in medians.index and pd.notna(medians.loc[f])
+    )
+    if median_text:
+        ax.text(
+            0.02,
+            0.98,
+            median_text,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=7,
+            bbox={"facecolor": "white", "alpha": 0.78, "edgecolor": "0.8", "linewidth": 0.5},
+        )
+    if filter_note:
+        ax.text(0.02, 0.02, filter_note, transform=ax.transAxes, ha="left", va="bottom", fontsize=7, color="0.35")
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     _finalize_fig(fig, out_path, fig_dpi)
@@ -1149,11 +1518,6 @@ def _save_all_finger_time_plot(
         return None
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(12.0, 5.0))
-    subject_colors = _subject_palette(subject_df["subject_id"]) if "subject_id" in subject_df else {}
-    for (subject, finger), g in subject_df.groupby(["subject_id", "finger_condition"], dropna=False):
-        g = g.sort_values("within_finger_time_bin")
-        ax.plot(g["within_finger_time_bin"], g["success_rate"], color=subject_colors.get(str(subject), "0.65"), alpha=0.22, linewidth=0.8, zorder=1)
-        ax.scatter(g["within_finger_time_bin"], g["success_rate"], facecolor=_finger_color(finger), edgecolor=subject_colors.get(str(subject), "0.55"), linewidth=0.5, s=24, alpha=0.55, zorder=2)
     summary = group_bins.copy() if group_bins is not None and not group_bins.empty else (
         subject_df.groupby(["finger_condition", "within_finger_time_bin"], dropna=False)
         .agg(mean_success_rate=("success_rate", "mean"))
@@ -1161,11 +1525,19 @@ def _save_all_finger_time_plot(
     )
     for finger, g in summary.groupby("finger_condition", dropna=False):
         g = g.sort_values("within_finger_time_bin")
-        ax.plot(g["within_finger_time_bin"], g["mean_success_rate"], color=_finger_color(finger), marker="o", linewidth=2.8, label=_finger_label(finger), zorder=4)
+        ax.plot(
+            g["within_finger_time_bin"],
+            g["mean_success_rate"],
+            color=_finger_color(finger),
+            marker=FINGER_STYLE.get(str(finger), {}).get("marker", "o"),
+            linewidth=2.8,
+            label=_finger_label(finger),
+            zorder=4,
+        )
     ax.set_ylim(-0.05, 1.05)
     ax.set_xlabel("Trial position within finger block (1-64)")
     ax.set_ylabel("Success rate")
-    ax.set_title("Within-finger learning/fatigue by finger (per trial)")
+    ax.set_title("Within-finger learning/fatigue by finger (group mean per trial position)")
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     _finalize_fig(fig, out_path, fig_dpi)
@@ -1191,17 +1563,33 @@ def _save_all_success_order_slopes(
     subject_colors = _subject_palette(plot_df["subject_id"]) if "subject_id" in plot_df else {}
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8.0, 4.8))
+    if "subject_id" in plot_df:
+        for subject, g in plot_df.groupby("subject_id", dropna=False):
+            subject = str(subject)
+            g = g.sort_values("finger_condition", key=lambda s: s.astype(str).map(x_map))
+            xs, ys = [], []
+            for _, row in g.iterrows():
+                finger = str(row["finger_condition"])
+                if finger not in x_map:
+                    continue
+                jitter = (((_stable_hash(subject, finger, "slope") % 100) / 100.0) - 0.5) * 0.28
+                xs.append(x_map[finger] + jitter)
+                ys.append(row["success_vs_order_slope"])
+            if len(xs) > 1:
+                ax.plot(xs, ys, color=subject_colors.get(subject, "0.60"), alpha=0.35, linewidth=0.9, zorder=1)
     for _, row in plot_df.iterrows():
         finger = str(row["finger_condition"])
         subject = str(row.get("subject_id", ""))
         jitter = (((_stable_hash(subject, finger, "slope") % 100) / 100.0) - 0.5) * 0.28
+        marker_style = _finger_fill_subject_edge_style(subject, finger, subject_colors)
         ax.scatter(
             x_map.get(finger, 0) + jitter,
             row["success_vs_order_slope"],
             s=58,
-            facecolor=_finger_color(finger),
-            edgecolor=subject_colors.get(subject, "black"),
-            linewidth=1.3,
+            facecolor=marker_style["facecolor"],
+            edgecolor=marker_style["edgecolor"],
+            marker=marker_style["marker"],
+            linewidth=marker_style["linewidth"],
             alpha=0.92,
             zorder=3,
         )
@@ -1526,6 +1914,13 @@ def save_all_figures(
         for metric, ylabel, filename in [("pse", "PSE", "pse_per_subject_and_finger.png"), ("jnd", "JND", "jnd_per_subject_and_finger.png")]:
             fig, ax = plt.subplots(figsize=(8, 4.8))
             plot_df = pse_jnd_by_subject_finger.copy()
+            plot_df[metric] = pd.to_numeric(plot_df[metric], errors="coerce")
+            display_max = 250.0
+            keep_mask = plot_df[metric].abs() <= display_max
+            removed = plot_df.loc[~keep_mask & plot_df[metric].notna()].copy()
+            plot_df = plot_df.loc[keep_mask].copy()
+            if plot_df.empty:
+                continue
             order = _finger_order_present(plot_df["finger_condition"])
             x_map = {finger: i for i, finger in enumerate(order)}
             plot_df["_x_num"] = plot_df["finger_condition"].map(x_map)
@@ -1555,42 +1950,19 @@ def save_all_figures(
             ax.set_ylabel(ylabel)
             ax.set_xlabel("Finger condition")
             ax.set_title(f"{ylabel} per subject and finger")
+            _apply_focus_ylim(
+                ax,
+                values,
+                symmetric=False,
+                lower_bound=0.0 if metric in {"pse", "jnd"} else None,
+                minimum_half_range=25.0,
+            )
+            note = _format_display_filter_note(removed, metric_col=metric, metric_label=ylabel, threshold=display_max)
+            ax.text(0.02, 0.02, note, transform=ax.transAxes, ha="left", va="bottom", fontsize=7, color="0.35")
             fig.tight_layout()
             out = fig_root / filename
             _finalize_fig(fig, out, fig_dpi)
             paths.append(out)
-
-    if not order_effects_binned.empty:
-        fingers = _finger_order_present(order_effects_binned["finger_condition"])
-        fig, axes = plt.subplots(len(fingers), 1, figsize=(8.5, 2.4 * len(fingers)), sharex=True, sharey=True)
-        axes = np.atleast_1d(axes)
-        for ax, finger in zip(axes, fingers):
-            color = _finger_color(finger)
-            g = order_effects_binned[order_effects_binned["finger_condition"].astype(str) == str(finger)].copy()
-            for _, sg in g.groupby("subject_id", dropna=False):
-                sg = sg.sort_values("mean_global_trial_order")
-                ax.plot(sg["mean_global_trial_order"], sg["p_comparison_greater"], color=color, alpha=0.18, linewidth=0.8, zorder=1)
-            group = (
-                g.groupby("order_bin", dropna=False)
-                .agg(
-                    mean_global_trial_order=("mean_global_trial_order", "mean"),
-                    p_comparison_greater=("p_comparison_greater", "mean"),
-                    sem=("p_comparison_greater", _sem),
-                )
-                .reset_index()
-                .sort_values("mean_global_trial_order")
-            )
-            ax.errorbar(group["mean_global_trial_order"], group["p_comparison_greater"], yerr=group["sem"], color=color, marker="o", linewidth=2, capsize=3, zorder=2)
-            ax.axhline(0.5, color="0.4", linestyle=":", linewidth=1)
-            ax.set_ylim(-0.05, 1.05)
-            ax.set_ylabel(_finger_label(finger))
-        axes[-1].set_xlabel("Global trial order")
-        fig.supylabel(PSYCHOMETRIC_GREATER_Y_LABEL)
-        fig.suptitle("Order/fatigue trend by finger (individuals faded, mean bold)")
-        fig.tight_layout()
-        out = fig_root / "order_effects.png"
-        _finalize_fig(fig, out, fig_dpi)
-        paths.append(out)
 
     if not clean.empty:
         side = clean.groupby(["subject_id", "finger_condition"]).agg(
@@ -1601,7 +1973,8 @@ def save_all_figures(
         side.to_csv(output_root / "side_bias_summary.csv", index=False)
         # Split each finger into two bars: object 1 (left, orange) showing
         # P(chose object 1) = 1 - p_chose_object2, and object 2 (right, blue)
-        # showing P(chose object 2). One dot per subject, edge = subject colour.
+        # showing P(chose object 2). One dot per subject with fill=finger,
+        # outline=subject, and shape=finger.
         order = _finger_order_present(side["finger_condition"])
         x_map = {finger: idx for idx, finger in enumerate(order)}
         subject_colors = _subject_palette(side["subject_id"])
@@ -1631,8 +2004,19 @@ def save_all_figures(
                 n = len(sub)
                 jit = np.linspace(-bar_w * 0.3, bar_w * 0.3, n) if n > 1 else np.array([0.0])
                 yv = ytf(sub["p_chose_object2"]).to_numpy()
-                edges = [subject_colors.get(str(s), "0.4") for s in sub["subject_id"]]
-                ax.scatter(x + jit, yv, facecolor=color, edgecolor=edges, linewidth=1.1, s=42, alpha=0.9, zorder=3)
+                for j, (_, row) in enumerate(sub.reset_index(drop=True).iterrows()):
+                    marker_style = _finger_fill_subject_edge_style(row.get("subject_id"), finger, subject_colors)
+                    ax.scatter(
+                        x + jit[j],
+                        yv[j],
+                        facecolor=marker_style["facecolor"],
+                        edgecolor=marker_style["edgecolor"],
+                        marker=marker_style["marker"],
+                        linewidth=marker_style["linewidth"],
+                        s=42,
+                        alpha=0.9,
+                        zorder=3,
+                    )
         ax.axhline(0.5, color="red", linestyle="--", linewidth=1, zorder=2)
         ax.set_xlim(-0.5, len(order) - 0.5)
         ax.set_xticks(range(len(order)))
@@ -1648,15 +2032,42 @@ def save_all_figures(
         paths.append(out)
 
     if not qc_summary.empty:
-        fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+        fig, axes = plt.subplots(1, 2, figsize=(16.8, 4.8), gridspec_kw={"width_ratios": [1.8, 1.0]})
         ax = axes[0]
-        if sns is not None:
-            sns.scatterplot(data=qc_summary, x="n_stimulus_levels", y="n_clean_trials", hue="finger_condition", hue_order=_finger_order_present(qc_summary["finger_condition"]), palette={f: _finger_color(f) for f in _finger_order_present(qc_summary["finger_condition"])}, style="qc_warnings", ax=ax)
-        else:
-            ax.scatter(qc_summary["n_stimulus_levels"], qc_summary["n_clean_trials"])
-        ax.set_title("QC: trials and levels")
-        ax.set_xlabel("Number of stimulus levels")
-        ax.set_ylabel("Clean trials")
+        ax.axis("off")
+        qc_table = (
+            qc_summary.groupby("finger_condition", dropna=False)
+            .agg(
+                subjects=("subject_id", "nunique") if "subject_id" in qc_summary else ("finger_condition", "size"),
+                median_clean_trials=("n_clean_trials", "median"),
+                median_stimulus_levels=("n_stimulus_levels", "median"),
+                warning_types=("qc_warnings", lambda s: ", ".join(sorted({str(v) for v in s.dropna().astype(str) if str(v)})) or "none")
+                if "qc_warnings" in qc_summary
+                else ("finger_condition", lambda s: "none"),
+            )
+            .reset_index()
+        )
+        qc_table["finger_condition"] = qc_table["finger_condition"].map(_finger_label)
+        qc_table["median_clean_trials"] = qc_table["median_clean_trials"].map(lambda v: f"{v:.0f}" if pd.notna(v) else "")
+        qc_table["median_stimulus_levels"] = qc_table["median_stimulus_levels"].map(lambda v: f"{v:.0f}" if pd.notna(v) else "")
+        table = ax.table(
+            cellText=qc_table[["finger_condition", "subjects", "median_clean_trials", "median_stimulus_levels", "warning_types"]].values,
+            colLabels=["Finger", "N", "Clean", "Levels", "Warnings"],
+            loc="center",
+            cellLoc="left",
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(7)
+        table.auto_set_column_width(col=list(range(5)))
+        for (row_i, col_i), cell in table.get_celld().items():
+            if col_i == 4:
+                cell.set_width(0.48)
+            elif col_i in {1, 2, 3}:
+                cell.set_width(0.10)
+            elif col_i == 0:
+                cell.set_width(0.16)
+        table.scale(1.0, 1.35)
+        ax.set_title("QC: trials and stimulus levels by finger")
         ax = axes[1]
         plot_qc = qc_summary.copy()
         order = _finger_order_present(plot_qc["finger_condition"])
@@ -1704,6 +2115,7 @@ def save_time_fatigue_figures(
     success_summary_by_subject: pd.DataFrame,
     success_trend_slopes: pd.DataFrame,
     fig_dpi: int = 160,
+    subject_finger_success_summary: Optional[pd.DataFrame] = None,
 ) -> list[Path]:
     """Save figures for response-duration and fatigue/order success analyses."""
     import matplotlib.pyplot as plt
@@ -1723,12 +2135,36 @@ def save_time_fatigue_figures(
         fig, ax = plt.subplots(figsize=(8, 4.8))
         plot_df = success_by_reaction_time_bin.copy()
         order = _finger_order_present(plot_df["finger_condition"])
-        if sns is not None:
-            sns.lineplot(data=plot_df, x="reaction_time_bin", y="success_rate", hue="finger_condition", hue_order=order, palette={f: _finger_color(f) for f in order}, marker="o", errorbar="se", ax=ax)
-        else:
-            for finger, g in plot_df.groupby("finger_condition"):
-                ax.plot(g["reaction_time_bin"], g["success_rate"], marker="o", label=str(finger))
-            ax.legend()
+        if {"subject_id", "finger_condition", "reaction_time_bin", "success_rate"}.issubset(plot_df.columns):
+            subject_colors = _subject_palette(plot_df["subject_id"])
+            for (subject, finger), g in plot_df.groupby(["subject_id", "finger_condition"], dropna=False):
+                g = g.sort_values("reaction_time_bin")
+                ax.plot(g["reaction_time_bin"], g["success_rate"], color=subject_colors.get(str(subject), "0.65"), alpha=0.16, linewidth=0.7, zorder=1)
+                ax.scatter(
+                    g["reaction_time_bin"],
+                    g["success_rate"],
+                    facecolor=_finger_fill_subject_edge_style(subject, finger, subject_colors)["facecolor"],
+                    edgecolor=_finger_fill_subject_edge_style(subject, finger, subject_colors)["edgecolor"],
+                    marker=_finger_fill_subject_edge_style(subject, finger, subject_colors)["marker"],
+                    linewidth=_finger_fill_subject_edge_style(subject, finger, subject_colors)["linewidth"],
+                    s=16,
+                    alpha=0.28,
+                    zorder=1,
+                )
+        for finger in order:
+            g = (
+                plot_df[plot_df["finger_condition"].astype(str) == str(finger)]
+                .groupby("reaction_time_bin", dropna=False)["success_rate"]
+                .agg(mean="mean", sem=_sem)
+                .reset_index()
+                .sort_values("reaction_time_bin")
+            )
+            if g.empty:
+                continue
+            ax.plot(g["reaction_time_bin"], g["mean"], marker=FINGER_STYLE.get(str(finger), {}).get("marker", "o"), color=_finger_color(finger), linewidth=2.2, label=_finger_label(finger), zorder=3)
+            if g["sem"].notna().any():
+                ax.errorbar(g["reaction_time_bin"], g["mean"], yerr=g["sem"], fmt="none", color=_finger_color(finger), alpha=0.35, capsize=3, zorder=3)
+        ax.legend(loc="best", fontsize=8)
         ax.set_ylim(-0.05, 1.05)
         ax.set_xlabel("Reaction-time quartile within participant/finger")
         ax.set_ylabel("Success rate")
@@ -1742,12 +2178,36 @@ def save_time_fatigue_figures(
         fig, ax = plt.subplots(figsize=(8, 4.8))
         plot_df = success_by_order_bin.copy()
         order = _finger_order_present(plot_df["finger_condition"])
-        if sns is not None:
-            sns.lineplot(data=plot_df, x="order_bin", y="success_rate", hue="finger_condition", hue_order=order, palette={f: _finger_color(f) for f in order}, marker="o", errorbar="se", ax=ax)
-        else:
-            for finger, g in plot_df.groupby("finger_condition"):
-                ax.plot(g["order_bin"], g["success_rate"], marker="o", label=str(finger))
-            ax.legend()
+        if {"subject_id", "finger_condition", "order_bin", "success_rate"}.issubset(plot_df.columns):
+            subject_colors = _subject_palette(plot_df["subject_id"])
+            for (subject, finger), g in plot_df.groupby(["subject_id", "finger_condition"], dropna=False):
+                g = g.sort_values("order_bin")
+                ax.plot(g["order_bin"], g["success_rate"], color=subject_colors.get(str(subject), "0.65"), alpha=0.16, linewidth=0.7, zorder=1)
+                ax.scatter(
+                    g["order_bin"],
+                    g["success_rate"],
+                    facecolor=_finger_fill_subject_edge_style(subject, finger, subject_colors)["facecolor"],
+                    edgecolor=_finger_fill_subject_edge_style(subject, finger, subject_colors)["edgecolor"],
+                    marker=_finger_fill_subject_edge_style(subject, finger, subject_colors)["marker"],
+                    linewidth=_finger_fill_subject_edge_style(subject, finger, subject_colors)["linewidth"],
+                    s=16,
+                    alpha=0.28,
+                    zorder=1,
+                )
+        for finger in order:
+            g = (
+                plot_df[plot_df["finger_condition"].astype(str) == str(finger)]
+                .groupby("order_bin", dropna=False)["success_rate"]
+                .agg(mean="mean", sem=_sem)
+                .reset_index()
+                .sort_values("order_bin")
+            )
+            if g.empty:
+                continue
+            ax.plot(g["order_bin"], g["mean"], marker=FINGER_STYLE.get(str(finger), {}).get("marker", "o"), color=_finger_color(finger), linewidth=2.2, label=_finger_label(finger), zorder=3)
+            if g["sem"].notna().any():
+                ax.errorbar(g["order_bin"], g["mean"], yerr=g["sem"], fmt="none", color=_finger_color(finger), alpha=0.35, capsize=3, zorder=3)
+        ax.legend(loc="best", fontsize=8)
         ax.set_ylim(-0.05, 1.05)
         ax.set_xlabel("Trial-order bin within participant/finger")
         ax.set_ylabel("Success rate")
@@ -1758,18 +2218,29 @@ def save_time_fatigue_figures(
         paths.append(out)
 
     if not fatigue_first_second_summary.empty and "success_rate_second_minus_first" in fatigue_first_second_summary:
-        fig, ax = plt.subplots(figsize=(9, 4.8))
+        fig_width = max(12.0, min(24.0, 0.26 * len(fatigue_first_second_summary)))
+        fig, ax = plt.subplots(figsize=(fig_width, 5.2))
         plot_df = fatigue_first_second_summary.copy()
         plot_df["subject_finger"] = plot_df["subject_id"].astype(str) + "-" + plot_df["finger_condition"].astype(str)
-        order = _finger_order_present(plot_df["finger_condition"])
-        if sns is not None:
-            sns.barplot(data=plot_df, x="subject_finger", y="success_rate_second_minus_first", hue="finger_condition", hue_order=order, palette={f: _finger_color(f) for f in order}, dodge=False, ax=ax)
-        else:
-            ax.bar(plot_df["subject_finger"], plot_df["success_rate_second_minus_first"])
+        plot_df = plot_df.sort_values(
+            ["subject_id", "finger_condition"],
+            key=lambda s: s.map(_finger_sort_key) if s.name == "finger_condition" else s.astype(str).map(_subject_sort_key),
+        )
+        subject_colors = _subject_palette(plot_df["subject_id"]) if "subject_id" in plot_df else {}
+        xs = np.arange(len(plot_df))
+        ax.bar(
+            xs,
+            plot_df["success_rate_second_minus_first"],
+            color=[_finger_color(f, "0.75") for f in plot_df["finger_condition"]],
+            edgecolor=[subject_colors.get(str(s), "0.35") for s in plot_df["subject_id"]],
+            linewidth=1.4,
+        )
         ax.axhline(0, color="black", linewidth=1)
+        ax.set_xticks(xs)
+        ax.set_xticklabels(plot_df["subject_finger"])
         ax.set_ylabel("Second-half minus first-half success rate")
         ax.set_xlabel("Participant-finger")
-        ax.set_title("Within-participant fatigue/learning direction")
+        ax.set_title("Within-participant fatigue/learning direction (fill=finger, outline=participant)")
         ax.tick_params(axis="x", rotation=90)
         fig.tight_layout()
         out = fig_root / "fatigue_second_minus_first_by_subject_finger.png"
@@ -1785,11 +2256,40 @@ def save_time_fatigue_figures(
                 continue
             fig, ax = plt.subplots(figsize=(6.8, 4.8))
             plot_df = success_summary_by_subject.copy()
-            if sns is not None:
-                sns.scatterplot(data=plot_df, x=x_col, y="success_rate", hue="subject_group_label", s=80, ax=ax)
-                sns.regplot(data=plot_df, x=x_col, y="success_rate", scatter=False, color="black", seed=_FIGURE_RNG_SEED, ax=ax)
+            subject_colors = _subject_palette(plot_df["subject_id"]) if "subject_id" in plot_df else {}
+            if (
+                subject_finger_success_summary is not None
+                and not subject_finger_success_summary.empty
+                and {"subject_id", "finger_condition", "success_rate"}.issubset(subject_finger_success_summary.columns)
+            ):
+                finger_df = subject_finger_success_summary[["subject_id", "finger_condition", "success_rate"]].copy()
+                plot_fingers = finger_df.merge(plot_df[["subject_id", x_col]], on="subject_id", how="left").dropna(subset=[x_col, "success_rate"])
+                for _, row in plot_fingers.iterrows():
+                    finger = str(row["finger_condition"])
+                    subject = str(row["subject_id"])
+                    ax.scatter(
+                        row[x_col],
+                        row["success_rate"],
+                        s=74,
+                        facecolor=subject_colors.get(subject, "0.35"),
+                        edgecolor=_finger_color(finger, "black"),
+                        marker=FINGER_STYLE.get(finger, {}).get("marker", "o"),
+                        linewidth=1.2,
+                        alpha=0.88,
+                        zorder=2,
+                    )
             else:
-                ax.scatter(plot_df[x_col], plot_df["success_rate"])
+                ax.scatter(
+                    plot_df[x_col],
+                    plot_df["success_rate"],
+                    s=80,
+                    facecolor=[subject_colors.get(str(s), "0.35") for s in plot_df.get("subject_id", pd.Series([], dtype=object))],
+                    edgecolor="black",
+                    linewidth=0.6,
+                    alpha=0.9,
+                )
+            if sns is not None:
+                sns.regplot(data=plot_df, x=x_col, y="success_rate", scatter=False, color="black", seed=_FIGURE_RNG_SEED, ax=ax)
             for _, row in plot_df.iterrows():
                 ax.annotate(str(row["subject_id"]), (row[x_col], row["success_rate"]), fontsize=8, xytext=(4, 4), textcoords="offset points")
             ax.set_ylim(-0.05, 1.05)
@@ -1802,27 +2302,10 @@ def save_time_fatigue_figures(
             paths.append(out)
 
     if not success_trend_slopes.empty and "success_vs_order_slope" in success_trend_slopes:
-        fig, ax = plt.subplots(figsize=(8, 4.8))
-        plot_df = success_trend_slopes.copy()
-        order = _finger_order_present(plot_df["finger_condition"])
-        if sns is not None:
-            np.random.seed(_FIGURE_RNG_SEED)  # reproducible stripplot jitter
-            sns.stripplot(data=plot_df, x="finger_condition", y="success_vs_order_slope", order=order, hue="finger_condition", hue_order=order, palette={f: _finger_color(f) for f in order}, dodge=False, ax=ax)
-            handles, labels = ax.get_legend_handles_labels()
-            if handles:
-                ax.legend(handles, labels, bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=7)
-            elif ax.get_legend() is not None:
-                ax.get_legend().remove()
-        else:
-            ax.scatter(plot_df["finger_condition"].astype(str), plot_df["success_vs_order_slope"])
-        ax.axhline(0, color="black", linewidth=1)
-        ax.set_ylabel("Within participant success slope over session")
-        ax.set_xlabel("Finger condition")
-        ax.set_title("Success trend slopes: positive=improves, negative=fatigue")
-        fig.tight_layout()
         out = fig_root / "success_order_slopes_by_finger.png"
-        _finalize_fig(fig, out, fig_dpi)
-        paths.append(out)
+        path = _save_all_success_order_slopes(success_trend_slopes, out_path=out, fig_dpi=fig_dpi)
+        if path:
+            paths.append(path)
 
     return paths
 
@@ -1866,12 +2349,12 @@ def save_finger_time_appearance_figures(
         fig, ax = plt.subplots(figsize=(12.0, 5.0))
         plot_df = finger_time_group_bins.copy()
         order = _finger_order_present(plot_df["finger_condition"])
-        if sns is not None:
-            sns.lineplot(data=plot_df, x="within_finger_time_bin", y="mean_success_rate", hue="finger_condition", hue_order=order, palette={f: _finger_color(f) for f in order}, marker="o", markersize=3, ax=ax)
-        else:
-            for finger, g in plot_df.groupby("finger_condition"):
-                ax.plot(g["within_finger_time_bin"], g["mean_success_rate"], marker="o", color=_finger_color(finger), label=str(finger))
-            ax.legend()
+        for finger in order:
+            g = plot_df[plot_df["finger_condition"].astype(str) == str(finger)].sort_values("within_finger_time_bin")
+            if g.empty:
+                continue
+            ax.plot(g["within_finger_time_bin"], g["mean_success_rate"], marker=FINGER_STYLE.get(str(finger), {}).get("marker", "o"), markersize=3, color=_finger_color(finger), linewidth=2.0, label=_finger_label(finger))
+        ax.legend(loc="best", fontsize=8)
         for finger, g in plot_df.groupby("finger_condition"):
             if "sem_success_rate" in g:
                 ax.errorbar(g["within_finger_time_bin"], g["mean_success_rate"], yerr=g["sem_success_rate"], fmt="none", color=_finger_color(finger), alpha=0.35)
@@ -1908,6 +2391,7 @@ def save_finger_time_appearance_figures(
 
         # Coarse 8-bin view (8 trials per bin), as in the original analysis.
         bins_df: pd.DataFrame
+        subj_bin_background: pd.DataFrame = pd.DataFrame()
         if subject_finger_time_bins is not None and not subject_finger_time_bins.empty and "within_finger_time_bin" in subject_finger_time_bins:
             # Rebuild the exact original statistic: bin each subject's 64 trials
             # into 8 quantile bins, success rate per (subject, finger, bin), then
@@ -1922,6 +2406,7 @@ def save_finger_time_appearance_figures(
                 .mean()
                 .reset_index()
             )
+            subj_bin_background = subj_bin.copy()
             bins_df = (
                 subj_bin.groupby(["finger_condition", "coarse_bin"], dropna=False)["success_rate"]
                 .agg(mean_success_rate="mean", sem_success_rate=_sem)
@@ -1942,12 +2427,28 @@ def save_finger_time_appearance_figures(
 
         if not bins_df.empty:
             fig, ax = plt.subplots(figsize=(8.5, 5.0))
+            if not subj_bin_background.empty:
+                subject_colors = _subject_palette(subj_bin_background["subject_id"])
+                for (subject, finger), g in subj_bin_background.groupby(["subject_id", "finger_condition"], dropna=False):
+                    g = g.sort_values("coarse_bin")
+                    ax.plot(g["coarse_bin"], g["success_rate"], color=subject_colors.get(str(subject), "0.65"), alpha=0.14, linewidth=0.65, zorder=1)
+                    ax.scatter(
+                        g["coarse_bin"],
+                        g["success_rate"],
+                        facecolor=_finger_fill_subject_edge_style(subject, finger, subject_colors)["facecolor"],
+                        edgecolor=_finger_fill_subject_edge_style(subject, finger, subject_colors)["edgecolor"],
+                        marker=_finger_fill_subject_edge_style(subject, finger, subject_colors)["marker"],
+                        linewidth=_finger_fill_subject_edge_style(subject, finger, subject_colors)["linewidth"],
+                        s=16,
+                        alpha=0.26,
+                        zorder=1,
+                    )
             for finger in order:
                 g = bins_df[bins_df["finger_condition"].astype(str) == str(finger)].sort_values("time_bin_8")
                 if g.empty:
                     continue
                 color = _finger_color(finger)
-                ax.plot(g["time_bin_8"], g["mean_success_rate"], marker="o", color=color, linewidth=2.0, label=_finger_label(finger))
+                ax.plot(g["time_bin_8"], g["mean_success_rate"], marker=FINGER_STYLE.get(str(finger), {}).get("marker", "o"), color=color, linewidth=2.0, label=_finger_label(finger))
                 if g["sem_success_rate"].notna().any():
                     ax.errorbar(g["time_bin_8"], g["mean_success_rate"], yerr=g["sem_success_rate"], fmt="none", color=color, alpha=0.35)
             ax.set_ylim(-0.05, 1.05)
@@ -1961,62 +2462,8 @@ def save_finger_time_appearance_figures(
             _finalize_fig(fig, out, fig_dpi)
             paths.append(out)
 
-    if not finger_appearance_order_summary.empty:
-        fig, ax = plt.subplots(figsize=(7.2, 4.8))
-        plot_df = finger_appearance_order_summary.copy()
-        order = _appearance_order(plot_df["finger_appearance_order"])
-        ax.plot(plot_df["finger_appearance_order"], plot_df["mean_success_rate"], color="0.25", linewidth=1.5, alpha=0.7)
-        ax.errorbar(
-            plot_df["finger_appearance_order"],
-            plot_df["mean_success_rate"],
-            yerr=plot_df.get("sem_success_rate"),
-            fmt="none",
-            color="0.25",
-            linewidth=2,
-            capsize=4,
-        )
-        ax.scatter(
-            plot_df["finger_appearance_order"],
-            plot_df["mean_success_rate"],
-            c=plot_df["finger_appearance_order"],
-            cmap=STIFFNESS_CMAP,
-            s=70,
-            edgecolor="black",
-            linewidth=0.4,
-            zorder=3,
-        )
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_xticks(order)
-        ax.set_xticklabels(_appearance_tick_labels(order))
-        ax.set_xlabel("Finger appearance order in session")
-        ax.set_ylabel("Mean success rate")
-        ax.set_title("Success by protocol appearance position (pooled across finger identity)")
-        fig.tight_layout()
-        out = fig_root / "success_by_finger_appearance_order.png"
-        _finalize_fig(fig, out, fig_dpi)
-        paths.append(out)
-
-    if not finger_by_appearance_order.empty:
-        fig, ax = plt.subplots(figsize=(8.5, 5.0))
-        plot_df = finger_by_appearance_order.copy()
-        order = _finger_order_present(plot_df["finger_condition"])
-        if sns is not None:
-            sns.lineplot(data=plot_df, x="finger_appearance_order", y="mean_success_rate", hue="finger_condition", hue_order=order, palette={f: _finger_color(f) for f in order}, marker="o", ax=ax)
-        else:
-            for finger, g in plot_df.groupby("finger_condition"):
-                ax.plot(g["finger_appearance_order"], g["mean_success_rate"], marker="o", color=_finger_color(finger), label=str(finger))
-            ax.legend()
-        ax.set_ylim(-0.05, 1.05)
-        app_order = _appearance_order(plot_df["finger_appearance_order"])
-        ax.set_xticks(app_order)
-        ax.set_xticklabels(_appearance_tick_labels(app_order))
-        ax.set_xlabel("Finger appearance order in session")
-        ax.set_ylabel("Mean success rate")
-        ax.set_title("Finger identity x appearance-order success")
-        fig.tight_layout()
-        out = fig_root / "success_by_finger_identity_and_appearance_order.png"
-        _finalize_fig(fig, out, fig_dpi)
-        paths.append(out)
+    # The appearance-order-only and identity-by-order plots duplicated the article-style
+    # success summary visually; keep the article-style figures as the canonical view.
 
     if not finger_time_slope_summary.empty:
         n_panels = 2 if stiffness_time_slope_summary is not None and not stiffness_time_slope_summary.empty else 1
@@ -2079,15 +2526,11 @@ def save_success_by_stiffness_repetition_figures(
     Layout: one subplot per finger (e.g. Index/Middle/Ring/Pinky). Within each
     panel:
     - colour encodes the stiffness level (signed delta, ``STIFFNESS_CMAP``),
-    - the thick line is the across-subject mean success at each repetition for a
-      given stiffness,
-    - faint markers are individual subjects (marker fill = stiffness colour,
-      marker edge/perimeter = subject colour), connected by thin per-subject
-      lines coloured by stiffness.
+    - each line is the across-subject mean success at each repetition for a
+      given stiffness.
 
-    Note: for a single subject, one (stiffness, repetition) cell is a single
-    trial, so per-subject markers sit at 0 or 1; the across-subject mean (thick
-    line) carries the real signal.
+    Individual binary trial markers are intentionally hidden here because they
+    collapse to only y=0/y=1 rows and obscure the readable mean trends.
     """
     import matplotlib.pyplot as plt
     from matplotlib.cm import ScalarMappable
@@ -2152,21 +2595,6 @@ def save_success_by_stiffness_repetition_figures(
 
     for ax, finger in zip(flat_axes, fingers):
         fdf = df[df["finger_condition"].astype(str) == str(finger)]
-        # Thin per-subject lines/markers: fill = stiffness colour, edge = subject.
-        for (subject, delta), g in fdf.groupby(["subject_id", "signed_stiffness_delta"], dropna=False):
-            g = g.sort_values("stiffness_repetition")
-            color = stiff_color(delta)
-            ax.plot(g["stiffness_repetition"], g["correct_response"], color=color, alpha=0.12, linewidth=0.7, zorder=1)
-            ax.scatter(
-                g["stiffness_repetition"],
-                g["correct_response"],
-                facecolor=[color],
-                edgecolor=subject_colors.get(str(subject), "0.4"),
-                linewidth=0.6,
-                s=22,
-                alpha=0.55,
-                zorder=2,
-            )
         # Thick across-subject mean line per stiffness level.
         mean_df = (
             fdf.groupby(["signed_stiffness_delta", "stiffness_repetition"], dropna=False)["correct_response"]
@@ -2175,7 +2603,7 @@ def save_success_by_stiffness_repetition_figures(
         )
         for delta, g in mean_df.groupby("signed_stiffness_delta", dropna=False):
             g = g.sort_values("stiffness_repetition")
-            ax.plot(g["stiffness_repetition"], g["correct_response"], color=stiff_color(delta), marker="o", linewidth=2.6, zorder=4)
+            ax.plot(g["stiffness_repetition"], g["correct_response"], color=stiff_color(delta), marker=FINGER_STYLE.get(str(finger), {}).get("marker", "o"), linewidth=2.6, zorder=4)
         ax.set_ylim(-0.05, 1.05)
         reps = np.sort(fdf["stiffness_repetition"].unique())
         if len(reps):
@@ -2194,7 +2622,7 @@ def save_success_by_stiffness_repetition_figures(
     cbar = fig.colorbar(sm, ax=flat_axes, shrink=0.85, pad=0.02)
     cbar.set_label("Stiffness delta (comparison - standard)")
 
-    fig.suptitle("Success across repetitions of each stiffness, per finger\n(thick = across-subject mean; marker edge colour = subject)")
+    fig.suptitle("Success across repetitions of each stiffness, per finger\n(lines show across-subject mean success; individual binary trials are hidden for readability)")
     out = fig_root / "success_by_stiffness_repetition_per_finger.png"
     _finalize_fig(fig, out, fig_dpi)
     paths.append(out)
