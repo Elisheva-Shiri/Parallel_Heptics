@@ -2,80 +2,31 @@
 anova_statistics.py
 ===================
 
-Self-contained statistics pipeline for a 2AFC stiffness-discrimination
-psychophysics study.
+Statistics/reporting pipeline for the 2AFC stiffness-discrimination study.
 
-This module is PURELY ADDITIVE. It does NOT recompute psychometric fits and
-does NOT modify any existing analysis code. It consumes a frozen per-subject x
-finger psychometric summary CSV and produces:
+The module reads an existing per-subject x finger psychophysics summary CSV and
+writes validation tables, exploratory one-way ANOVA, the confirmatory mixed
+System x Finger ANOVA, planned contrasts, bootstrap CIs, figures, and a text
+report. Psychometric fits, trial scoring, calculations, and visual defaults are
+not recomputed here.
 
-  * Data loading + validation (transparent, never silently drops rows).
-  * Exploratory one-way ANOVA on the 8 combined System x Finger groups.
-  * MAIN analysis: mixed-design ANOVA  System (between) x Finger (within),
-    with Subject as the repeated-measures unit, for Bias and JND.
-  * Planned contrasts: System L vs N within each finger (Holm-corrected).
-  * Subject-respecting bootstrap confidence intervals.
-  * Publication-style figures.
-  * A methods/results text report.
-
-Domain facts (kept verbatim where reported)
--------------------------------------------
-  * 2AFC stiffness task. Standard S = 85; comparison values
-    25, 40, 55, 70, 100, 115, 130, 145; predictor delta = C - 85.
-  * Binary response y = 1 iff the participant judged the COMPARISON stiffer
-    than the standard (NOT correct/incorrect, not side, not order, not
-    physical truth). This is already coded upstream.
-
-Psychometric model (frozen upstream; NOT recomputed here)
---------------------------------------------------------
-Each subject x finger psychometric function is a LAPSE-AWARE yes/no-style
-function with FOUR fitted parameters (mu, scale, lapse_low, lapse_high). It is
-NOT a textbook 2AFC percent-correct model with a fixed guess rate. The fit is
-to P(participant judged comparison C stiffer than standard S=85), i.e. P(y=1):
-
-    P(y=1) = lapse_low + (1 - lapse_low - lapse_high) * F(delta; mu, scale),
-    delta = C - 85,  F = a monotonic sigmoid.
-
-Fitter provenance: psignifit was used when installed (preferred); otherwise a
-custom lapse-aware fallback fitter was used. The source CSV records the fitter
-per row in ``fit_method`` and the psignifit availability in
-``psignifit_status``; this module reports a count of fits by fitter.
-
-Derived measures (fit is in comparison-stiffness units, so these are
-equivalent to delta-space):
-  * PSE  = comparison value where P(y=1) = 0.5.
-  * Bias = PSE - 85 = the delta at P(y=1) = 0.5 (perceptual shift; 0 = none).
-  * JND  = (x75 - x25) / 2, where x25 / x75 are the comparison values at which
-           the curve reaches 0.25 / 0.75 (sensitivity; smaller = finer).
-    Because of the lapse parameters, x25 / x75 are estimable ONLY if 0.25 and
-    0.75 lie within the attainable range [lapse_low, 1 - lapse_high]. When they
-    do not, the upstream fitter returns NaN JND together with a fit_warning
-    ("jnd_quantile_outside_lapse_range" / "pse_outside_lapse_range"); a
-    non-estimable JND is therefore FLAGGED, not silently invalid.
-
-Design factors
+Design summary
 --------------
-  * System = between-subject factor (each subject is in EXACTLY one system).
-  * Finger = within-subject / repeated factor (4 fingers per subject).
-  * Subject = repeated-measures unit.
+* System is the between-subject factor (L/N).
+* Finger is the within-subject repeated factor (I/M/P/R).
+* Subject is the repeated-measures unit.
+* Bias = PSE - 85; JND = (x75 - x25) / 2 from the frozen upstream fits.
 
-Why a mixed-design ANOVA and NOT an ordinary two-way ANOVA
----------------------------------------------------------
-An ordinary independent two-way ANOVA assumes all observations are
-independent. Here the 4 finger measurements come from the SAME subject and are
-therefore correlated (repeated measures). Treating them as independent would
-violate the independence assumption and mis-estimate the error term. A
-mixed-design ANOVA (System between, Finger within, Subject as the repeated
-unit) is the correct classical model and is the MAIN analysis.
-
-Author: additive analysis module (no existing code touched).
+Main analysis: mixed-design ANOVA, because each subject contributes repeated
+finger measurements. The one-way analyses are retained only as didactic and
+exploratory checks.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
-import textwrap
 import warnings
 from dataclasses import dataclass, field
 from typing import Optional
@@ -85,15 +36,26 @@ import pandas as pd
 
 # Statistics
 import pingouin as pg
-from scipy import stats
 from statsmodels.stats.multitest import multipletests
 
 # Plotting (configured by the notebook; safe defaults here)
-import matplotlib
 
-import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
-import seaborn as sns
+from report_text import METHODS_TEXT
+from anova_statistics_render import (
+    RenderContext,
+    dataframe_to_image,
+    fatigue_order_interpretation,
+    fatigue_order_summary_frame,
+    plot_bootstrap_diff,
+    plot_contrasts,
+    plot_dv_by_finger,
+    plot_eight_groups,
+    plot_fatigue_order_control,
+    plot_pooled_ln_by_finger,
+    pooled_ln_descriptives,
+    render_oneway_summary_table,
+    render_summary_tables,
+)
 
 # One-way (per-system finger) analysis helpers, colocated in THIS folder as
 # ``oneway_anova.py``. We reuse its numpy/scipy stat + plot helpers (NOT its
@@ -127,6 +89,7 @@ BOOTSTRAP_CI = 95  # confidence level (%)
 SYSTEM_LEVELS = ["L", "N"]
 FINGER_LEVELS = ["I", "M", "P", "R"]
 FINGER_FULLNAMES = {"I": "Index", "M": "Middle", "P": "Pinky", "R": "Ring"}
+DEPENDENT_VARS = ("Bias", "JND")
 
 # Source-column -> analysis-column mapping (documented for transparency).
 COLUMN_MAP = {
@@ -138,18 +101,26 @@ COLUMN_MAP = {
     "jnd": "JND",
 }
 
-# Live psychophysics results directory. This module READS already-computed
-# summaries from here; it never recomputes psychometric fits or trial scoring.
-PSYCHO_RESULTS_DIR = os.path.join(
+# Live psychophysics results root. This module READS already-computed summaries
+# from here; it never recomputes psychometric fits or trial scoring.
+PSYCHOPHYSICS_RESULTS_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "psychophysics", "results", "L_N_E", "_working",
+    "psychophysics", "results",
+)
+DEFAULT_RESULTS_SELECTION = "L_N_E"
+PSE_JND_SUMMARY_FILENAME = "pse_jnd_by_subject_finger.csv"
+SUCCESS_SUMMARY_FILENAME = "success_summary_by_subject_finger.csv"
+
+# Backward-compatible default live directory.
+PSYCHO_RESULTS_DIR = os.path.join(
+    PSYCHOPHYSICS_RESULTS_ROOT, DEFAULT_RESULTS_SELECTION, "_working"
 )
 
 # Primary source: the live per-subject x finger PSE/JND summary produced by the
 # psychophysics pipeline (NOT a frozen copy). PSE, JND and Bias are read from
 # here as-is.
 DEFAULT_DATA_PATH = os.path.join(
-    PSYCHO_RESULTS_DIR, "pse_jnd_by_subject_finger.csv"
+    PSYCHO_RESULTS_DIR, PSE_JND_SUMMARY_FILENAME
 )
 SOURCE_DATA_PATH = DEFAULT_DATA_PATH  # provenance == the live file itself
 
@@ -158,7 +129,7 @@ SOURCE_DATA_PATH = DEFAULT_DATA_PATH  # provenance == the live file itself
 # when it has to fall back.
 LEGACY_FROZEN_DATA_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "data", "pse_jnd_by_subject_finger.csv",
+    "data", PSE_JND_SUMMARY_FILENAME,
 )
 
 # A JND larger than this (in stiffness units, same scale as the comparisons
@@ -173,6 +144,22 @@ JND_EXTREME_THRESHOLD = 100.0
 LAPSE_BOUND_LOW = 0.0
 LAPSE_BOUND_HIGH = 0.20
 LAPSE_BOUND_TOL = 1e-3
+
+
+def _ensure_dirs(*paths: str) -> None:
+    """Create output folders used by the analysis pipeline."""
+    for path in paths:
+        os.makedirs(path, exist_ok=True)
+
+
+def _write_csv(df: pd.DataFrame, path: str, **kwargs) -> str:
+    """Write ``df`` to ``path`` and return the path for call-site reuse."""
+    df.to_csv(path, index=False, **kwargs)
+    return path
+
+
+def _dv_slug(dv: str) -> str:
+    return dv.lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -221,15 +208,150 @@ class ValidationReport:
 # Load + validate
 # --------------------------------------------------------------------------- #
 
-def load_data(path: Optional[str] = None) -> pd.DataFrame:
+def _safe_source_label(source: Optional[str]) -> str:
+    """Return a filename-safe cohort/source label for ANOVA outputs."""
+    if source is None:
+        source = DEFAULT_RESULTS_SELECTION
+    text = os.fspath(source)
+    # Direct file path -> parent folder label; direct folder path -> folder name.
+    if text.lower().endswith(".csv"):
+        text = os.path.basename(os.path.dirname(text)) or os.path.basename(text)
+        if text == "_working":
+            text = os.path.basename(os.path.dirname(os.path.dirname(os.fspath(source))))
+    else:
+        text = os.path.basename(os.path.normpath(text)) or text
+    if text == "_working":
+        text = os.path.basename(os.path.dirname(os.path.normpath(os.fspath(source))))
+    text = str(text).strip() or "selected"
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._-")
+    return text or "selected"
+
+
+def selected_source_label(source: Optional[str] = None) -> str:
+    """Public helper used by the notebook for the output cohort prefix."""
+    return _safe_source_label(source)
+
+
+def available_psychophysics_result_sources(
+    results_root: Optional[str] = None,
+    *,
+    filename: str = PSE_JND_SUMMARY_FILENAME,
+) -> pd.DataFrame:
+    """List psychophysics result folders and whether they contain ``filename``."""
+    root = os.path.abspath(results_root or PSYCHOPHYSICS_RESULTS_ROOT)
+    rows = []
+    if not os.path.isdir(root):
+        return pd.DataFrame(columns=["selection", "folder", "summary_path", "has_summary"])
+    for name in sorted(os.listdir(root)):
+        folder = os.path.join(root, name)
+        if not os.path.isdir(folder):
+            continue
+        candidates = _summary_candidates(folder, filename)
+        found = next((p for p in candidates if os.path.isfile(p)), "")
+        rows.append(
+            {
+                "selection": name,
+                "folder": folder,
+                "summary_path": found,
+                "has_summary": bool(found),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _summary_candidates(folder: str, filename: str) -> list[str]:
+    """Most likely summary locations inside one psychophysics result folder."""
+    return [
+        os.path.join(folder, "_working", filename),
+        os.path.join(folder, filename),
+        os.path.join(folder, "csv", filename),
+        os.path.join(folder, "csv", "psychometric_curves", filename),
+        os.path.join(folder, "csv", "all", filename),
+        os.path.join(folder, "csv", "all", "shared", filename),
+    ]
+
+
+def _find_summary_under(folder: str, filename: str) -> Optional[str]:
+    for candidate in _summary_candidates(folder, filename):
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    for dirpath, _, filenames in os.walk(folder):
+        if filename in filenames:
+            return os.path.abspath(os.path.join(dirpath, filename))
+    return None
+
+
+def resolve_psychophysics_summary_path(
+    source: Optional[str] = None,
+    *,
+    filename: str = PSE_JND_SUMMARY_FILENAME,
+    results_root: Optional[str] = None,
+) -> str:
+    """Resolve an ANOVA input source to a concrete psychophysics summary CSV.
+
+    ``source`` can be:
+      * ``None`` -> default ``L_N_E`` live summary.
+      * a folder name under ``analysis/psychophysics/results`` such as
+        ``L_E``, ``N_E``, or ``L_N_E``.
+      * a direct results-folder path.
+      * a direct CSV path.
+    """
+    root = os.path.abspath(results_root or PSYCHOPHYSICS_RESULTS_ROOT)
+    if source is None:
+        return os.path.abspath(DEFAULT_DATA_PATH)
+
+    text = os.path.expanduser(os.fspath(source))
+    if os.path.isfile(text):
+        return os.path.abspath(text)
+    if os.path.isdir(text):
+        found = _find_summary_under(text, filename)
+        if found:
+            return found
+        raise FileNotFoundError(
+            f"Could not find {filename!r} inside results folder {text!r}."
+        )
+
+    # Treat a non-path token as a folder under the psychophysics results root.
+    folder = os.path.join(root, text)
+    if os.path.isdir(folder):
+        found = _find_summary_under(folder, filename)
+        if found:
+            return found
+
+    # Direct CSV path that does not exist: give a direct error rather than
+    # silently falling back to the frozen copy.
+    if text.lower().endswith(".csv") or os.path.isabs(text):
+        raise FileNotFoundError(f"ANOVA source CSV/folder not found: {text!r}")
+
+    available = available_psychophysics_result_sources(root, filename=filename)
+    with_summary = (
+        available.loc[available["has_summary"], "selection"].astype(str).tolist()
+        if not available.empty
+        else []
+    )
+    raise FileNotFoundError(
+        f"Could not find {filename!r} for psychophysics results selection {source!r} "
+        f"under {root!r}. Available selections with this CSV: {with_summary}"
+    )
+
+
+def load_data(
+    path: Optional[str] = None,
+    *,
+    results_root: Optional[str] = None,
+) -> pd.DataFrame:
     """Load the frozen per-subject x finger summary and standardise columns.
 
     Returns a DataFrame with canonical columns: Subject, System, Finger, PSE,
     Bias, JND, plus the quality/flag columns and a derived ``Group8`` column
     (System + "_" + Finger). No rows are dropped here.
+
+    ``path`` may be a direct CSV path, a direct psychophysics-results folder, or
+    a folder name under ``analysis/psychophysics/results`` (for example
+    ``L_E``, ``N_E``, ``L_N_E``).
     """
     if path is None:
-        path = DEFAULT_DATA_PATH
+        path = resolve_psychophysics_summary_path(None, results_root=results_root)
         if not os.path.exists(path) and os.path.exists(LEGACY_FROZEN_DATA_PATH):
             warnings.warn(
                 "Live psychophysics summary not found at "
@@ -239,6 +361,8 @@ def load_data(path: Optional[str] = None) -> pd.DataFrame:
                 stacklevel=2,
             )
             path = LEGACY_FROZEN_DATA_PATH
+    else:
+        path = resolve_psychophysics_summary_path(path, results_root=results_root)
     raw = pd.read_csv(path)
 
     missing = [c for c in COLUMN_MAP if c not in raw.columns]
@@ -707,14 +831,14 @@ def planned_contrasts(df: pd.DataFrame, dv: str, drop_flagged: bool = False):
     rows = []
     for finger in FINGER_LEVELS:
         sub = work[work["Finger"] == finger]
-        l = sub.loc[sub["System"] == "L", dv].to_numpy()
-        n = sub.loc[sub["System"] == "N", dv].to_numpy()
-        if len(l) < 2 or len(n) < 2:
+        l_values = sub.loc[sub["System"] == "L", dv].to_numpy()
+        n_values = sub.loc[sub["System"] == "N", dv].to_numpy()
+        if len(l_values) < 2 or len(n_values) < 2:
             continue
         # Welch's t-test (does not assume equal variance) via pingouin to get
         # CI and effect size in one call.
-        tt = pg.ttest(l, n, paired=False, correction=True)
-        diff = float(np.mean(l) - np.mean(n))  # L - N
+        tt = pg.ttest(l_values, n_values, paired=False, correction=True)
+        diff = float(np.mean(l_values) - np.mean(n_values))  # L - N
         # pingouin 0.6.x uses underscore column names: p_val, CI95, cohen_d.
         ci_col = "CI95" if "CI95" in tt.columns else "CI95%"
         p_col = "p_val" if "p_val" in tt.columns else "p-val"
@@ -724,12 +848,12 @@ def planned_contrasts(df: pd.DataFrame, dv: str, drop_flagged: bool = False):
             "DV": dv,
             "Finger": finger,
             "Finger_name": FINGER_FULLNAMES.get(finger, finger),
-            "mean_L": float(np.mean(l)),
-            "sd_L": float(np.std(l, ddof=1)),
-            "n_L": int(len(l)),
-            "mean_N": float(np.mean(n)),
-            "sd_N": float(np.std(n, ddof=1)),
-            "n_N": int(len(n)),
+            "mean_L": float(np.mean(l_values)),
+            "sd_L": float(np.std(l_values, ddof=1)),
+            "n_L": int(len(l_values)),
+            "mean_N": float(np.mean(n_values)),
+            "sd_N": float(np.std(n_values, ddof=1)),
+            "n_N": int(len(n_values)),
             "diff_L_minus_N": diff,
             "T": float(tt["T"].iloc[0]),
             "dof": float(tt["dof"].iloc[0]),
@@ -836,223 +960,39 @@ def bootstrap_cis(df: pd.DataFrame, dv: str,
 # (6) Figures
 # --------------------------------------------------------------------------- #
 
-def _mean_ci(values: np.ndarray, ci: float = 95.0):
-    """Mean and +/- half-width 95% CI (t-based) of a 1-D array."""
-    v = np.asarray(values, dtype=float)
-    v = v[~np.isnan(v)]
-    n = len(v)
-    if n < 2:
-        return (float(np.mean(v)) if n else np.nan), 0.0
-    m = float(np.mean(v))
-    se = float(np.std(v, ddof=1) / np.sqrt(n))
-    tcrit = stats.t.ppf(1 - (1 - ci / 100) / 2, df=n - 1)
-    return m, tcrit * se
 
 
 # System colours: the marker/circle is filled by SYSTEM (pink = L, light purple = N).
-_SYS_COLORS = {"L": "#E377C2", "N": "#B19CD9"}
-_SYS_OFFSET = {"L": -0.14, "N": 0.14}
 # Per-finger colours: every finger keeps ONE dedicated colour across all figures.
 # Sourced from the colocated oneway_anova module so the one-way and two-way plots
 # match; falls back to the same literal values if that module is unavailable.
-_FINGER_COLORS = (getattr(owa, "_FINGER_COLORS", None) or
-                  {"I": "#4C72B0", "M": "#DD8452", "R": "#55A868", "P": "#C44E52"})
+
+# Display-only: keep JND figures readable on a linear axis by hiding QC-extreme
+# JND points from the plotted points/means. Statistical analyses and CSV outputs
+# still use the original data; this only affects visualization scale.
 
 
-def plot_dv_by_finger(df: pd.DataFrame, dv: str, hline: Optional[float],
-                      ylabel: str, title: str, out_path: str,
-                      seed: int = RANDOM_SEED):
-    """Subject points + mean +/- 95% CI per Finger, hue = System."""
-    work = analysis_frame(df, dv)
-    rng = np.random.default_rng(seed)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    x_base = {f: i for i, f in enumerate(FINGER_LEVELS)}
-
-    for s in SYSTEM_LEVELS:
-        for f in FINGER_LEVELS:
-            vals = work[(work["System"] == s) &
-                        (work["Finger"] == f)][dv].to_numpy()
-            x0 = x_base[f] + _SYS_OFFSET[s]
-            jitter = (rng.random(len(vals)) - 0.5) * 0.10
-            ax.scatter(np.full(len(vals), x0) + jitter, vals,
-                       color=_SYS_COLORS[s], alpha=0.35, s=22,
-                       edgecolors="none", zorder=2)
-            m, h = _mean_ci(vals)
-            # Circle filled by SYSTEM colour; error line in this FINGER's colour.
-            ax.errorbar(x0, m, yerr=h, fmt="o",
-                        mfc=_SYS_COLORS[s], mec="black", markeredgewidth=0.6,
-                        ecolor=_FINGER_COLORS.get(f, "#444444"),
-                        markersize=10, capsize=5, elinewidth=2.2, zorder=3,
-                        label=f"System {s}" if f == "I" else None)
-
-    if hline is not None:
-        ax.axhline(hline, color="gray", ls="--", lw=1,
-                   label=f"reference = {hline:g}")
-    # Secondary legend mapping each finger to its dedicated error-line colour.
-    finger_handles = [Line2D([0], [0], color=_FINGER_COLORS.get(f, "#444444"),
-                             lw=2.2, label=f"{f} ({FINGER_FULLNAMES[f]})")
-                      for f in FINGER_LEVELS]
-    ax.set_xticks(list(x_base.values()))
-    ax.set_xticklabels([f"{f}\n({FINGER_FULLNAMES[f]})" for f in FINGER_LEVELS])
-    ax.set_xlabel("Finger")
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    sys_legend = ax.legend(frameon=False, loc="upper left", title="circle = system")
-    ax.add_artist(sys_legend)
-    ax.legend(handles=finger_handles, frameon=False, loc="upper right",
-              title="line = finger", fontsize=8)
-    sns.despine(ax=ax)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    return out_path
 
 
-def plot_eight_groups(df: pd.DataFrame, dv: str, ylabel: str, title: str,
-                      out_path: str, hline: Optional[float] = None,
-                      seed: int = RANDOM_SEED):
-    """Exploratory 8-group figure: points + mean +/- 95% CI per Group8."""
-    work = analysis_frame(df, dv)
-    work["Group8"] = work["System"] + "_" + work["Finger"]
-    order = [f"{s}_{f}" for s in SYSTEM_LEVELS for f in FINGER_LEVELS]
-    rng = np.random.default_rng(seed)
-    fig, ax = plt.subplots(figsize=(9, 5))
-    for i, grp in enumerate(order):
-        vals = work[work["Group8"] == grp][dv].to_numpy()
-        s, f = grp.split("_")[0], grp.split("_")[1]
-        jitter = (rng.random(len(vals)) - 0.5) * 0.18
-        ax.scatter(np.full(len(vals), i) + jitter, vals,
-                   color=_SYS_COLORS[s], alpha=0.35, s=22,
-                   edgecolors="none", zorder=2)
-        m, h = _mean_ci(vals)
-        # Circle filled by SYSTEM colour; error line in this FINGER's colour.
-        ax.errorbar(i, m, yerr=h, fmt="o",
-                    mfc=_SYS_COLORS[s], mec="black", markeredgewidth=0.6,
-                    ecolor=_FINGER_COLORS.get(f, "#444444"),
-                    markersize=10, capsize=5, elinewidth=2.2, zorder=3)
-    if hline is not None:
-        ax.axhline(hline, color="gray", ls="--", lw=1)
-    ax.set_xticks(range(len(order)))
-    ax.set_xticklabels(order, rotation=45, ha="right")
-    ax.set_xlabel("Combined System_Finger group (EXPLORATORY)")
-    ax.set_ylabel(ylabel)
-    ax.set_title(title + "\n(EXPLORATORY: ignores repeated measures)")
-    sns.despine(ax=ax)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    return out_path
 
 
-def plot_contrasts(contrast_df: pd.DataFrame, dv: str, ylabel: str,
-                   title: str, out_path: str):
-    """Planned-contrast figure: L - N per finger with 95% CI + Holm sig."""
-    fig, ax = plt.subplots(figsize=(8, 5))
-    x = range(len(contrast_df))
-    diffs = contrast_df["diff_L_minus_N"].to_numpy()
-    lo = contrast_df["CI95_low"].to_numpy()
-    hi = contrast_df["CI95_high"].to_numpy()
-    # One point per finger, drawn in that finger's dedicated colour.
-    for i, (_, row) in enumerate(contrast_df.iterrows()):
-        col = _FINGER_COLORS.get(str(row["Finger"]), "#2c3e50")
-        ax.errorbar(i, diffs[i], yerr=[[diffs[i] - lo[i]], [hi[i] - diffs[i]]],
-                    fmt="o", color=col, markersize=10, capsize=6, lw=2,
-                    elinewidth=2.2, markeredgecolor="black")
-    ax.axhline(0, color="gray", ls="--", lw=1)
-    for i, (_, row) in enumerate(contrast_df.iterrows()):
-        if row.get("sig_holm", False):
-            top = max(hi[i], 0) + 0.04 * (np.nanmax(hi) - np.nanmin(lo) + 1)
-            ax.annotate("*", (i, top), ha="center", fontsize=18,
-                        color="black")
-    ax.set_xticks(list(x))
-    ax.set_xticklabels([f"{r.Finger}\n({r.Finger_name})"
-                        for _, r in contrast_df.iterrows()])
-    ax.set_xlabel("Finger")
-    ax.set_ylabel(ylabel + "  (L - N)")
-    ax.set_title(title + "\n(* = Holm-corrected p < 0.05)")
-    sns.despine(ax=ax)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    return out_path
+
+
+
+
+
+
+
+
+
+
+
 
 
 # --------------------------------------------------------------------------- #
 # Reporting helpers
 # --------------------------------------------------------------------------- #
 
-METHODS_TEXT = textwrap.dedent("""\
-    METHODS (psychophysics statistics)
-    ----------------------------------
-    Task and response coding. Participants performed a two-alternative
-    forced-choice (2AFC) stiffness-discrimination task. On each trial a
-    standard stimulus (S = 85) was compared with one of eight comparison
-    stimuli (25, 40, 55, 70, 100, 115, 130, 145); the predictor was the
-    signed difference delta = C - 85. The binary response was coded y = 1 if
-    and only if the participant judged the COMPARISON to be stiffer than the
-    standard (this is not correct/incorrect, not side, not order, and not the
-    physical ground truth). This coding was performed upstream.
-
-    Psychometric model. For each subject and finger a lapse-aware yes/no-style
-    psychometric function with four fitted parameters (mu, scale, lapse_low,
-    lapse_high) was fitted upstream (these fits are frozen and were NOT
-    recomputed here). This is not a textbook 2AFC percent-correct model with a
-    fixed guess rate; it models the probability that the participant judged the
-    comparison stiffer than the standard, P(y=1) = lapse_low +
-    (1 - lapse_low - lapse_high) * F(delta; mu, scale), where delta = C - 85 and
-    F is a monotonic sigmoid. Fits used psignifit when installed and otherwise a
-    custom lapse-aware fallback fitter; the fitter used for each fit is recorded
-    in the data.
-
-    Derived measures. From each fit we used two summary measures (the fit is in
-    comparison-stiffness units, so these are equivalent to delta-space): the
-    Bias, defined as the point of subjective equality minus the standard
-    (Bias = PSE - 85, the delta at P(y=1) = 0.5; a value of 0 indicates no
-    perceptual shift), and the JND, defined as (x75 - x25)/2 where x25 and x75
-    are the comparison values at which the curve reaches 0.25 and 0.75 (a
-    measure of sensitivity, where smaller values indicate finer
-    discrimination). Because of the lapse parameters, x25 and x75 are estimable
-    only if 0.25 and 0.75 lie within the attainable range
-    [lapse_low, 1 - lapse_high]; when they do not, the upstream fitter returns a
-    NaN JND with a fit warning, so a non-estimable JND is flagged rather than
-    silently treated as valid.
-
-    Design. System (L vs N) was a between-subjects factor: each participant
-    used exactly one system. Finger (I, M, P, R) was a within-subjects
-    (repeated-measures) factor, with all four fingers measured in every
-    subject. Subject served as the repeated-measures unit.
-
-    Main analysis. Bias and JND were each analysed with a mixed-design
-    analysis of variance with System as the between-subjects factor and Finger
-    as the within-subjects factor, testing the main effect of System, the main
-    effect of Finger, and the System x Finger interaction. Sphericity of the
-    Finger factor was assessed with Mauchly's test and, where appropriate, the
-    Greenhouse-Geisser correction was applied. Partial eta-squared (np2) and
-    generalized eta-squared (ges) are reported as effect sizes.
-
-    Why a mixed-design ANOVA and not an ordinary two-way ANOVA. An ordinary
-    independent two-way ANOVA assumes that all observations are independent.
-    Because the four finger measurements were obtained from the same subject,
-    they are correlated (repeated measures); treating them as independent would
-    violate the independence assumption and mis-estimate the error term. We
-    therefore used the mixed-design model, which correctly partitions
-    between-subject and within-subject variance.
-
-    Exploratory analysis. As a descriptive supplement we also ran a one-way
-    ANOVA across the eight combined System x Finger groups. This exploratory
-    analysis treats the eight cells as independent groups and does NOT model
-    the repeated-measures structure; it is reported for completeness only and
-    is not the basis for inference.
-
-    Planned contrasts. The L-vs-N system difference was tested within each
-    finger using independent (between-subjects) t-tests, with Holm correction
-    across the four finger comparisons.
-
-    Robustness. Confidence intervals for cell means and for the L - N
-    difference per finger were additionally estimated with a subject-level
-    bootstrap (subjects resampled with replacement within each system, keeping
-    each subject's four finger rows together; fixed random seed).
-    """)
 
 
 def get_p(row_or_df, prefer=("p_unc", "p-unc", "p_GG_corr")):
@@ -1084,6 +1024,22 @@ def _fmt_p(p) -> str:
     return "< .001" if p < 0.001 else f"{p:.3f}"
 
 
+def _render_context() -> RenderContext:
+    """Bind rendering helpers to this module's validated analysis functions."""
+    return RenderContext(
+        system_levels=tuple(SYSTEM_LEVELS),
+        finger_levels=tuple(FINGER_LEVELS),
+        finger_fullnames=FINGER_FULLNAMES,
+        random_seed=RANDOM_SEED,
+        jnd_extreme_threshold=JND_EXTREME_THRESHOLD,
+        analysis_frame=analysis_frame,
+        get_p=get_p,
+        fmt_p=_fmt_p,
+        ensure_dirs=_ensure_dirs,
+        owa=owa,
+    )
+
+
 def build_report(validation: ValidationReport,
                  results: dict) -> str:
     """Assemble the full methods + results text report from computed results.
@@ -1096,7 +1052,7 @@ def build_report(validation: ValidationReport,
     lines.append("# (mixed-design ANOVA pipeline; additive, fits not recomputed)")
     lines.append("#" * 72)
     lines.append("")
-    lines.append(f"Source data (frozen copy): {results.get('data_path','')}")
+    lines.append(f"Source data:               {results.get('data_path','')}")
     lines.append(f"Documented provenance:     {SOURCE_DATA_PATH}")
     lines.append(f"Random seed (all stochastic steps): {RANDOM_SEED}")
     lines.append("")
@@ -1116,7 +1072,7 @@ def build_report(validation: ValidationReport,
                          f"{int(r['n_total'])}")
         lines.append("")
 
-    for dv in ["Bias", "JND"]:
+    for dv in DEPENDENT_VARS:
         lines.append("=" * 72)
         lines.append(f"RESULTS  --  {dv}")
         lines.append("=" * 72)
@@ -1223,7 +1179,7 @@ def build_report(validation: ValidationReport,
         for system in oneway["systems"]:
             res = oneway["results"].get(system, {})
             lines.append(f"System {system}:")
-            for dv in ("Bias", "JND"):
+            for dv in DEPENDENT_VARS:
                 a = res.get("anova", {}).get(dv, {})
                 fr = res.get("friedman", {}).get(dv, {})
                 f_val = a.get("F", np.nan)
@@ -1246,6 +1202,39 @@ def build_report(validation: ValidationReport,
         lines.append(f"   {oneway['note']}")
         lines.append("")
 
+    lines.append("=" * 72)
+    lines.append("THESIS DISCUSSION NOTE: MAIN INTERPRETATION FIGURE")
+    lines.append("=" * 72)
+    lines.append("Main thesis figure: the L+N pooled visualization by finger.")
+    lines.append("   Bias figure: mixed_design/bias/figures/"
+                 "<cohort>__pooled_LplusN_by_finger.png")
+    lines.append("   JND figure:  mixed_design/jnd/figures/"
+                 "<cohort>__pooled_LplusN_by_finger.png")
+    lines.append("")
+    lines.append("Short interpretation for the thesis discussion:")
+    lines.append("   - Exploratory one-way ANOVA: implemented only as a first/"
+                 "didactic attempt. It is not relevant for scientific "
+                 "interpretation because it does not model Finger as repeated "
+                 "within subject and System as a between-subject factor.")
+    lines.append("   - Mixed-design ANOVA: relevant confirmatory statistics. "
+                 "For the current L+N dataset, it did not find statistically "
+                 "significant evidence for a System effect, Finger effect, or "
+                 "System x Finger interaction for either Bias or JND. This "
+                 "should be stated as no significant evidence for a difference, "
+                 "not as proof that systems or fingers are identical.")
+    lines.append("   - L+N pooled visualization: main relevant thesis figure. "
+                 "L subjects remain pink, N subjects remain purple, the black "
+                 "point/CI shows the pooled mean +/- 95% CI, and the "
+                 "finger-coloured rectangle shows the pooled median value.")
+    lines.append("   - L-N planned contrasts and bootstrap L-N plots: retained "
+                 "as supplementary checks, but not the main discussion focus "
+                 "because the thesis presentation should emphasize L and N "
+                 "together rather than the L-N difference.")
+    lines.append("   - Supervisor-approved success-rate filter: relevant only as "
+                 "a sensitivity check. Older JND/PSE magnitude filters are not "
+                 "relevant and should not be interpreted.")
+    lines.append("")
+
     lines.append("#" * 72)
     lines.append("# END OF REPORT")
     lines.append("#" * 72)
@@ -1261,75 +1250,8 @@ def build_report(validation: ValidationReport,
 # publication-style PNG tables alongside the existing figures. A significant
 # row (p < .05) is shaded so the eye lands on it immediately.
 
-_TABLE_HEADER_BG = "#2c3e50"
-_TABLE_HEADER_FG = "white"
-_TABLE_ROW_ALT = "#f4f6f8"
-_TABLE_SIG_BG = "#ffe3b3"  # warm highlight for significant rows
 
 
-def dataframe_to_image(df: pd.DataFrame, out_path: str,
-                       title: Optional[str] = None,
-                       sig_mask: Optional[np.ndarray] = None,
-                       fontsize: int = 10,
-                       col_scale: float = 1.0) -> str:
-    """Render a (small) DataFrame as a formatted table image and save to PNG.
-
-    Parameters
-    ----------
-    df : the table to render. Values are stringified as-is (format upstream).
-    out_path : PNG path to write.
-    title : optional title drawn above the table.
-    sig_mask : optional boolean array (len == n rows). True rows are shaded
-        with the "significant" highlight colour.
-    """
-    data = df.copy()
-    for c in data.columns:
-        data[c] = data[c].map(lambda v: "" if (isinstance(v, float) and
-                                                np.isnan(v)) else str(v))
-    n_rows, n_cols = data.shape
-
-    # Column widths proportional to the longest string (header or cell).
-    col_chars = []
-    for c in data.columns:
-        longest = max([len(str(c))] + [len(v) for v in data[c]])
-        col_chars.append(max(longest, 4))
-    total_chars = sum(col_chars)
-    fig_w = max(6.0, 0.14 * total_chars * col_scale)
-    fig_h = max(1.4, 0.45 * (n_rows + 1) + (0.5 if title else 0))
-
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-    ax.axis("off")
-    if title:
-        ax.set_title(title, fontsize=fontsize + 2, fontweight="bold",
-                     loc="left", pad=10)
-
-    tbl = ax.table(cellText=data.values, colLabels=list(data.columns),
-                   cellLoc="center", loc="center",
-                   colWidths=[w / total_chars for w in col_chars])
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(fontsize)
-    tbl.scale(1.0, 1.4)
-
-    for (r, c), cell in tbl.get_cells().items() if hasattr(tbl, "get_cells") \
-            else tbl.get_celld().items():
-        cell.set_edgecolor("#d0d0d0")
-        if r == 0:  # header
-            cell.set_facecolor(_TABLE_HEADER_BG)
-            cell.set_text_props(color=_TABLE_HEADER_FG, fontweight="bold")
-        else:
-            row_idx = r - 1
-            if sig_mask is not None and row_idx < len(sig_mask) \
-                    and bool(sig_mask[row_idx]):
-                cell.set_facecolor(_TABLE_SIG_BG)
-            elif row_idx % 2 == 1:
-                cell.set_facecolor(_TABLE_ROW_ALT)
-            else:
-                cell.set_facecolor("white")
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
 
 
 def _gg_text(row) -> str:
@@ -1340,169 +1262,14 @@ def _gg_text(row) -> str:
     return "-"
 
 
-def mixed_summary_frame(results: dict, key: str = "mixed") -> pd.DataFrame:
-    """Tidy Bias+JND mixed-ANOVA effects table for rendering.
-
-    key : 'mixed' (MAIN) or 'mixed_sensitivity'.
-    """
-    rows = []
-    sig = []
-    for dv in ["Bias", "JND"]:
-        aov = results[key][dv]["aov"]
-        for _, r in aov.iterrows():
-            p = get_p(r)
-            ddof1 = r.get("DF1", r.get("ddof1", ""))
-            ddof2 = r.get("DF2", r.get("ddof2", ""))
-            rows.append({
-                "DV": dv,
-                "Effect": r["Source"],
-                "df": f"{int(ddof1)}, {int(ddof2)}"
-                      if str(ddof1) != "" else "",
-                "F": f"{float(r.get('F', np.nan)):.3f}",
-                "p": _fmt_p(p),
-                "p (GG)": _gg_text(r),
-                "partial eta2": f"{float(r.get('np2', np.nan)):.3f}",
-                "sig": "*" if (np.isfinite(p) and p < 0.05) else "",
-            })
-            sig.append(bool(np.isfinite(p) and p < 0.05))
-    out = pd.DataFrame(rows)
-    out.attrs["sig_mask"] = np.array(sig)
-    return out
 
 
-def descriptives_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """System x Finger mean +/- SD (n) for Bias and JND, wide by System."""
-    rows = []
-    for f in FINGER_LEVELS:
-        row = {"Finger": f"{f} ({FINGER_FULLNAMES[f]})"}
-        for dv in ["Bias", "JND"]:
-            sub = df[df["Finger"] == f]
-            for s in SYSTEM_LEVELS:
-                v = sub.loc[sub["System"] == s, dv].dropna()
-                if len(v):
-                    row[f"{dv} {s} (mean+/-SD, n)"] = (
-                        f"{v.mean():.1f} +/- {v.std(ddof=1):.1f} (n={len(v)})")
-                else:
-                    row[f"{dv} {s} (mean+/-SD, n)"] = "-"
-        rows.append(row)
-    return pd.DataFrame(rows)
 
 
-def contrasts_summary_frame(results: dict) -> pd.DataFrame:
-    """Planned L - N contrasts per finger for Bias and JND, with Holm p."""
-    rows = []
-    sig = []
-    for dv in ["Bias", "JND"]:
-        ct = results["contrasts"][dv]
-        for _, r in ct.iterrows():
-            rows.append({
-                "DV": dv,
-                "Finger": r["Finger"],
-                "mean L": f"{r['mean_L']:.2f}",
-                "mean N": f"{r['mean_N']:.2f}",
-                "diff (L-N)": f"{r['diff_L_minus_N']:.2f}",
-                "95% CI": f"[{r['CI95_low']:.1f}, {r['CI95_high']:.1f}]",
-                "t": f"{r['T']:.2f}",
-                "p (Holm)": _fmt_p(r["p_holm"]),
-                "Cohen d": f"{r['cohen_d']:.2f}",
-                "sig": "*" if bool(r.get("sig_holm", False)) else "",
-            })
-            sig.append(bool(r.get("sig_holm", False)))
-    out = pd.DataFrame(rows)
-    out.attrs["sig_mask"] = np.array(sig)
-    return out
 
 
-def assumption_checks_frame(df: pd.DataFrame, results: dict) -> pd.DataFrame:
-    """Normality (Shapiro), variance homogeneity (Levene), sphericity (Mauchly).
-
-    A compact diagnostics table so the reader can see WHETHER the classical
-    ANOVA assumptions hold for each DV. Shapiro is run on the model residuals
-    (value minus its System x Finger cell mean); Levene compares the two System
-    groups; Mauchly is read from the already-computed mixed-ANOVA result.
-    """
-    rows = []
-    sig = []
-    for dv in ["Bias", "JND"]:
-        work = analysis_frame(df, dv)
-        cell_mean = work.groupby(["System", "Finger"], observed=True)[dv] \
-                        .transform("mean")
-        resid = (work[dv] - cell_mean).to_numpy()
-        try:
-            sh_p = float(stats.shapiro(resid).pvalue)
-        except Exception:
-            sh_p = np.nan
-        l = work.loc[work["System"] == "L", dv].dropna()
-        n = work.loc[work["System"] == "N", dv].dropna()
-        try:
-            lev_p = float(stats.levene(l, n, center="median").pvalue)
-        except Exception:
-            lev_p = np.nan
-        sph = results["mixed"][dv].get("sphericity_note", "")
-        normal_ok = np.isfinite(sh_p) and sh_p >= 0.05
-        var_ok = np.isfinite(lev_p) and lev_p >= 0.05
-        rows.append({
-            "DV": dv,
-            "Normality (Shapiro p)": _fmt_p(sh_p),
-            "Normality OK?": "yes" if normal_ok else "NO",
-            "Equal var (Levene p)": _fmt_p(lev_p),
-            "Equal var OK?": "yes" if var_ok else "NO",
-            "Sphericity (Mauchly)": "met" if "sphericity=met" in sph
-                                    or "='met'" in sph else
-                                    ("VIOLATED" if "VIOLATED" in sph else "-"),
-        })
-        # Flag the row if any assumption fails (draws the eye to problems).
-        sig.append(not (normal_ok and var_ok))
-    out = pd.DataFrame(rows)
-    out.attrs["sig_mask"] = np.array(sig)
-    return out
 
 
-def render_summary_tables(df: pd.DataFrame, results: dict,
-                          out_dir: str) -> dict:
-    """Render all summary tables as PNG images. Returns {name: path}.
-
-    Produces:
-      * mixed_anova_summary.png        - MAIN Bias+JND effects (sig shaded)
-      * mixed_anova_sensitivity.png    - sensitivity (flagged fits removed)
-      * descriptives.png               - System x Finger mean +/- SD (n)
-      * planned_contrasts.png          - L - N per finger, Holm p (sig shaded)
-      * assumption_checks.png          - normality / variance / sphericity
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    paths = {}
-
-    main_tbl = mixed_summary_frame(results, "mixed")
-    paths["mixed_anova_summary"] = dataframe_to_image(
-        main_tbl, os.path.join(out_dir, "mixed_anova_summary.png"),
-        title="MAIN mixed-design ANOVA: System (between) x Finger (within)",
-        sig_mask=main_tbl.attrs.get("sig_mask"))
-
-    sens_tbl = mixed_summary_frame(results, "mixed_sensitivity")
-    paths["mixed_anova_sensitivity"] = dataframe_to_image(
-        sens_tbl, os.path.join(out_dir, "mixed_anova_sensitivity.png"),
-        title="SENSITIVITY mixed-design ANOVA (flagged/degenerate fits removed)",
-        sig_mask=sens_tbl.attrs.get("sig_mask"))
-
-    desc_tbl = descriptives_frame(df)
-    paths["descriptives"] = dataframe_to_image(
-        desc_tbl, os.path.join(out_dir, "descriptives.png"),
-        title="Descriptives: Bias and JND by System x Finger (mean +/- SD)",
-        col_scale=1.15)
-
-    ct_tbl = contrasts_summary_frame(results)
-    paths["planned_contrasts"] = dataframe_to_image(
-        ct_tbl, os.path.join(out_dir, "planned_contrasts.png"),
-        title="Planned contrasts: System L - N within each finger (Holm)",
-        sig_mask=ct_tbl.attrs.get("sig_mask"))
-
-    asm_tbl = assumption_checks_frame(df, results)
-    paths["assumption_checks"] = dataframe_to_image(
-        asm_tbl, os.path.join(out_dir, "assumption_checks.png"),
-        title="ANOVA assumption checks (flagged row = an assumption is violated)",
-        sig_mask=asm_tbl.attrs.get("sig_mask"))
-
-    return paths
 
 
 # --------------------------------------------------------------------------- #
@@ -1510,45 +1277,39 @@ def render_summary_tables(df: pd.DataFrame, results: dict,
 #     subgroups, mirroring the results/ folder architecture per subgroup.
 # --------------------------------------------------------------------------- #
 #
-# Each subgroup EXCLUDES "bad" subjects at a graded strictness, so the analyses
-# read as a sensitivity ladder (loosest -> strictest cleaning). Filtering is at
-# the SUBJECT level: a subject's four finger rows are kept or dropped together,
-# so the repeated-measures design stays balanced. A finger is "bad" if its
-# metric crosses the threshold; the level says HOW MANY bad fingers a subject
-# needs before the whole subject is removed.
+# The supervisor-approved subgroup filter EXCLUDES subjects only when at least
+# three fingers have low psychophysics success. Filtering is at the SUBJECT level:
+# a subject's four finger rows are kept or dropped together, so the repeated-
+# measures design stays balanced. PSE/JND magnitude filters were intentionally
+# removed because they are not appropriate filtering criteria for this analysis.
 
-# Per-finger "bad" thresholds.
-SUCCESS_RATE_THRESHOLD = 0.70   # success rate strictly below this is "bad"
-PSE_SHIFT_THRESHOLD = 100.0     # |PSE - 85| strictly above this is "bad"
-JND_GT_250_THRESHOLD = 250.0    # JND strictly above this is "bad"
-JND_GT_100_THRESHOLD = 100.0    # JND strictly above this is "bad"
+# Per-finger "bad" threshold.
+SUCCESS_RATE_THRESHOLD = 0.55   # success rate strictly below this is "bad"
 
 # Per-finger success (% correct) source. This is READ from the psychophysics
 # pipeline's PRECOMPUTED per-subject x finger success summary - it is NOT
 # recomputed here. (The pipeline already scored every trial and aggregated
 # success_rate = n_correct / n_trials per subject x finger.)
 DEFAULT_SUCCESS_SUMMARY_PATH = os.path.join(
-    PSYCHO_RESULTS_DIR, "success_summary_by_subject_finger.csv"
+    PSYCHO_RESULTS_DIR, SUCCESS_SUMMARY_FILENAME
 )
 
 # (metric_key, human description). Folder name == metric_key.
 SUBGROUP_PLAN = [
-    ("success_lt70", "Per-finger success rate < 70%"),
-    ("pse_shift_gt100", "|PSE - 85| > 100"),
-    ("jnd_gt250", "JND > 250"),
-    ("jnd_gt100", "JND > 100"),
+    ("success_lt55", "Per-finger success rate < 55%"),
 ]
 
 # (level_key, min bad-finger count to EXCLUDE the subject, label).
-# "all_fingers" means every one of the subject's fingers is bad.
 SUBGROUP_LEVELS = [
-    ("all_fingers", "all", "all fingers bad"),
-    ("at_least_2_fingers", 2, ">= 2 fingers bad"),
-    ("at_least_1_finger", 1, ">= 1 finger bad"),
+    ("at_least_3_fingers", 3, ">= 3 fingers below 55% success"),
 ]
 
 
-def load_success_rates(path: Optional[str] = None) -> pd.DataFrame:
+def load_success_rates(
+    path: Optional[str] = None,
+    *,
+    results_root: Optional[str] = None,
+) -> pd.DataFrame:
     """READ the precomputed per-subject x finger success rate (% correct).
 
     This does NOT recompute success - it reads the ``success_rate`` column that
@@ -1558,16 +1319,25 @@ def load_success_rates(path: Optional[str] = None) -> pd.DataFrame:
 
     The live success summary lives under the (large) psychophysics results tree.
     If that file is not available (e.g. Dropbox not synced) an EMPTY frame with
-    the correct columns is returned and a warning is emitted; the ``success_lt70``
+    the correct columns is returned and a warning is emitted; the ``success_lt55``
     subgroup filter is then skipped by ``run_all_subgroups`` rather than crashing
-    the whole pipeline. The metric-on-the-data-frame filters (pse_shift / jnd)
-    are unaffected.
+    the whole pipeline.
     """
-    path = path or DEFAULT_SUCCESS_SUMMARY_PATH
+    if path is None:
+        path = DEFAULT_SUCCESS_SUMMARY_PATH
+    else:
+        try:
+            path = resolve_psychophysics_summary_path(
+                path, filename=SUCCESS_SUMMARY_FILENAME, results_root=results_root
+            )
+        except FileNotFoundError:
+            # Preserve forgiving behaviour for success only: missing success data
+            # skips the success_lt55 subgroup filter.
+            path = os.fspath(path)
     if not os.path.exists(path):
         warnings.warn(
             "Per-finger success summary not found at "
-            f"{path!r}; the success_lt70 subgroup filter will be skipped. "
+            f"{path!r}; the success_lt55 subgroup filter will be skipped. "
             "Re-sync the psychophysics results to enable it.",
             stacklevel=2,
         )
@@ -1579,6 +1349,147 @@ def load_success_rates(path: Optional[str] = None) -> pd.DataFrame:
                           "finger_condition": "Finger",
                           "n_trials": "n_success_trials"})
     return s[["Subject", "Finger", "success_rate", "n_success_trials"]]
+
+
+# --------------------------------------------------------------------------- #
+# Finger-order / fatigue control analysis
+# --------------------------------------------------------------------------- #
+
+FATIGUE_ORDER_FILES = {
+    "finger_by_appearance_order": os.path.join(
+        "finger_time_appearance", "finger_by_appearance_order.csv"),
+    "finger_slope_summary": os.path.join(
+        "finger_time_appearance", "finger_slope_summary.csv"),
+    "finger_slope_contrasts": os.path.join(
+        "finger_time_appearance", "finger_slope_contrasts.csv"),
+    "group_finger_time_bins": os.path.join(
+        "finger_time_appearance", "group_finger_time_bins.csv"),
+    "reaction_time_bins": os.path.join(
+        "time_fatigue", "reaction_time_bins.csv"),
+}
+
+
+def resolve_psychophysics_results_folder(
+    source: Optional[str] = None,
+    *,
+    results_root: Optional[str] = None,
+) -> str:
+    """Resolve an ANOVA source to its psychophysics results folder."""
+    root = os.path.abspath(results_root or PSYCHOPHYSICS_RESULTS_ROOT)
+    if source is None:
+        source = DEFAULT_RESULTS_SELECTION
+    text = os.path.expanduser(os.fspath(source))
+    if os.path.isdir(text):
+        return os.path.abspath(text)
+
+    folder = os.path.join(root, text)
+    if os.path.isdir(folder):
+        return os.path.abspath(folder)
+
+    summary_path = resolve_psychophysics_summary_path(
+        source, results_root=results_root)
+    if os.path.abspath(summary_path).startswith(root):
+        cur = os.path.abspath(os.path.dirname(summary_path))
+        while True:
+            parent = os.path.dirname(cur)
+            if os.path.abspath(parent) == root:
+                return cur
+            if parent == cur:
+                break
+            cur = parent
+    return os.path.abspath(os.path.dirname(summary_path))
+
+
+def _find_fatigue_order_csv(folder: str, rel_path: str) -> Optional[str]:
+    """Find one fatigue/order CSV in common group or subject layouts."""
+    candidates = [
+        os.path.join(folder, "csv", "all", "shared", rel_path),
+        os.path.join(folder, "csv", rel_path),
+        os.path.join(folder, rel_path),
+    ]
+    filename = os.path.basename(rel_path)
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    for dirpath, _, filenames in os.walk(folder):
+        if filename in filenames and os.path.basename(os.path.dirname(
+                os.path.join(dirpath, filename))) == os.path.basename(
+                    os.path.dirname(rel_path)):
+            return os.path.abspath(os.path.join(dirpath, filename))
+    return None
+
+
+def load_fatigue_order_data(
+    source: Optional[str] = None,
+    *,
+    results_root: Optional[str] = None,
+) -> dict:
+    """Read precomputed psychophysics finger-order/time-fatigue CSVs.
+
+    This analysis is intentionally read-only with respect to psychophysics:
+    it does not recompute trial success, reaction time, or psychometric fits.
+    """
+    folder = resolve_psychophysics_results_folder(
+        source, results_root=results_root)
+    tables = {}
+    paths = {}
+    missing = []
+    for key, rel_path in FATIGUE_ORDER_FILES.items():
+        path = _find_fatigue_order_csv(folder, rel_path)
+        if path:
+            paths[key] = path
+            tables[key] = pd.read_csv(path)
+        else:
+            missing.append(key)
+    return {
+        "source": source if source is not None else DEFAULT_RESULTS_SELECTION,
+        "source_folder": folder,
+        "tables": tables,
+        "paths": paths,
+        "missing": missing,
+    }
+
+
+
+
+
+
+
+
+def run_fatigue_order_control(
+    source: Optional[str] = None,
+    *,
+    base_root: str = "results",
+    cohort: Optional[str] = None,
+    results_root: Optional[str] = None,
+) -> dict:
+    """Run the supplementary finger-order/fatigue control section."""
+    cohort = cohort or selected_source_label(source)
+    out_dir = os.path.join(base_root, "fatigue_order", cohort)
+    fatigue = load_fatigue_order_data(source, results_root=results_root)
+    status = "ok" if "finger_slope_summary" in fatigue["tables"] else "skipped"
+    figures = plot_fatigue_order_control(
+        fatigue, out_dir, cohort=cohort, ctx=_render_context())
+    interp = fatigue_order_interpretation(fatigue)
+    _ensure_dirs(out_dir)
+    with open(os.path.join(out_dir, "fatigue_order_interpretation.txt"), "w",
+              encoding="utf-8") as fh:
+        fh.write(interp + "\n")
+        fh.write(f"Source folder: {fatigue['source_folder']}\n")
+        if fatigue["missing"]:
+            fh.write(f"Missing tables: {', '.join(fatigue['missing'])}\n")
+    return {
+        "status": status,
+        "source": fatigue["source"],
+        "source_folder": fatigue["source_folder"],
+        "tables": fatigue["tables"],
+        "paths": fatigue["paths"],
+        "missing": fatigue["missing"],
+        "summary": fatigue_order_summary_frame(fatigue),
+        "figures": figures,
+        "output_dir": out_dir,
+        "interpretation": interp,
+    }
 
 
 def attach_success_rate(df: pd.DataFrame,
@@ -1606,17 +1517,11 @@ def _finger_bad_mask(df: pd.DataFrame, metric: str) -> pd.Series:
     NaN metric values yield False (a non-estimable finger does not, by itself,
     trigger exclusion; such cases are surfaced by the QC report instead).
     """
-    if metric == "success_lt70":
+    if metric == "success_lt55":
         if "success_rate" not in df.columns:
             raise KeyError("success_rate column missing; call "
                            "attach_success_rate() first.")
         return df["success_rate"] < SUCCESS_RATE_THRESHOLD
-    if metric == "pse_shift_gt100":
-        return df["Bias"].abs() > PSE_SHIFT_THRESHOLD
-    if metric == "jnd_gt250":
-        return df["JND"] > JND_GT_250_THRESHOLD
-    if metric == "jnd_gt100":
-        return df["JND"] > JND_GT_100_THRESHOLD
     raise ValueError(f"Unknown subgroup metric: {metric}")
 
 
@@ -1639,31 +1544,6 @@ def build_subgroup(df: pd.DataFrame, metric: str, level: str):
     return kept, excluded, counts
 
 
-def plot_bootstrap_diff(diff_ci: pd.DataFrame, dv: str, out_path: str) -> str:
-    """Bootstrap L - N difference per finger with 95% CI (subgroup-safe)."""
-    fig, ax = plt.subplots(figsize=(8, 5))
-    diff_ci = diff_ci.reset_index(drop=True)
-    # One point per finger, drawn in that finger's dedicated colour.
-    for i, row in diff_ci.iterrows():
-        col = _FINGER_COLORS.get(str(row["Finger"]), "#2c3e50")
-        ax.errorbar(i, row["diff_L_minus_N"],
-                    yerr=[[row["diff_L_minus_N"] - row["ci_low"]],
-                          [row["ci_high"] - row["diff_L_minus_N"]]],
-                    fmt="o", color=col, capsize=6, lw=2, elinewidth=2.2,
-                    markersize=10, markeredgecolor="black")
-    ax.axhline(0, color="gray", ls="--", lw=1)
-    ax.set_xticks(list(range(len(diff_ci))))
-    ax.set_xticklabels([f"{r.Finger}\n({r.Finger_name})"
-                        for _, r in diff_ci.iterrows()])
-    ax.set_xlabel("Finger")
-    ax.set_ylabel(f"{dv}  (L - N)")
-    ax.set_title(f"Bootstrap L - N difference per finger: {dv} "
-                 "(subject-level, 95% CI)")
-    sns.despine(ax=ax)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    return out_path
 
 
 def _ensure_pipeline_dirs(base_root: str, cohort: str) -> dict:
@@ -1693,12 +1573,16 @@ def _ensure_pipeline_dirs(base_root: str, cohort: str) -> dict:
     # Exploratory 8-group and contrasts are folded into mixed_design.
     paths["explo"] = paths["mixed"]
     paths["contr"] = paths["mixed"]
-    for base in ("mixed", "boot"):
-        for sub in ("bias", "jnd"):
-            os.makedirs(os.path.join(paths[base], sub, "csv"), exist_ok=True)
-            os.makedirs(os.path.join(paths[base], sub, "figures"), exist_ok=True)
-    os.makedirs(paths["reports"], exist_ok=True)
-    os.makedirs(paths["tables"], exist_ok=True)
+    _ensure_dirs(
+        paths["reports"],
+        paths["tables"],
+        *(
+            os.path.join(paths[base], sub, leaf)
+            for base in ("mixed", "boot")
+            for sub in ("bias", "jnd")
+            for leaf in ("csv", "figures")
+        ),
+    )
     return paths
 
 
@@ -1706,7 +1590,7 @@ def _pipeline_complete(results: dict) -> bool:
     """True iff every block needed by the report/tables is present for both DVs."""
     for block in ("exploratory", "mixed", "mixed_sensitivity", "contrasts",
                   "bootstrap"):
-        for dv in ("Bias", "JND"):
+        for dv in DEPENDENT_VARS:
             if dv not in results.get(block, {}):
                 return False
     return True
@@ -1727,6 +1611,7 @@ def run_full_pipeline(df: pd.DataFrame, base_root: str, cohort: str, *,
     """
     label = label or cohort
     P = _ensure_pipeline_dirs(base_root, cohort)
+    render_ctx = _render_context()
     notes: list = []
     validation = validate_data(df)
     df_flags = compute_qc_flags(df)
@@ -1741,14 +1626,26 @@ def run_full_pipeline(df: pd.DataFrame, base_root: str, cohort: str, *,
         "label": label,
         "cohort": cohort,
         "qc_summary": qc_summary,
-        "exploratory": {}, "mixed": {}, "mixed_sensitivity": {},
+        "exploratory": {}, "pooled_ln": {},
+        "mixed": {}, "mixed_sensitivity": {},
         "contrasts": {}, "bootstrap": {}, "notes": notes,
         "n_subjects": int(df["Subject"].nunique()),
         "validation": validation,
     }
 
-    for dv in ["Bias", "JND"]:
-        sub = "bias" if dv == "Bias" else "jnd"
+    # Didactic first attempt: run the per-system one-way finger analysis before
+    # the mixed-design ANOVA. It is retained for documentation/reporting, but the
+    # confirmatory model remains the mixed-design ANOVA below.
+    try:
+        results["oneway"] = run_oneway_flat(
+            data_path=results["data_path"],
+            base_root=base_root,
+        )
+    except Exception as exc:
+        notes.append(f"oneway skipped: {exc}")
+
+    for dv in DEPENDENT_VARS:
+        sub = _dv_slug(dv)
 
         # Per-DV sub-folders: mixed_design/<bias|jnd>/{csv,figures}; same for
         # bootstrap. The cohort stays a filename prefix (<cohort>__...).
@@ -1756,45 +1653,49 @@ def run_full_pipeline(df: pd.DataFrame, base_root: str, cohort: str, *,
         mixed_fig = os.path.join(P["mixed"], sub, "figures")
         boot_csv = os.path.join(P["boot"], sub, "csv")
         boot_fig = os.path.join(P["boot"], sub, "figures")
-        for _d in (mixed_csv, mixed_fig, boot_csv, boot_fig):
-            os.makedirs(_d, exist_ok=True)
+        _ensure_dirs(mixed_csv, mixed_fig, boot_csv, boot_fig)
 
         try:
             aov, posthoc = exploratory_one_way(df, dv)
             results["exploratory"][dv] = {"aov": aov, "posthoc": posthoc}
-            aov.to_csv(os.path.join(
+            _write_csv(aov, os.path.join(
                 mixed_csv,
-                f"{cohort}__exploratory_oneway_anova.csv"), index=False)
-            posthoc.to_csv(os.path.join(
+                f"{cohort}__exploratory_oneway_anova.csv"))
+            _write_csv(posthoc, os.path.join(
                 mixed_csv,
-                f"{cohort}__exploratory_oneway_posthoc_holm.csv"),
-                index=False)
+                f"{cohort}__exploratory_oneway_posthoc_holm.csv"))
         except Exception as exc:
             notes.append(f"exploratory[{dv}] skipped: {exc}")
 
         try:
+            pooled_desc = pooled_ln_descriptives(df, dv, ctx=render_ctx)
+            results["pooled_ln"][dv] = {"desc": pooled_desc}
+            _write_csv(pooled_desc, os.path.join(
+                mixed_csv, f"{cohort}__pooled_LplusN_descriptives.csv"))
+        except Exception as exc:
+            notes.append(f"pooled_ln[{dv}] skipped: {exc}")
+
+        try:
             results["mixed"][dv] = mixed_anova(df, dv, drop_flagged=False)
-            results["mixed"][dv]["aov"].to_csv(os.path.join(
-                mixed_csv, f"{cohort}__mixed_anova_main.csv"),
-                index=False)
+            _write_csv(results["mixed"][dv]["aov"], os.path.join(
+                mixed_csv, f"{cohort}__mixed_anova_main.csv"))
         except Exception as exc:
             notes.append(f"mixed[{dv}] skipped: {exc}")
 
         try:
             results["mixed_sensitivity"][dv] = mixed_anova(
                 df, dv, drop_flagged=True)
-            results["mixed_sensitivity"][dv]["aov"].to_csv(os.path.join(
-                mixed_csv, f"{cohort}__mixed_anova_sensitivity.csv"),
-                index=False)
+            _write_csv(results["mixed_sensitivity"][dv]["aov"], os.path.join(
+                mixed_csv, f"{cohort}__mixed_anova_sensitivity.csv"))
         except Exception as exc:
             notes.append(f"mixed_sensitivity[{dv}] skipped: {exc}")
 
         try:
             ct = planned_contrasts(df, dv, drop_flagged=False)
             results["contrasts"][dv] = ct
-            ct.to_csv(os.path.join(
+            _write_csv(ct, os.path.join(
                 mixed_csv,
-                f"{cohort}__planned_contrasts_L_vs_N.csv"), index=False)
+                f"{cohort}__planned_contrasts_L_vs_N.csv"))
         except Exception as exc:
             notes.append(f"contrasts[{dv}] skipped: {exc}")
 
@@ -1802,12 +1703,10 @@ def run_full_pipeline(df: pd.DataFrame, base_root: str, cohort: str, *,
             cell_ci, diff_ci = bootstrap_cis(df, dv, n_boot=n_bootstrap,
                                              seed=seed, drop_flagged=False)
             results["bootstrap"][dv] = {"cell": cell_ci, "diff": diff_ci}
-            cell_ci.to_csv(os.path.join(
-                boot_csv, f"{cohort}__bootstrap_cell_means.csv"),
-                index=False)
-            diff_ci.to_csv(os.path.join(
-                boot_csv, f"{cohort}__bootstrap_LminusN_diff.csv"),
-                index=False)
+            _write_csv(cell_ci, os.path.join(
+                boot_csv, f"{cohort}__bootstrap_cell_means.csv"))
+            _write_csv(diff_ci, os.path.join(
+                boot_csv, f"{cohort}__bootstrap_LminusN_diff.csv"))
         except Exception as exc:
             notes.append(f"bootstrap[{dv}] skipped: {exc}")
 
@@ -1818,23 +1717,32 @@ def run_full_pipeline(df: pd.DataFrame, base_root: str, cohort: str, *,
                     df, dv, dv, f"Exploratory: {dv} by System_Finger group",
                     os.path.join(mixed_fig,
                                  f"{cohort}__exploratory_8group.png"),
-                    hline=hline)
+                    ctx=render_ctx, hline=hline)
                 plot_dv_by_finger(
                     df, dv, hline, dv,
                     f"{dv} by Finger and System (mean +/- 95% CI)",
                     os.path.join(mixed_fig,
-                                 f"{cohort}__by_finger_system.png"))
+                                 f"{cohort}__by_finger_system.png"),
+                    ctx=render_ctx)
+                plot_pooled_ln_by_finger(
+                    df, dv, hline, dv,
+                    f"{dv} by Finger, L+N pooled visualization",
+                    os.path.join(mixed_fig,
+                                 f"{cohort}__pooled_LplusN_by_finger.png"),
+                    ctx=render_ctx)
                 if dv in results["contrasts"] and len(results["contrasts"][dv]):
                     plot_contrasts(
                         results["contrasts"][dv], dv, dv,
                         f"Planned contrast: {dv} difference (L - N) per finger",
                         os.path.join(mixed_fig,
-                                     f"{cohort}__planned_contrast.png"))
+                                     f"{cohort}__planned_contrast.png"),
+                        ctx=render_ctx)
                 if dv in results["bootstrap"]:
                     plot_bootstrap_diff(
                         results["bootstrap"][dv]["diff"], dv,
                         os.path.join(boot_fig,
-                                     f"{cohort}__bootstrap_LminusN.png"))
+                                     f"{cohort}__bootstrap_LminusN.png"),
+                        ctx=render_ctx)
             except Exception as exc:
                 notes.append(f"figures[{dv}] skipped: {exc}")
 
@@ -1854,7 +1762,12 @@ def run_full_pipeline(df: pd.DataFrame, base_root: str, cohort: str, *,
             notes.append(f"report skipped: {exc}")
         try:
             results["table_images"] = render_summary_tables(
-                df, results, P["tables"])
+                df, results, P["tables"], ctx=render_ctx)
+            if "oneway" in results:
+                oneway_table = render_oneway_summary_table(
+                    results["oneway"], P["tables"], ctx=render_ctx)
+                if oneway_table:
+                    results["table_images"]["oneway_per_system_summary"] = oneway_table
         except Exception as exc:
             notes.append(f"summary tables skipped: {exc}")
     else:
@@ -2029,75 +1942,8 @@ def run_oneway_flat(data_path: Optional[str] = None,
     return out
 
 
-def oneway_summary_frame(oneway_res: dict) -> pd.DataFrame:
-    """Tidy System x DV x test summary for the oneway table image.
-
-    Built from the per-system test_summary frames returned by run_oneway_flat.
-    """
-    rows = []
-    sig = []
-    for system in oneway_res.get("systems", []):
-        ts = oneway_res["test_summaries"].get(system)
-        if ts is None:
-            continue
-        for _, r in ts.iterrows():
-            p = r.get("p_value", np.nan)
-            stat = r.get("statistic", np.nan)
-            es = r.get("effect_size", np.nan)
-            try:
-                p = float(p)
-            except (TypeError, ValueError):
-                p = np.nan
-            rows.append({
-                "System": system,
-                "DV": r.get("dv", ""),
-                "Test": r.get("test", ""),
-                f"{r.get('statistic_name', 'stat')}": (
-                    f"{float(stat):.3f}" if np.isfinite(
-                        float(stat) if stat == stat else np.nan) else "-"),
-                "p": _fmt_p(p),
-                "effect": (f"{float(es):.3f}"
-                           if (es == es and es is not None) else "-"),
-                "n": ("" if r.get("n") is None or not (r.get("n") == r.get("n"))
-                      else int(r.get("n"))),
-            })
-            sig.append(bool(np.isfinite(p) and p < 0.05))
-    # statistic_name varies (F vs chi_square); normalise to one column.
-    norm = []
-    for r in rows:
-        stat_val = r.pop("F", None)
-        if stat_val is None:
-            stat_val = r.pop("chi_square", None)
-        # Any leftover statistic-named key.
-        for k in list(r.keys()):
-            if k not in ("System", "DV", "Test", "p", "effect", "n",
-                         "statistic"):
-                if stat_val is None:
-                    stat_val = r.pop(k)
-                else:
-                    r.pop(k)
-        r["statistic"] = stat_val if stat_val is not None else "-"
-        norm.append({"System": r["System"], "DV": r["DV"], "Test": r["Test"],
-                     "statistic": r["statistic"], "p": r["p"],
-                     "effect": r["effect"], "n": r["n"]})
-    out = pd.DataFrame(norm)
-    out.attrs["sig_mask"] = np.array(sig)
-    return out
 
 
-def render_oneway_summary_table(oneway_res: dict, out_dir: str) -> Optional[str]:
-    """Render the one-way per-system summary as a PNG table. Returns its path."""
-    if not oneway_res.get("systems"):
-        return None
-    os.makedirs(out_dir, exist_ok=True)
-    tbl = oneway_summary_frame(oneway_res)
-    if tbl.empty:
-        return None
-    return dataframe_to_image(
-        tbl, os.path.join(out_dir, "oneway_per_system_summary.png"),
-        title="One-way per-system (finger) analysis: ANOVA (F) + Friedman "
-              "(chi2) by System x DV",
-        sig_mask=tbl.attrs.get("sig_mask"))
 
 
 def subgroup_master_frame(rows: list) -> pd.DataFrame:
@@ -2109,7 +1955,7 @@ def subgroup_master_frame(rows: list) -> pd.DataFrame:
 def _effect_p_row(res: dict) -> dict:
     """Pull System/Finger/Interaction p (Bias & JND) from a results dict."""
     out = {}
-    for dv in ("Bias", "JND"):
+    for dv in DEPENDENT_VARS:
         aov = res.get("mixed", {}).get(dv, {}).get("aov")
         for eff in ("System", "Finger", "Interaction"):
             val = np.nan
@@ -2140,9 +1986,9 @@ def run_all_subgroups(df: pd.DataFrame, base_root: str = "results", *,
     """
     work = df if "success_rate" in df.columns else attach_success_rate(
         df, success_rates)
-    os.makedirs(base_root, exist_ok=True)
+    _ensure_dirs(base_root)
 
-    # If success rates are unavailable (success_rate all NaN), the success_lt70
+    # If success rates are unavailable (success_rate all NaN), the success_lt55
     # filter cannot be evaluated; skip it (with a note) rather than crash.
     success_available = ("success_rate" in work.columns
                          and bool(work["success_rate"].notna().any()))
@@ -2163,17 +2009,17 @@ def run_all_subgroups(df: pd.DataFrame, base_root: str = "results", *,
         rows.append(raw_row)
 
     for metric, desc in SUBGROUP_PLAN:
-        if metric == "success_lt70" and not success_available:
+        if metric == "success_lt55" and not success_available:
             # No success data: record a single skip note for this filter.
             for level, _min, level_label in SUBGROUP_LEVELS:
                 cohort = f"{metric}__{level}"
                 reports_dir = os.path.join(base_root, "report", cohort)
-                os.makedirs(reports_dir, exist_ok=True)
+                _ensure_dirs(reports_dir)
                 with open(os.path.join(reports_dir, "SKIPPED.txt"), "w",
                           encoding="utf-8") as fh:
                     fh.write(f"Cohort {cohort} skipped: per-finger success "
                              "summary unavailable (psychophysics results not "
-                             "synced); success_lt70 filter cannot be "
+                             "synced); success_lt55 filter cannot be "
                              "evaluated.\n")
                 row = {
                     "cohort": cohort, "filter": metric, "filter_desc": desc,
@@ -2181,7 +2027,7 @@ def run_all_subgroups(df: pd.DataFrame, base_root: str = "results", *,
                     "n_subjects": np.nan, "n_L": np.nan, "n_N": np.nan,
                     "status": "skipped_no_success_data",
                 }
-                for dv in ("Bias", "JND"):
+                for dv in DEPENDENT_VARS:
                     for eff in ("System", "Finger", "Interaction"):
                         row[f"{dv}_{eff}_p"] = np.nan
                 rows.append(row)
@@ -2191,7 +2037,7 @@ def run_all_subgroups(df: pd.DataFrame, base_root: str = "results", *,
             kept, excluded, counts = build_subgroup(work, metric, level)
             cohort = f"{metric}__{level}"
             reports_dir = os.path.join(base_root, "report", cohort)
-            os.makedirs(reports_dir, exist_ok=True)
+            _ensure_dirs(reports_dir)
 
             kept_subjects = kept.drop_duplicates("Subject")
             n_subj = int(kept["Subject"].nunique())
@@ -2216,7 +2062,7 @@ def run_all_subgroups(df: pd.DataFrame, base_root: str = "results", *,
 
             if n_subj < min_subjects or (per_sys < min_per_system).any():
                 row["status"] = "skipped_too_small"
-                for dv in ("Bias", "JND"):
+                for dv in DEPENDENT_VARS:
                     for eff in ("System", "Finger", "Interaction"):
                         row[f"{dv}_{eff}_p"] = np.nan
                 with open(os.path.join(reports_dir, "SKIPPED.txt"), "w",
@@ -2279,3 +2125,6 @@ def run_all_subgroups(df: pd.DataFrame, base_root: str = "results", *,
         sig_mask=sig, col_scale=1.25, fontsize=9)
 
     return master, all_results
+
+
+# --------------------------------------------------------------------------- #

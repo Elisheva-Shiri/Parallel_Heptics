@@ -394,7 +394,10 @@ def plot_dv_by_finger(df: pd.DataFrame, dv: str, system: str, desc: pd.DataFrame
     means = [desc.loc[desc.finger == f, "mean"].values[0] if (desc.finger == f).any() else np.nan for f in fingers]
     lo = [desc.loc[desc.finger == f, "ci95_lower"].values[0] if (desc.finger == f).any() else np.nan for f in fingers]
     hi = [desc.loc[desc.finger == f, "ci95_upper"].values[0] if (desc.finger == f).any() else np.nan for f in fingers]
-    err = np.array([[m - l for m, l in zip(means, lo)], [h - m for m, h in zip(means, hi)]])
+    err = np.array([
+        [mean - lower for mean, lower in zip(means, lo)],
+        [upper - mean for mean, upper in zip(means, hi)],
+    ])
     colors = [_FINGER_COLORS.get(f, "#888888") for f in fingers]
     ax.bar(x, means, yerr=err, capsize=5, color=colors, alpha=0.55,
            edgecolor="black", linewidth=0.8, zorder=2)
@@ -436,7 +439,8 @@ def plot_posthoc_matrix(posthoc: pd.DataFrame, dv: str, system: str, fingers: li
     fig, ax = plt.subplots(figsize=(5.2, 4.4))
     cmap = plt.get_cmap("RdYlGn_r")
     im = ax.imshow(np.ma.masked_invalid(mat), cmap=cmap, vmin=0, vmax=0.1)
-    ax.set_xticks(range(n)); ax.set_yticks(range(n))
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
     ax.set_xticklabels([FINGER_LABELS.get(f, f) for f in fingers])
     ax.set_yticklabels([FINGER_LABELS.get(f, f) for f in fingers])
     for i in range(n):
