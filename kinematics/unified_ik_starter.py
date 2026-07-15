@@ -11,9 +11,10 @@ Frozen design choices from the user
    - left:  P2_left = rotate (P1 -> Pm) by +120 deg in XY
 
 2) phi2 definition:
-   - use the angle of vector (P2 -> P1) for all legs, this becomes the same practical rule
-   - phi2 = atan2(y1 - yPm, x1 - xPm)
-   - for the top leg, since P2_top = Pm
+   - use the angle of vector (P2 -> P1) for every leg
+   - phi2 = atan2(y1 - y2, x1 - x2)
+   - for the top leg only, P2_top = Pm, so this is also:
+         phi2_top = atan2(y1 - yPm, x1 - xPm)
 
 3) phi3 definition:
    - use the interior triangle angle from vectors for all legs:
@@ -27,6 +28,20 @@ Frozen design choices from the user
        phi6 = atan2(z3 - zp, y3 - yp)
 
 5) historical d4 is renamed to d2.
+
+6) P3 construction and branch selection:
+   - P3 is constrained to the same horizontal plane as P2:
+         z3 = z2
+   - P3 candidates are computed from:
+         circle centered at P2 with radius d2 in plane z = z2
+         sphere centered at Pb with radius d3
+     This is implemented as a circle-circle intersection in XY, where the
+     Pb sphere contributes an effective XY radius:
+         rb = sqrt(d3^2 - (z2 - zp)^2)
+   - If there are two valid P3 candidates, select the branch with the smallest
+     weighted squared angular distance from previous_angles; if unavailable,
+     use rest_angles; if neither is provided, the first geometric candidate is
+     selected.
 
 Design intent
 -------------
@@ -135,9 +150,9 @@ def default_model() -> Dict[str, Any]:
             "left":  (-12.10, -10.86, 0.0),
         },
         "lengths": {
-            "d1": 4.11,
+            "d1": 4.00,
             "d2": 11.0,   # renamed from historical d4
-            "d3": 9.40,
+            "d3": 9.50,
         },
         "branch_weights": {
             "phi2": 1.0,
@@ -389,10 +404,12 @@ def solve_all_legs(
 
 
 if __name__ == "__main__":
-    P1 = (0.0, 0.0, 9.62)
+    demo_model = default_model()
+    demo_z = min(6.0, demo_model["lengths"]["d3"] - 0.1)
+    P1 = (0.0, 0.0, demo_z)
     phi1 = math.pi / 2.0
 
-    result = solve_all_legs(P1, phi1)
+    result = solve_all_legs(P1, phi1, model=demo_model)
 
     for leg in ("top", "right", "left"):
         print(f"\n--- {leg.upper()} ---")

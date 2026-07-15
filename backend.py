@@ -6,7 +6,7 @@ from pathlib import Path
 import math
 import signal
 import subprocess
-from time import sleep
+from time import sleep, monotonic
 import cv2
 import threading
 from typing import Literal, Optional
@@ -241,6 +241,18 @@ class Experiment:
         self._top_camera_capture: cv2.VideoCapture | None = None
         self._side_camera_capture: cv2.VideoCapture | None = None
 
+        # Actual FPS / capture dimensions reported by each camera after the
+        # driver has applied (or rejected) the values we requested via
+        # cap.set(...). These are populated by _configure_camera and used to
+        # drive video writers and frame-rate throttling so the saved MP4 plays
+        # back at real time even when a camera ignores our requested FPS.
+        self._top_camera_fps: float | None = None
+        self._side_camera_fps: float | None = None
+        self._top_capture_width: int = top_width
+        self._top_capture_height: int = top_height
+        self._side_capture_width: int = side_width
+        self._side_capture_height: int = side_height
+
         # Frame queues for recording
         self._top_frame_queue = Queue(maxsize=30)
         self._side_frame_queue = Queue(maxsize=30)
@@ -292,8 +304,8 @@ class Experiment:
         self._running = True
 
         # Camera indices
-        self.TOP_CAMERA = 1
-        self.SIDE_CAMERA = 0
+        self.TOP_CAMERA = 0
+        self.SIDE_CAMERA = 1
         
         # Video writers
         self._top_writer = None
@@ -426,14 +438,41 @@ class Experiment:
                 return candidate_top, candidate_side
             index += 1
 
+    def _get_recording_fps(self) -> float:
+        """FPS used by the video writers.
+
+        We anchor on the side camera because the user reports it runs slower
+        than the top camera, and saving both videos at that lower rate (with
+        matching frame throttling on the top camera) produces playable MP4
+        files at real-time speed. If the side camera is disabled or has not
+        reported its FPS yet, we fall back to the top camera's actual FPS, and
+        finally to the requested ``camera_fps``.
+        """
+        if not self._side_camera_off and self._side_camera_fps:
+            return self._side_camera_fps
+        if self._top_camera_fps:
+            return self._top_camera_fps
+        return float(self._camera_fps)
+
     def _initialize_writers(self) -> None:
         # Initialize video writers for this pair
         if RECORDING_DATA:
             top_path, side_path = self._next_video_filenames()
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self._top_writer = cv2.VideoWriter(str(top_path), fourcc, self._camera_fps, (self._top_width, self._top_height))
+            recording_fps = self._get_recording_fps()
+            top_size = (self._top_capture_width, self._top_capture_height)
+            self._top_writer = cv2.VideoWriter(str(top_path), fourcc, recording_fps, top_size)
+            print(
+                f"Top video writer: {top_path.name} "
+                f"@ {recording_fps:.2f} fps, size {top_size[0]}x{top_size[1]}"
+            )
             if not self._side_camera_off:
-                self._side_writer = cv2.VideoWriter(str(side_path), fourcc, self._camera_fps, (self._top_width, self._top_height))
+                side_size = (self._side_capture_width, self._side_capture_height)
+                self._side_writer = cv2.VideoWriter(str(side_path), fourcc, recording_fps, side_size)
+                print(
+                    f"Side video writer: {side_path.name} "
+                    f"@ {recording_fps:.2f} fps, size {side_size[0]}x{side_size[1]}"
+                )
 
     def _setup_pair(self) -> None:
         """ Setup everything needed for a new pair """
@@ -1180,11 +1219,48 @@ class Experiment:
                     
             self._sleep_frontend()
 
-    def _configure_camera(self, cap: cv2.VideoCapture):
+    def _configure_camera(self, cap: cv2.VideoCapture, camera_name: Literal["top", "side"]):
+        """Apply requested camera settings and store what the driver actually selected.
+
+        Cameras frequently ignore requested FPS/resolution silently and fall
+        back to a supported native mode. ``cv2.VideoWriter`` then writes
+        nothing when frames don't match its configured size — that's why the
+        top-camera MP4 was previously empty/unplayable. Reading back the real
+        values lets us size the writer correctly and pick the right FPS.
+        """
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
         cap.set(cv2.CAP_PROP_FPS, self._camera_fps)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._top_width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._top_height)
+
+        if camera_name == "top":
+            requested_width, requested_height = self._top_width, self._top_height
+        else:
+            requested_width, requested_height = self._side_width, self._side_height
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, requested_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, requested_height)
+
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or requested_width
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or requested_height
+        if not actual_fps or actual_fps <= 0:
+            actual_fps = float(self._camera_fps)
+
+        if camera_name == "top":
+            self._top_camera_fps = actual_fps
+            self._top_capture_width = actual_width
+            self._top_capture_height = actual_height
+            print(
+                f"Top camera initialized: {actual_width}x{actual_height} "
+                f"@ {actual_fps:.2f} fps (requested {requested_width}x{requested_height} @ {self._camera_fps} fps)"
+            )
+        else:
+            self._side_camera_fps = actual_fps
+            self._side_capture_width = actual_width
+            self._side_capture_height = actual_height
+            print(
+                f"Side camera initialized: {actual_width}x{actual_height} "
+                f"@ {actual_fps:.2f} fps (requested {requested_width}x{requested_height} @ {self._camera_fps} fps)"
+            )
 
     def _update_movement_progress(self):
         """Update movement progress based on object position"""
@@ -1330,7 +1406,13 @@ class Experiment:
 
         self._register_camera_capture("top", cap)
         try:
-            self._configure_camera(cap)
+            self._configure_camera(cap, "top")
+
+            # Throttle frames sent to the recording queue so the saved MP4
+            # plays at real-time speed even when the top camera runs faster
+            # than the side camera (the writer is configured at the side
+            # camera's FPS — see _initialize_writers).
+            last_record_time = 0.0
 
             while self._running:
                 ret, frame = cap.read()
@@ -1341,14 +1423,34 @@ class Experiment:
                 if DEBUG_FLIP_Y:
                     frame = cv2.flip(frame, 0)
 
+                # Force the frame to match the writer's configured size. If
+                # the camera silently delivered a different resolution, the
+                # writer would otherwise drop the frame and produce an empty
+                # MP4.
+                if (
+                    frame.shape[1] != self._top_capture_width
+                    or frame.shape[0] != self._top_capture_height
+                ):
+                    frame = cv2.resize(
+                        frame,
+                        (self._top_capture_width, self._top_capture_height),
+                    )
+
                 detected = self._process_top_view(frame)
                 
                 # Add frame to recording queue if recording
                 if self._top_writer:
-                    try:
-                        self._top_frame_queue.put_nowait((frame, detected))
-                    except Exception:
-                        pass
+                    recording_fps = self._get_recording_fps()
+                    interval = 1.0 / recording_fps if recording_fps > 0 else 0.0
+                    now = monotonic()
+                    if now - last_record_time >= interval:
+                        last_record_time = now
+                        try:
+                            self._top_frame_queue.put_nowait((frame, detected))
+                        except Exception:
+                            pass
+                else:
+                    last_record_time = 0.0
                     
                 cv2.imshow("Top Camera", cv2.flip(frame, 1))
                 key = cv2.waitKey(1) & 0xFF
@@ -1382,7 +1484,7 @@ class Experiment:
         
         self._register_camera_capture("side", cap)
         try:
-            self._configure_camera(cap)
+            self._configure_camera(cap, "side")
             # Sleeping 3 seconds to give time for the camera to warm up
             sleep(3)
 
@@ -1390,6 +1492,15 @@ class Experiment:
                 ret, frame = cap.read()
                 if not ret:
                     continue
+
+                if (
+                    frame.shape[1] != self._side_capture_width
+                    or frame.shape[0] != self._side_capture_height
+                ):
+                    frame = cv2.resize(
+                        frame,
+                        (self._side_capture_width, self._side_capture_height),
+                    )
 
                 # Add frame to recording queue if recording
                 if self._side_writer:

@@ -162,6 +162,7 @@ class MotorController:
 
     def zero_motor_positions(self, motor_set_id: MotorSetId) -> list[MotorMovement]:
         """Return zero-position commands for all 3 motors in a physical motor set."""
+        self._reset_ik_state_to_origin()
         base_motor_idx = motor_set_id.base_index
         return [
             MotorMovement(pos=0, index=base_motor_idx),
@@ -337,7 +338,7 @@ class MotorController:
         base_motor_idx = motor_set_id.base_index
         movements: list[MotorMovement] = []
         for i, leg in enumerate(("top", "right", "left")):
-            wire_length = self._calculate_ik_wire_length(leg, result[leg], model)
+            wire_length = self._calculate_ik_tactor_wire_length(leg, p1, model)
             wire_delta = wire_length - self._ik_wire_reference[leg]
             movements.append(MotorMovement(pos=int(wire_delta * ik_to_sim_scale), index=base_motor_idx + i))
         return movements
@@ -362,31 +363,53 @@ class MotorController:
         if not all(result[leg]["valid"] for leg in ("top", "right", "left")):
             raise ValueError("IK origin reference is invalid.")
 
-        self._ik_wire_reference = {
-            leg: self._calculate_ik_wire_length(leg, result[leg], model)
-            for leg in ("top", "right", "left")
-        }
+        reference_p1 = result["shared"]["P1"]
+        self._ik_wire_reference = self._calculate_ik_wire_reference(reference_p1, model)
         self._ik_previous_angles = self._extract_ik_angles(result)
 
-    def _calculate_ik_wire_length(
+    def _reset_ik_state_to_origin(self) -> None:
+        """Reset IK branch continuity when the physical motors are sent home."""
+        if self._movement_strategy != MovementStrategy.IK or self._ik_wire_reference is None:
+            return
+
+        ik = self._get_ik_module()
+        model = self._get_ik_model()
+        result = ik.solve_all_legs((0.0, 0.0, self._get_ik_tactor_z(model)), math.pi / 2.0, model=model)
+        if not all(result[leg]["valid"] for leg in ("top", "right", "left")):
+            raise ValueError("IK origin reference is invalid.")
+
+        self._ik_wire_reference = self._calculate_ik_wire_reference(result["shared"]["P1"], model)
+        self._ik_previous_angles = self._extract_ik_angles(result)
+
+    def _calculate_ik_wire_reference(
+        self,
+        p1: tuple[float, float, float],
+        model: dict[str, Any],
+    ) -> dict[str, float]:
+        return {
+            leg: self._calculate_ik_tactor_wire_length(leg, p1, model)
+            for leg in ("top", "right", "left")
+        }
+
+    def _calculate_ik_tactor_wire_length(
         self,
         leg: str,
-        leg_result: dict[str, Any],
+        p1: tuple[float, float, float],
         model: dict[str, Any],
     ) -> float:
+        """Return the commanded wire length from a motor anchor to the tactor.
+
+        `unified_ik_starter.py` solves the mechanism geometry and validates the
+        requested tactor pose. The firmware command, however, drives the three
+        motor wires, so the command delta must be measured from each fixed motor
+        anchor to the requested tactor point (`P1`), not to an internal IK branch
+        point such as `P3`.
+        """
         pb = model["anchors"][leg]
-        p2 = leg_result["P2"]
-        p3 = leg_result["selected_P3"]
-        direction = self._unit3((p2[0] - p3[0], p2[1] - p3[1], p2[2] - p3[2]))
-        attach = (
-            p3[0] + 4.1 * direction[0],
-            p3[1] + 4.1 * direction[1],
-            p3[2] + 4.1 * direction[2],
-        )
         return math.sqrt(
-            (attach[0] - pb[0]) ** 2
-            + (attach[1] - pb[1]) ** 2
-            + (attach[2] - pb[2]) ** 2
+            (p1[0] - pb[0]) ** 2
+            + (p1[1] - pb[1]) ** 2
+            + (p1[2] - pb[2]) ** 2
         )
 
     def _extract_ik_angles(self, result: dict[str, Any]) -> dict[str, dict[str, float]]:
@@ -420,11 +443,26 @@ class MotorController:
             return (obj_x * scale, obj_y * scale)
         return (obj_x, obj_y)
 
-    def _unit3(self, vector: tuple[float, float, float]) -> tuple[float, float, float]:
-        norm = math.sqrt(vector[0] ** 2 + vector[1] ** 2 + vector[2] ** 2)
-        if norm == 0.0:
-            raise ValueError("Cannot normalize zero-length IK wire attachment vector.")
-        return (vector[0] / norm, vector[1] / norm, vector[2] / norm)
+    def _get_planar_motor_anchors(self) -> list[tuple[float, float]]:
+        """Return the 2-D motor anchor triangle shared by every strategy.
+
+        There is one physical mechanism with one anchor triangle, defined by
+        ``unified_ik_starter.default_model()`` (an isosceles triangle, NOT
+        equilateral). Every strategy must measure cable lengths against this
+        same triangle so that a commanded path reconstructs identically
+        regardless of strategy. The IK anchors are given in IK units, so scale
+        them to controller units by ``motor_spacing / base_span``.
+
+        Order matches the motor layout and the IK leg order:
+            0 = top, 1 = bottom-right, 2 = bottom-left.
+        """
+        anchors = self._get_ik_module().default_model()["anchors"]
+        base_span = self._get_ik_base_span({"anchors": anchors})
+        scale = self._motor_spacing / base_span
+        return [
+            (anchors[leg][0] * scale, anchors[leg][1] * scale)
+            for leg in ("top", "right", "left")
+        ]
 
     def _calculate_movements_to_point(
         self,
@@ -433,8 +471,8 @@ class MotorController:
     ) -> list[MotorMovement]:
         """Compute cable-length deltas from origin to a target point.
 
-        The object is assumed to start at `(0, 0)`. For each motor in the selected
-        equilateral-triangle layout, this calculates:
+        The object is assumed to start at `(0, 0)`. For each motor in the shared
+        mechanism triangle (`_get_planar_motor_anchors`), this calculates:
             delta = distance(motor, object_end) - distance(motor, object_start)
 
         Args:
@@ -449,12 +487,7 @@ class MotorController:
         object_start = (0.0, 0.0)
         end_x, end_y = object_end
 
-        h = self._motor_spacing * math.sqrt(3) / 3
-        motor_positions = [
-            (0.0, 2 * h / 3),  # Motor 0: top
-            (self._motor_spacing / 2, -h / 3),  # Motor 1: bottom-right
-            (-self._motor_spacing / 2, -h / 3),  # Motor 2: bottom-left
-        ]
+        motor_positions = self._get_planar_motor_anchors()
 
         movements: list[MotorMovement] = []
         for i, (motor_x, motor_y) in enumerate(motor_positions):
