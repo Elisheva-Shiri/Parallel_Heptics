@@ -37,6 +37,213 @@ Cameras → backend.py → motor commands → (UDP 12347) → esp32_bridge.exe �
 
 ---
 
+## Minimum system requirements and complete setup checklist
+
+The project does not enforce a CPU, RAM, or disk-space threshold in code. The
+computer specifications below are therefore practical lower bounds inferred
+from the 640x480 camera streams, MediaPipe/OpenCV processing, video recording,
+and the selected frontend. For a new computer, prefer the recommended values
+rather than purchasing exactly at the minimum.
+
+### Computer requirements
+
+| Configuration | CPU | RAM | GPU | Free storage | Operating system |
+| --- | --- | --- | --- | --- | --- |
+| Minimum pygame + MediaPipe | 4-core Intel Core i5 / AMD Ryzen 5 class | 8 GB | Integrated graphics are acceptable | 10 GB plus experiment recordings | Windows 10/11 64-bit |
+| Recommended non-VR experiment PC | Modern 6-core CPU | 16 GB | Integrated or entry-level discrete GPU | 20-50 GB | Windows 11 64-bit |
+| Quest Link / PCVR | Intel Core i7 / AMD Ryzen 7 class | 16 GB | NVIDIA RTX 20-series or AMD RX 6000-series class | 30-50 GB | Windows 10/11 64-bit |
+| Unity development | Modern Core i7 / Ryzen 7 | 16 GB minimum; 32 GB preferred | RTX 20-series or newer | 50 GB or more | Windows 11 64-bit |
+
+Before purchasing a VR computer, verify it against Meta's current
+[Windows PC requirements for Meta Horizon Link](https://www.meta.com/help/quest/articles/headsets-and-accessories/oculus-link/requirements-quest-link/).
+
+Required computer connections:
+
+- Two USB ports for the minimum physical setup: top camera + ESP32.
+- A third USB port when the optional side camera is enabled.
+- An additional USB 3 port and data-capable Link cable for wired Quest Link.
+- A monitor, keyboard, and mouse. An audio output is needed when white-noise
+  masking is enabled.
+
+### Hardware requirements
+
+The minimum visual demonstration needs only the computer, one top camera, and
+the pygame frontend. It does not need the ESP32, servos, side camera, or Quest.
+For an intentional software-only run, set `MOTOR_TYPE = MotorType.NONE` in
+`backend.py`; the committed default is `MotorType.HARDWARE`.
+
+The minimum physical haptic system consists of:
+
+- One ESP32 development board.
+- One PCA9685 16-channel PWM/servo driver.
+- Three SG92R servos for one finger cluster. The complete five-finger system
+  uses 15 servos (five clusters x three servos).
+- One data-capable USB cable for the ESP32.
+- A separate regulated 5-6 V servo power supply, wiring, and a common ground
+  shared by the supply, PCA9685, and ESP32.
+- One fixed top-view USB camera. The side-view USB camera is optional.
+
+The firmware defines 15 motors on PCA9685 channels 0-14, ESP32 I2C pins SDA 21
+and SCL 22, PCA9685 address `0x40`, 50 Hz servo PWM, and 115200-baud serial.
+
+> **Servo power safety:** Never power all servos from the ESP32 USB connector.
+> The repository does not define a power-supply rating. Size the supply for the
+> measured stall current of the actual servos; approximately 5 V / 10 A or more
+> is a sensible engineering provision for 15 SG92R-class servos. Add suitable
+> fusing or an emergency disconnect. See Adafruit's
+> [PCA9685 power and library guide](https://learn.adafruit.com/16-channel-pwm-servo-driver/using-the-adafruit-library).
+
+Optional VR hardware:
+
+- A Meta Quest headset supported by Meta Horizon Link and its controllers.
+- A high-quality USB 3 Link cable. Wired Link is preferred over Air Link for
+  repeatable experiment latency.
+- A Meta account and a supported dedicated GPU.
+
+### Vision requirements and limitations
+
+The top camera is mandatory. The backend raises an error if camera index `0`
+cannot be opened. The side camera uses index `1` and can be disabled with
+`--side-camera-disabled`; failure to open it does not stop the experiment.
+
+Both cameras request:
+
+- 640x480 capture resolution.
+- 30 frames per second.
+- MJPEG capture through the Windows DirectShow backend.
+
+Use a fixed camera mount, stable and even lighting, minimal reflections and
+motion blur, and a field of view that contains the complete hand and working
+area. If Windows enumerates the cameras in the opposite order, exchange their
+USB ports or update `TOP_CAMERA` and `SIDE_CAMERA` in `backend.py`.
+
+Vision mode limitations:
+
+- **MediaPipe (default and minimum recommended):** CPU operation is sufficient,
+  no colored markers are needed, and the current configuration tracks one hand
+  with detection confidence `0.7` and tracking confidence `0.5`.
+- **Color tracking:** requires visible, distinct markers selected from red,
+  green, blue, yellow, and magenta. Lighting and background color directly
+  affect reliability.
+- **YOLO:** uses `vision/yolo/model/best.pt` through Ultralytics. A GPU improves
+  performance but is not required by the Python code.
+- **Optical color GPU:** uses CUDA only when the installed OpenCV build exposes
+  a CUDA device; otherwise it falls back to CPU. The normal `opencv-python`
+  package should not be assumed to include CUDA support.
+
+### Software downloads
+
+#### Required for every experiment computer
+
+1. **Windows 10/11 64-bit.** The current implementation uses DirectShow,
+   Windows COM ports, Windows batch launchers, and a Windows serial bridge.
+2. **This repository.** Copy the complete project folder or obtain it with Git
+   or a ZIP download. Git is optional once the full directory is present.
+3. **[uv](https://docs.astral.sh/uv/getting-started/installation/).** uv is
+   mandatory and manages both Python and the virtual environment:
+
+   ```powershell
+   winget install --id=astral-sh.uv -e
+   uv python install 3.12
+   uv sync
+   ```
+
+   A separate Python download is not required. Although `pyproject.toml` allows
+   Python 3.12 or newer, use Python 3.12 for the tested MediaPipe configuration.
+   `uv sync` installs the locked runtime packages, including MediaPipe,
+   OpenCV, Pydantic, pygame, pyserial, keyboard, Ultralytics, yappi, snakeviz,
+   and Typer. Do not install them individually unless troubleshooting.
+
+#### Required to flash a new ESP32
+
+4. **[Arduino IDE 2](https://www.arduino.cc/en/software).** Select the
+   **ESP32 Dev Module** board.
+5. **ESP32 Arduino core.** Add the following stable Board Manager URL, install
+   `esp32 by Espressif Systems`, and restart Arduino IDE. See the
+   [official Espressif installation guide](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html).
+
+   ```text
+   https://espressif.github.io/arduino-esp32/package_esp32_index.json
+   ```
+
+6. **Adafruit PWM Servo Driver library.** Install it through Arduino IDE's
+   Library Manager, including any dependencies it requests.
+7. **USB-serial driver, only if needed.** Install the CP210x or CH340/CH341
+   Windows driver appropriate to the ESP32 board if `uv run list_ports.py`
+   does not show a COM port.
+
+#### Required for the physical haptic system
+
+8. **ESP32 serial bridge.** The prebuilt
+   `esp32_serial_bridge/esp32_bridge.exe` is committed to the repository, so no
+   compiler is needed for normal runs. It receives UDP on port `12347` and
+   forwards commands to the ESP32 at 115200 baud.
+9. **C++ compiler, only when rebuilding the bridge.** Install either
+   [MSYS2/MinGW-w64](https://www.msys2.org/) or
+   [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/)
+   with the *Desktop development with C++* workload. Do not install both unless
+   they are needed for unrelated development.
+
+#### Required only for Quest/VR sessions
+
+10. **[Meta Horizon Link](https://www.meta.com/quest/setup/)**, previously
+    called Meta Quest Link. Sign in, connect the headset, set Meta Horizon Link
+    as the active OpenXR runtime, and enable passthrough-over-Link when needed
+    for calibration.
+11. **Current NVIDIA or AMD graphics driver** from the GPU manufacturer.
+
+The prebuilt `frontend_unity/Build/ParallelHeptics.exe` does not require Unity
+Hub, the Unity Editor, or Node.js on the experiment computer.
+
+#### Required only for editing or rebuilding Unity
+
+12. **[Unity Hub](https://unity.com/download).** Install the exact editor
+    version **Unity 6000.4.4f1**, using the
+    [Unity download archive](https://unity.com/releases/editor/archive) if it
+    is not shown in Hub. Windows Build Support is required; Android Build
+    Support is not required because this is a Windows PCVR build, not a
+    standalone Quest APK.
+13. **[Node.js LTS with npm](https://nodejs.org/en/download).** It is needed
+    when opening the Unity project because the MCP Unity package starts a local
+    Node server:
+
+    ```powershell
+    winget install --id OpenJS.NodeJS.LTS -e
+    node --version
+    npm --version
+    ```
+
+Unity restores the pinned OpenXR, Meta OpenXR, Input System, Universal Render
+Pipeline, and MCP Unity packages automatically from `Packages/manifest.json`.
+Do not download those packages separately.
+
+### Minimum startup sequence
+
+```powershell
+# One-time Python environment setup
+uv python install 3.12
+uv sync
+
+# Find the ESP32 port
+uv run list_ports.py
+
+# Start the physical motor bridge; replace COM13 with the detected port
+esp32_serial_bridge\esp32_bridge.exe COM13
+
+# Start the backend
+uv run backend.py
+
+# Start exactly one frontend: pygame...
+uv run frontend_pygame.py
+```
+
+For VR, start Meta Horizon Link, connect the Quest, and launch
+`frontend_unity/Build/ParallelHeptics.exe` instead of pygame. Only one frontend
+may run because pygame and Unity both bind UDP port `12346`. The backend control
+server uses TCP port `12344`, and the motor bridge uses UDP port `12347`.
+
+---
+
 ## Running the experiment
 
 These steps are everything needed on a fresh experiment computer. Most of the

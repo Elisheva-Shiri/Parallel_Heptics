@@ -200,10 +200,22 @@ cython_debug/
 *.app
 
 
+### Generated data/images (whole project)
+# Ignore all generated data/media (CSV, images, spreadsheets, video) anywhere in
+# the repo. Add explicit `!path/to/file.ext` exceptions below to track specific ones.
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.xlsx
+*.mp4
+*.json
+*.svg
+*.md
+*.txt
+
 ### Other
 VR_Experiment_1/
-configuration.csv
-configuration_backup.csv
 basic_logic.txt
 debug_experiments/
 live_experiments/
@@ -241,3 +253,31 @@ analysis/motor_response_analizer_servo/responses/
 
 # Psychophysics analysis generated outputs
 analysis/psychophysics_analysis/results/
+
+# Psychophysics images (*.png, *.jpg, *.jpeg handled by global rules above)
+analysis/psychophysics/*.gif
+analysis/psychophysics/*.bmp
+analysis/psychophysics/*.tif
+analysis/psychophysics/*.tiff
+analysis/psychophysics/*.webp
+analysis/psychophysics/*.ico
+analysis/psychophysics/*.heic
+analysis/psychophysics/*.avif
+analysis/psychophysics/**/*.gif
+analysis/psychophysics/**/*.bmp
+analysis/psychophysics/**/*.tif
+analysis/psychophysics/**/*.tiff
+analysis/psychophysics/**/*.webp
+analysis/psychophysics/**/*.ico
+analysis/psychophysics/**/*.heic
+analysis/psychophysics/**/*.avif
+
+# Thesis paper: sources, drafts, figures, media, and build artifacts
+paper/
+
+# Analysis generated output folders (complements the **/[Rr]esults/ rule
+# above): catches *_results dirs such as analysis/movement_strategy_results/,
+# plus any plots/ output dirs. Deliberately does NOT match results_core* etc.,
+# which are tracked golden fixtures (see _perf/.gitignore).
+**/*_[Rr]esults/
+analysis/**/plots/
