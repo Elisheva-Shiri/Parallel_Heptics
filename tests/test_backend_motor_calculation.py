@@ -230,6 +230,63 @@ def test_ik_strategy_returns_three_scaled_motor_commands():
     assert any(movement.pos != 0 for movement in actual)
 
 
+def test_ik_strategy_translates_target_to_tactor_wire_deltas():
+    controller = _make_controller(MovementStrategy.IK)
+    model = controller._get_ik_model()
+    obj_x = 120.0
+    obj_y = -60.0
+
+    actual = controller.calculate_motor_movements(
+        motor_set_id=MotorSetId.MOTORS_3_5,
+        stiffness_value=1.0,
+        obj_x=obj_x,
+        obj_y=obj_y,
+        motors_enabled=True,
+    )
+
+    sim_to_ik_scale = controller._get_ik_base_span(model) / controller._motor_spacing
+    ik_to_sim_scale = 1.0 / sim_to_ik_scale
+    expected_obj_x, expected_obj_y = controller._apply_stiffness_value(obj_x, obj_y, 1.0)
+    expected_obj_x, expected_obj_y = controller._apply_actuator_destination_polarity(expected_obj_x, expected_obj_y)
+    p1 = (
+        expected_obj_x * sim_to_ik_scale,
+        expected_obj_y * sim_to_ik_scale,
+        controller._get_ik_tactor_z(model),
+    )
+    reference_p1 = (0.0, 0.0, controller._get_ik_tactor_z(model))
+    expected = []
+    for index, leg in enumerate(("top", "right", "left"), start=MotorSetId.MOTORS_3_5.base_index):
+        wire_length = controller._calculate_ik_tactor_wire_length(leg, p1, model)
+        reference_length = controller._calculate_ik_tactor_wire_length(leg, reference_p1, model)
+        expected.append((index, int((wire_length - reference_length) * ik_to_sim_scale)))
+
+    assert _to_tuples(actual) == expected
+
+
+def test_zero_motor_positions_resets_ik_branch_state_to_origin():
+    controller = _make_controller(MovementStrategy.IK)
+
+    controller.calculate_motor_movements(
+        motor_set_id=MotorSetId.MOTORS_3_5,
+        obj_x=140.0,
+        obj_y=70.0,
+        motors_enabled=True,
+    )
+    moved_angles = controller._ik_previous_angles
+
+    assert moved_angles is not None
+    assert _to_tuples(controller.zero_motor_positions(MotorSetId.MOTORS_3_5)) == [(3, 0), (4, 0), (5, 0)]
+
+    model = controller._get_ik_model()
+    origin_result = controller._get_ik_module().solve_all_legs(
+        (0.0, 0.0, controller._get_ik_tactor_z(model)),
+        math.pi / 2.0,
+        model=model,
+    )
+    assert controller._ik_previous_angles == controller._extract_ik_angles(origin_result)
+    assert controller._ik_previous_angles != moved_angles
+
+
 def test_ik_strategy_uses_repo_local_solver_module():
     controller = _make_controller(MovementStrategy.IK)
     module_path = Path(controller._get_ik_module().__file__).resolve()
