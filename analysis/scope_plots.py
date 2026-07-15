@@ -45,6 +45,41 @@ def sanitize_name(value: Any, fallback: str = "unknown") -> str:
     return text or fallback
 
 
+def _short_label(value: Any) -> str:
+    text = str(value) if value is not None and not pd.isna(value) else ""
+    replacements = {
+        "finger_condition": "finger",
+        "pse_delta_from_standard": "PSE shift",
+        "correct_response": "success",
+        "experiment_group": "group",
+        "setup_factor": "setup",
+        "no_airsled": "N/no air",
+        "airsled": "L/air",
+        "standard": "std",
+        "comparison": "cmp",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    text = text.replace("psychophysics_", "").replace("_condition_metric_summary", "")
+    text = text.replace("_", " ")
+    return text
+
+
+def _plot_label(row: pd.Series, x_cols: list[str]) -> str:
+    parts = [_short_label(row[col]) for col in x_cols if col in row and str(row[col]) != "nan"]
+    return " | ".join([p for p in parts if p])
+
+
+def _bar_colors(df: pd.DataFrame, x_cols: list[str]) -> list[Any]:
+    finger_colors = {"I": "#1f77b4", "M": "#ff7f0e", "R": "#2ca02c", "P": "#d62728"}
+    setup_colors = {"no_airsled": "#D55E00", "airsled": "#0072B2", "N": "#D55E00", "L": "#0072B2"}
+    group_colors = {"N_E": "#D55E00", "L_E": "#0072B2", "L_P": "#009E73"}
+    for col, palette in [("finger_condition", finger_colors), ("setup_factor", setup_colors), ("experiment_group", group_colors)]:
+        if col in df.columns:
+            return [palette.get(str(v), "#4C78A8") for v in df[col]]
+    return ["#4C78A8"] * len(df)
+
+
 def available_summary_metrics(df: pd.DataFrame, metrics: Iterable[str] | None = None) -> list[str]:
     if "metric" not in df or "mean" not in df:
         return []
@@ -128,13 +163,13 @@ def _save_one_plot(
     d = d.dropna(subset=["mean"])
     if d.empty:
         return None
-    d["_plot_label"] = d[x_cols].astype(str).agg(" | ".join, axis=1)
+    d["_plot_label"] = d.apply(lambda row: _plot_label(row, x_cols), axis=1)
     d = d.sort_values(x_cols)
     if len(d) > MAX_SUMMARY_PLOT_ROWS:
         return None
 
-    width = min(18.0, max(5.5, 0.35 * len(d) + 2.5))
-    fig, ax = plt.subplots(figsize=(width, 4.8))
+    width = min(30.0, max(9.0, 0.62 * len(d) + 4.0))
+    fig, ax = plt.subplots(figsize=(width, 5.6))
     x = np.arange(len(d))
     if "raw_values_json" in d.columns:
         for i, raw in enumerate(d["raw_values_json"]):
@@ -154,13 +189,13 @@ def _save_one_plot(
                 linewidths=0,
                 zorder=1,
             )
-    ax.bar(x, d["mean"], color="#4C78A8", alpha=0.85)
+    ax.bar(x, d["mean"], color=_bar_colors(d, x_cols), alpha=0.85)
     _plot_with_ci(ax, x, d["mean"], d)
     ax.set_xticks(x)
-    ax.set_xticklabels(d["_plot_label"], rotation=70 if len(d) > 8 else 20, ha="right")
-    ax.set_ylabel(metric)
-    ax.set_xlabel(summary_level.replace("_", " "))
-    ax.set_title(f"{metric} by {summary_level.replace('_', ' ')}")
+    ax.set_xticklabels(d["_plot_label"], rotation=45 if len(d) > 8 else 15, ha="right")
+    ax.set_ylabel(_short_label(metric))
+    ax.set_xlabel(_short_label(summary_level))
+    ax.set_title(f"{_short_label(metric)} by {_short_label(summary_level)}")
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
 

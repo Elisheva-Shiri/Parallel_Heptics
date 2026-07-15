@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import sys
 from pathlib import Path
@@ -9,7 +9,6 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "analysis" / "Kinematics"))
-sys.path.insert(0, str(ROOT / "analysis" / "probing_analysis"))
 sys.path.insert(0, str(ROOT / "analysis" / "psychophysics_analysis"))
 
 from analysis.group_comparisons import (  # noqa: E402
@@ -23,7 +22,7 @@ from analysis.group_comparisons import (  # noqa: E402
     compute_setup_factor_tables,
 )
 import kinematics_analysis as ka  # noqa: E402
-import probing_analysis as pa  # noqa: E402
+from analysis.success_factors import probing as pa  # noqa: E402
 import twoafc_psychophysics as psych  # noqa: E402
 
 
