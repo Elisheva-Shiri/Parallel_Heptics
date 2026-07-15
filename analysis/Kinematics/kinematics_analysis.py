@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -19,6 +20,7 @@ import pandas as pd
 
 try:
     from analysis.group_comparisons import (
+        PILOT_ONBOARDING_TRIALS,
         add_experiment_group_columns,
         compute_analysis_scope_tables,
         compute_group_comparison_tables,
@@ -33,6 +35,7 @@ except (
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from analysis.group_comparisons import (
+        PILOT_ONBOARDING_TRIALS,
         add_experiment_group_columns,
         compute_analysis_scope_tables,
         compute_group_comparison_tables,
@@ -88,11 +91,11 @@ FINGER_LABELS = {"I": "Index", "M": "Middle", "R": "Ring", "P": "Pinky"}
 FINGER_TO_COLOR = {"I": "#1f77b4", "M": "#ff7f0e", "R": "#2ca02c", "P": "#d62728"}
 IGNORED_PATH_PATTERNS = (
     "old",
-    "not finish",
-    "not_finish",
-    "not-finish",
-    "notfinish",
     "unfinished",
+)
+FILTER_PATH_PATTERNS = (
+    "filter",
+    "filtered",
 )
 WORKSPACE_SPECS_CM = {
     # User-specified physical workspaces.  These normalize derived coordinates
@@ -168,6 +171,609 @@ def save_csv(df: pd.DataFrame, output_root: Path, name: str) -> Path:
     return path
 
 
+def save_csv_path(df: pd.DataFrame, path: Path) -> Path:
+    """Persist a CSV to an exact path, creating only that file's parent folder."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+    return path
+
+
+def save_parquet(df: pd.DataFrame, output_root: Path, name: str) -> Path:
+    """Persist a large table as Parquet instead of CSV.
+
+    Used for the multi-GB raw sample/time tables where CSV serialization
+    dominates notebook runtime. The in-memory DataFrame is unchanged, so this
+    only affects the on-disk format, not any computed analysis result. ``name``
+    may be passed with any extension; the file is always written as ``.parquet``.
+    """
+    output_root.mkdir(parents=True, exist_ok=True)
+    path = output_root / f"{Path(name).stem}.parquet"
+    df.to_parquet(path, index=False)
+    return path
+
+
+def _table_is_per_subject(df: Any) -> bool:
+    """True for a table that carries usable per-participant rows (a ``subject_id``)."""
+    return (
+        isinstance(df, pd.DataFrame)
+        and "subject_id" in df.columns
+        and df["subject_id"].notna().any()
+    )
+
+
+def save_table_routed(df: Any, run_output_root: Path, name: str) -> list[Path]:
+    """Route one table into the selection output tree.
+
+    Per-subject tables (those with a ``subject_id`` column) are split by subject
+    into sibling folders ``results/<subject>/csv/<name>`` -- mirroring the
+    psychophysics per-subject layout. Cross-subject aggregates are written once to
+    the selected owner folder ``results/<SELECTION_LABEL>/<name>`` and are
+    categorized by :func:`organize_kinematic_results_tree`. Returns every path written.
+    """
+    run_output_root = Path(run_output_root)
+    subject_base = run_output_root.parent
+    fname = str(name) if str(name).endswith(".csv") else f"{sanitize_name(name)}.csv"
+    written: list[Path] = []
+    if _table_is_per_subject(df):
+        for subject_id, sub in df.groupby(df["subject_id"].astype(str), sort=True):
+            sid = sanitize_name(subject_id, fallback="unknown_subject")
+            written.append(save_csv(sub, subject_base / sid / "csv", fname))
+    else:
+        frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        written.append(save_csv(frame, run_output_root, fname))
+    return written
+
+
+SUBJECT_TREE_SCAN_SKIP_STEMS = {
+    # Raw/sample-level tables can be very large in group runs.  They are kept in
+    # the run owner unless explicitly passed in ``tables`` by a caller that knows
+    # it wants per-subject copies.
+    "kinematic_samples",
+    "side_z_samples",
+    "kinematic_3d_proxy_samples",
+}
+
+
+def _split_existing_subject_csvs(run_output_root: Path) -> list[dict[str, Any]]:
+    """Split already-written subject CSVs from a group owner into subject folders.
+
+    The notebook computes several derived tables directly to ``OUTPUT_ROOT`` and
+    only later calls :func:`save_selected_kinematic_tree`.  Historically, only
+    the hand-curated ``tables`` dict was split, so group runs left newer
+    subject-level outputs (for example metric distributions and influence
+    summaries) in the group folder while single-subject runs appeared complete.
+    This scan catches those already-written derived CSVs without re-running the
+    analysis and without touching large raw/sample parquet tables.
+    """
+
+    run_output_root = Path(run_output_root)
+    rows: list[dict[str, Any]] = []
+    if not run_output_root.exists():
+        return rows
+    if SUBJECT_FOLDER_RE.match(run_output_root.name):
+        return rows
+    subject_base = run_output_root.parent
+    candidates = [
+        p
+        for p in run_output_root.rglob("*.csv")
+        if p.is_file()
+        and p.stem not in SUBJECT_TREE_SCAN_SKIP_STEMS
+        and not any(part in {"__pycache__"} for part in p.parts)
+    ]
+    for src in sorted(candidates):
+        try:
+            df = read_csv_flexible(src)
+        except Exception:
+            continue
+        if not _table_is_per_subject(df):
+            continue
+        for subject_id, sub in df.groupby(df["subject_id"].astype(str), sort=True):
+            sid = sanitize_name(subject_id, fallback="unknown_subject")
+            dst = subject_base / sid / "csv" / src.name
+            save_csv(sub, dst.parent, dst.name)
+            rows.append({"table": src.name, "kind": "subject", "path": str(dst)})
+    return rows
+
+
+def save_selected_kinematic_tree(
+    run_output_root: Path, *, tables: dict[str, Any]
+) -> pd.DataFrame:
+    """Write the per-subject ``csv`` split for a selected cohort.
+
+    Mirrors the psychophysics ``save_selected_analysis_tree``: it operates on the
+    already-computed in-memory frames (no recompute). Each table carrying a
+    ``subject_id`` column is split per subject into ``results/<subject>/csv/``;
+    tables without one land in the selected owner folder
+    ``results/<SELECTION_LABEL>/`` before final categorization. Per-subject and aggregate figures
+    are written to ``results/<subject>/figures/`` and
+    ``results/<SELECTION_LABEL>/figures/`` during the main run by the figure
+    helpers. Returns a manifest of the tables written here.
+    """
+    run_output_root = Path(run_output_root)
+    rows: list[dict[str, Any]] = []
+    for name, df in tables.items():
+        if df is None:
+            continue
+        kind = "subject" if _table_is_per_subject(df) else "aggregate"
+        for path in save_table_routed(df, run_output_root, name):
+            rows.append({"table": str(name), "kind": kind, "path": str(path)})
+    rows.extend(_split_existing_subject_csvs(run_output_root))
+    return pd.DataFrame(rows, columns=["table", "kind", "path"])
+
+
+# --- Category reorganization -------------------------------------------------
+# Every subject/group folder's csv/ and figures/ are split into these semantic
+# categories so the output tree reads by analysis topic rather than by the
+# function that happened to emit a file.
+KINEMATIC_FIGURE_CATEGORIES: tuple[str, ...] = (
+    "hand_orientation",
+    "movement_orientation",
+    "z_lift",
+    "trajectories",
+    "velocity",
+    "acceleration",
+    "success",
+    "other",
+)
+
+# These trajectory-derived plot families should live inside the trajectory
+# figure tree, not as top-level siblings of ``trajectories``.
+TRAJECTORY_FIGURE_SUBCATEGORIES: tuple[str, ...] = (
+    "hand_orientation",
+    "movement_orientation",
+    "z_lift",
+)
+
+
+def figure_category(name: str) -> str:
+    """Classify a figure filename into one of KINEMATIC_FIGURE_CATEGORIES."""
+    n = str(name).lower()
+    if "standard_vs_comparison" in n:
+        if "pos" in n or "movementdirection" in n or "movement_direction" in n:
+            return "s_vs_c_pos"
+        if "accel" in n or "axyz" in n or "_ax_" in n or "_ay_" in n or "_az_" in n:
+            return "s_vs_c_a"
+        return "s_vs_c_v"
+    if n.startswith("all_xy_trajectories_with_") or n.startswith(
+        "median_xy_trajectory_by_finger"
+    ):
+        return "movement_orientation"
+    if "radiation_orientation" in n or "movement_cycle" in n:
+        return "movement_orientation"
+    if "hand_orientation" in n:
+        return "hand_orientation"
+    if "side_z" in n:
+        return "z_lift"
+    if "velocity_3d" in n or "3d_proxy_velocity" in n:
+        return "velocity"
+    if (
+        "xy_trajector" in n
+        or "trajectory_distance" in n
+        or "3d_proxy" in n
+        or "3d_excursion" in n
+        or "_3d_" in n
+    ):
+        return "trajectories"
+    if "success" in n:
+        return "success"
+    if "acceleration" in n:
+        return "acceleration"
+    if "velocity" in n or "speed" in n or "magnitude" in n:
+        return "velocity"
+    if "distance_from_center" in n:
+        return "trajectories"
+    return "other"
+
+
+
+
+def figure_category_parts(filename: str) -> tuple[str, ...]:
+    """Return nested semantic figure folders for ``filename``.
+
+    Standard-vs-comparison outputs are stored under the metric family they belong
+    to (trajectory/velocity/acceleration) instead of as top-level siblings.
+    Acceleration time-by-stiffness median panels get their requested subfolder;
+    all other acceleration plots stay directly in ``acceleration``.
+    """
+    category = figure_category(filename)
+    n = str(filename).lower()
+    if category == "s_vs_c_a":
+        return ("acceleration", "s_vs_c_a")
+    if category == "s_vs_c_v":
+        if "radial" in n:
+            return ("velocity", "radial", "s_vs_c_v")
+        if "tangential" in n:
+            return ("velocity", "tangential", "s_vs_c_v")
+        if any(token in n for token in ("vxyz", "_vx_", "_vy_", "_vz_", "x_axis", "y_axis", "z_axis")):
+            return ("velocity", "components", "s_vs_c_v")
+        return ("velocity", "magnitude", "s_vs_c_v")
+    if category == "s_vs_c_pos":
+        return ("trajectories", "s_vs_c_pos")
+    if category == "acceleration":
+        if any(
+            token in n
+            for token in (
+                "acceleration_x_axis",
+                "acceleration_y_axis",
+                "acceleration_z_axis",
+                "acceleration_xyz_axis",
+            )
+        ):
+            return ("acceleration", "components")
+        if "acceleration_by_stiffness_finger" in n:
+            return ("acceleration", "median_by_finger")
+        if "acceleration_xyz_vs_time_by_finger_median.png" in n:
+            return ("acceleration", "median_by_stiffness")
+        if "acceleration_xyz_vs_time_by_finger_median_stiffness" in n:
+            return ("acceleration", "median_by_stiffness")
+    if category in TRAJECTORY_FIGURE_SUBCATEGORIES:
+        return ("trajectories", category)
+    if category == "velocity":
+        sub = velocity_result_subfolder(filename)
+        if sub:
+            return ("velocity", sub)
+    return (category,)
+
+
+def categorized_figure_path(results_root: Path, owner: str, filename: str) -> Path:
+    return results_root / owner / "figures" / Path(*figure_category_parts(filename)) / filename
+
+
+def _deprecated_scoped_acceleration_figure(
+    filename: str, scope_folder: Optional[str] = None
+) -> bool:
+    """True for scoped acceleration figures that duplicate the main all-scope view.
+
+    The subject/group tree keeps the unprefixed ``all_*`` acceleration figures as
+    the canonical descriptive plots. The interaction-scope copies named with
+    ``standard_`` / ``Comparison_`` prefixes are intentionally pruned for the
+    stiffness-specific XYZ acceleration panels, average-acceleration stiffness
+    bars, and time-acceleration matrix.
+    """
+    raw = str(filename)
+    n = raw.lower()
+    scope = str(scope_folder).lower() if scope_folder else None
+    scoped = scope in {"standard", "comparison"}
+    for prefix in ("standard_", "comparison_"):
+        if n.startswith(prefix):
+            n = n[len(prefix) :]
+            scoped = True
+            break
+    if not scoped:
+        return False
+    if n in {"average_acceleration_vs_stiffness.png", "time_acceleration.png"}:
+        return True
+    return (
+        n.startswith("all_acceleration_xyz_vs_time_by_finger_")
+        and "_stiffness_" in n
+        and n.endswith(".png")
+    )
+
+
+def _deprecated_scoped_velocity_figure(
+    filename: str, scope_folder: Optional[str] = None
+) -> bool:
+    """True for scoped velocity figures that duplicate the all-scope view.
+
+    The unprefixed all-scope velocity figures are the canonical descriptive
+    views. Standard/comparison copies are intentionally pruned for the speed
+    time-by-stiffness and average-speed stiffness plots because they have the
+    same axes/titles but only differ by the interaction-scope row filter.
+    Standard-vs-comparison diagnostic grids are kept separately under
+    ``velocity/s_vs_c_v``.
+    """
+    raw = str(filename)
+    n = raw.lower()
+    scope = str(scope_folder).lower() if scope_folder else None
+    scoped = scope in {"standard", "comparison"}
+    for prefix in ("standard_", "comparison_"):
+        if n.startswith(prefix):
+            n = n[len(prefix) :]
+            scoped = True
+            break
+    if not scoped:
+        return False
+    if n in {
+        "all_velocity_vs_time_by_stiffness.png",
+        "velocity_vs_time_by_stiffness.png",
+        "average_velocity_vs_stiffness.png",
+        "average_velocity_vs_stiffness_by_finger_subject.png",
+        "time_magnitude.png",
+        "time_speed.png",
+        "time_radial_velocity.png",
+        "time_tangential_velocity.png",
+    }:
+        return True
+    if n.startswith("velocity_") and ("_normalized_time_mean" in n or "_normalized_time_median" in n):
+        return True
+    return (
+        n.startswith("all_velocity_vs_time_by_stiffness_finger_")
+        or n.startswith("velocity_vs_time_by_stiffness_finger_")
+    ) and n.endswith(".png")
+
+
+def _deprecated_velocity_acceleration_figure(filename: str) -> bool:
+    """True for old velocity/acceleration figures no longer generated."""
+    n = str(filename).lower()
+    if n == "average_velocity_vs_stiffness_by_finger_subject.png":
+        return True
+    if "_normalized_time_mean" in n and n.startswith("velocity_"):
+        return True
+    if n.startswith("velocity_magnitude_normalized_time_mean") and n.endswith(".png"):
+        return True
+    if n.startswith("all_velocity_vs_time_by_stiffness"):
+        return True
+    if n.startswith("all_acceleration_xyz_vs_time_by_finger_mean"):
+        return True
+    return False
+
+
+def _deprecated_velocity_acceleration_table(filename: str) -> bool:
+    """True for old velocity/acceleration CSV outputs no longer generated."""
+    n = str(filename).lower()
+    return "_normalized_time_mean" in n and n.startswith("velocity_")
+
+
+def _deprecated_trajectory_figure(filename: str) -> bool:
+    """True for trajectory figures replaced or removed from the current report."""
+    n = str(filename).lower()
+    if n.startswith("radiation_orientation_"):
+        return True
+    if n.startswith("hand_orientation_axis_matrix_"):
+        return True
+    if n.startswith("movement_cycle_movement_direction_"):
+        return True
+    if n.startswith("movement_cycle_thumb_to_active_finger_xy_angle_"):
+        return True
+    if re.match(r"^standard_vs_comparison_pos[xyz]_abs_", n):
+        return True
+    if n == "time_distance_from_center.png":
+        return True
+    if n == "median_xy_trajectory_by_finger.png":
+        return True
+    if re.match(r"^subject_.+_xy_trajectories\.png$", n):
+        return True
+    return False
+
+
+def _deprecated_renamed_acceleration_figure(filename: str) -> bool:
+    """True for old acceleration filenames replaced by clearer names."""
+    n = str(filename).lower()
+    return n == "time_acceleration.png" or bool(
+        re.match(r"^subject_.+_acceleration\.png$", n)
+    )
+
+def table_category(name: str) -> str:
+    """Classify a CSV/parquet table name into a figure category folder."""
+    n = str(name).lower()
+    if "side_z" in n:
+        return "z_lift"
+    if "hand_orientation" in n:
+        return "hand_orientation"
+    if "movement_cycle" in n:
+        return "movement_orientation"
+    if "velocity_3d" in n or "3d_proxy_velocity" in n:
+        return "velocity"
+    if "trajectory" in n or "spatial" in n or "_3d" in n or "3d_" in n:
+        return "trajectories"
+    if "success" in n:
+        return "success"
+    if "velocity_acceleration" in n or "velocity" in n:
+        return "velocity"
+    if "acceleration" in n:
+        return "acceleration"
+    return "other"
+
+
+def velocity_result_subfolder(name: str) -> Optional[str]:
+    """Return the requested nested folder inside ``velocity`` for an output name."""
+    n = str(name).lower()
+    if (
+        "xyz_component" in n
+        or "xyz_axes" in n
+        or "x_axis" in n
+        or "y_axis" in n
+        or "z_axis" in n
+    ):
+        return "components"
+    if "curviness" in n or "decomposition" in n or "suggestion" in n:
+        return "others"
+    if "radial" in n:
+        return "radial"
+    if "tangential" in n:
+        return "tangential"
+    if "magnitude" in n or "speed" in n or "average_velocity" in n or "velocity_vs_time" in n:
+        return "magnitude"
+    if "velocity" in n:
+        return "others"
+    return None
+
+
+def table_category_parts(filename: str) -> tuple[str, ...]:
+    """Return nested semantic CSV/parquet folders for ``filename``."""
+    category = table_category(filename)
+    if category == "velocity":
+        sub = velocity_result_subfolder(filename)
+        if sub:
+            return ("velocity", sub)
+    return (category,)
+
+
+def categorized_table_path(results_root: Path, owner: str, filename: str) -> Path:
+    return results_root / owner / "csv" / Path(*table_category_parts(filename)) / filename
+
+
+def _rename_group_label(name: str) -> str:
+    """Map any combined-group alias to the canonical ``L_N_E`` folder name."""
+    return "L_N_E" if str(name) in {"N+L_E", "NL_E", "N_L_E", "L_N_E"} else str(name)
+
+
+def _safe_move(src: Path, dst: Path) -> Optional[Path]:
+    """Move ``src`` to ``dst`` and replace stale generated output if present."""
+    if src.resolve() == dst.resolve():
+        return None
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    shutil.move(str(src), str(dst))
+    return dst
+
+
+def _prune_empty_dirs(root: Path) -> None:
+    """Remove now-empty directories under ``root`` (deepest first)."""
+    for d in sorted(
+        (p for p in root.rglob("*") if p.is_dir()),
+        key=lambda p: len(p.parts),
+        reverse=True,
+    ):
+        try:
+            d.rmdir()  # only succeeds when empty
+        except OSError:
+            pass
+
+
+def organize_kinematic_results_tree(
+    results_root: Path, run_output_root: Path, selection: Any = None
+) -> pd.DataFrame:
+    """Reorganize a finished run into the by-subject, by-category tree.
+
+    Target layout (mirrors the agreed scheme)::
+
+        results/<owner>/figures/<category>/<file>.png
+        results/<owner>/csv/<category>/<file>.csv
+
+    where ``<owner>`` is a subject id (``L_E_1``) or a group folder
+    (``L_E``/``N_E``/``L_N_E``) sitting at the top level. Group/combined figures
+    that the run wrote under ``results/<LABEL>/figures/<group>/`` are relocated to
+    their own top-level group folder; aggregate tables that carry an
+    ``experiment_group`` column are additionally split per group so each group
+    folder gets its relevant tables, with the full table kept in the combined
+    (top) folder. Single-subject runs have no group folder. Returns a move log.
+    """
+    results_root = Path(results_root)
+    run_output_root = Path(run_output_root)
+    label = run_output_root.name  # top aggregate owner (subject, group, or L_N_E)
+    cats = set(KINEMATIC_FIGURE_CATEGORIES)
+    group_names = set(FULL_EXPERIMENT_GROUPS) | set(COMBINED_EXPERIMENT_GROUPS) | {"N+L_E"}
+    combined_members = COMBINED_EXPERIMENT_GROUPS.get(_rename_group_label(label), ())
+    moves: list[dict[str, Any]] = []
+
+    # ---- figures ----
+    for src in [p for p in results_root.rglob("*.png") if p.is_file()]:
+        rel = src.relative_to(results_root).parts
+        if "figures" not in rel:
+            continue
+        fi = rel.index("figures")
+        top = rel[0]
+        after = rel[fi + 1] if len(rel) > fi + 1 else ""
+        scope_folder = rel[fi - 1] if fi > 0 and rel[fi - 1] in {"all", "standard", "Comparison"} else None
+        if _deprecated_renamed_acceleration_figure(src.name):
+            src.unlink(missing_ok=True)
+            continue
+        if _deprecated_scoped_acceleration_figure(src.name, scope_folder):
+            src.unlink(missing_ok=True)
+            continue
+        if _deprecated_scoped_velocity_figure(src.name, scope_folder):
+            src.unlink(missing_ok=True)
+            continue
+        if _deprecated_velocity_acceleration_figure(src.name):
+            src.unlink(missing_ok=True)
+            continue
+        if _deprecated_trajectory_figure(src.name):
+            src.unlink(missing_ok=True)
+            continue
+        if len(rel) > fi + 1 and rel[fi + 1] in cats:
+            # Re-home already-categorized legacy files when their current
+            # subpath no longer matches the filename router.
+            if tuple(rel[fi + 1 : -1]) != figure_category_parts(src.name):
+                dst = categorized_figure_path(results_root, top, src.name)
+                if _safe_move(src, dst):
+                    moves.append({"kind": "figure", "owner": top, "to": str(dst)})
+            continue  # already categorized, or just moved from legacy layout
+        if scope_folder == "all":
+            src.unlink(missing_ok=True)
+            continue  # duplicate of the main run-level figures
+        filename = src.name
+        if scope_folder in {"standard", "Comparison"} and not filename.startswith(f"{scope_folder}_"):
+            filename = f"{scope_folder}_{filename}"
+        if SUBJECT_FOLDER_RE.match(top):
+            owner = top
+        elif top == label and after in group_names:
+            owner = _rename_group_label(after)
+        else:
+            owner = top  # general figures stay with the run/owner folder
+        dst = categorized_figure_path(results_root, owner, filename)
+        if _safe_move(src, dst):
+            moves.append({"kind": "figure", "owner": owner, "to": str(dst)})
+
+    # ---- csv / parquet ----
+    for src in [
+        p
+        for p in results_root.rglob("*")
+        if p.is_file() and p.suffix.lower() in {".csv", ".parquet"}
+    ]:
+        rel = src.relative_to(results_root).parts
+        if _deprecated_velocity_acceleration_table(src.name):
+            src.unlink(missing_ok=True)
+            continue
+        if "csv" in rel:
+            ci = rel.index("csv")
+            if len(rel) > ci + 1 and rel[ci + 1] in cats:
+                continue  # already categorized
+            owner = rel[0]
+            dst = categorized_table_path(results_root, owner, src.name)
+            if _safe_move(src, dst):
+                moves.append({"kind": "table", "owner": owner, "to": str(dst)})
+        elif "_group_level" in rel:
+            # Aggregate tables belong to the top (combined/group) owner; split
+            # per group for combined runs so each group folder gets its rows.
+            if src.suffix.lower() == ".csv" and combined_members:
+                try:
+                    df = read_csv_flexible(src)
+                except Exception:
+                    df = None
+                if df is not None and EXPERIMENT_GROUP_COLUMN in df.columns:
+                    for g in combined_members:
+                        sub = df[df[EXPERIMENT_GROUP_COLUMN].astype(str) == g]
+                        if not sub.empty:
+                            gdst = categorized_table_path(results_root, g, src.name)
+                            gdst.parent.mkdir(parents=True, exist_ok=True)
+                            if not gdst.exists():
+                                sub.to_csv(gdst, index=False)
+                                moves.append({"kind": "table", "owner": g, "to": str(gdst)})
+            dst = categorized_table_path(results_root, label, src.name)
+            if _safe_move(src, dst):
+                moves.append({"kind": "table", "owner": label, "to": str(dst)})
+        elif rel[0] == label:
+            scope_folder = rel[1] if len(rel) > 1 and rel[1] in {"all", "standard", "Comparison"} else None
+            if scope_folder == "all":
+                src.unlink(missing_ok=True)
+                continue  # duplicate of the main run-level tables
+            filename = src.name
+            if scope_folder in {"standard", "Comparison"} and not filename.startswith(f"{scope_folder}_"):
+                filename = f"{scope_folder}_{filename}"
+            if src.suffix.lower() == ".csv" and combined_members and scope_folder is None:
+                try:
+                    df = read_csv_flexible(src)
+                except Exception:
+                    df = None
+                if df is not None and EXPERIMENT_GROUP_COLUMN in df.columns:
+                    for g in combined_members:
+                        sub = df[df[EXPERIMENT_GROUP_COLUMN].astype(str) == g]
+                        if not sub.empty:
+                            gdst = categorized_table_path(results_root, g, filename)
+                            gdst.parent.mkdir(parents=True, exist_ok=True)
+                            if not gdst.exists():
+                                sub.to_csv(gdst, index=False)
+                                moves.append({"kind": "table", "owner": g, "to": str(gdst)})
+            dst = categorized_table_path(results_root, label, filename)
+            if _safe_move(src, dst):
+                moves.append({"kind": "table", "owner": label, "to": str(dst)})
+
+    _prune_empty_dirs(results_root)
+    return pd.DataFrame(moves, columns=["kind", "owner", "to"])
+
+
 def read_csv_flexible(path: Path, **kwargs: Any) -> pd.DataFrame:
     for enc in ("utf-8-sig", "utf-8", "cp1255", "latin1"):
         try:
@@ -185,22 +791,545 @@ def sanitize_name(value: Any, fallback: str = "unknown") -> str:
     return text or fallback
 
 
-def subject_figure_path(fig_dir: Path, subject_id: Any, filename: str) -> Path:
-    """Return a figure path under a per-person folder such as ``N_E_7``."""
+# The four full experiment groups (population x condition). Coarse single-letter
+# groups (L/N skin-stretch condition) are intentionally NOT in this set.
+FULL_EXPERIMENT_GROUPS: tuple[str, ...] = ("L_E", "L_P", "N_E", "N_P")
 
-    subject_dir = fig_dir / sanitize_name(subject_id, fallback="unknown_subject")
+# Combined cross-population groups: each combined label aggregates these full
+# experiment groups into one extra group folder (figures/<label>/all/).
+COMBINED_EXPERIMENT_GROUPS: dict[str, tuple[str, ...]] = {
+    "L_N_E": ("L_E", "N_E"),
+}
+
+
+def _is_full_experiment_group(group: Any) -> bool:
+    """True for L_E/L_P/N_E/N_P and combined labels (so they route to <group>/all)."""
+    g = str(group)
+    return g in FULL_EXPERIMENT_GROUPS or g in COMBINED_EXPERIMENT_GROUPS
+
+
+def _group_from_subject_id(subject_id: Any) -> str:
+    """Return the group prefix of a subject id (``L_E`` from ``L_E_1``).
+
+    Subject ids are ``<group>_<participant_number>`` (e.g. ``N_E_7``). If the
+    trailing token is not a number (an unexpected id), the whole id becomes the
+    group so nothing is silently dropped.
+    """
+    sid = sanitize_name(subject_id, fallback="unknown_subject")
+    head, _, tail = sid.rpartition("_")
+    return head if head and tail.isdigit() else sid
+
+
+# --- Data-selection mechanism (mirrors analysis/psychophysics/twoafc_psychophysics.py) ---
+# A notebook ``DATA_SELECTION`` flag chooses what enters the analysis: one subject
+# (``L_E_14``), a whole group (``L_E``/``L_P``/``N_E``/``N_P``), or the combined
+# cross-population group ``L_N_E`` (= L_E + N_E). The selection drives both the
+# discovery filter and the output folder name (``selection_label``).
+SUBJECT_FOLDER_RE = re.compile(
+    r"^(?P<setup>[LN])_(?P<protocol>[EP])_(?P<number>\d+)$", re.IGNORECASE
+)
+GROUP_SELECTIONS: dict[str, tuple[str, ...]] = {
+    "L_E": ("L_E",),
+    "L_P": ("L_P",),
+    "N_E": ("N_E",),
+    "N_P": ("N_P",),
+    "L_N_E": ("L_E", "N_E"),
+}
+FILTER_ONLY_SELECTION = "FILTER_ONLY"
+
+
+def canonical_subject_id(value: Any) -> str:
+    """Return the canonical ``L_E_14``-style subject id embedded in a folder/name."""
+    text = str(value).strip()
+    match = re.search(r"([LN])_([EP])_(\d+)", text, flags=re.IGNORECASE)
+    if not match:
+        return text
+    return f"{match.group(1).upper()}_{match.group(2).upper()}_{int(match.group(3))}"
+
+
+def subject_group_code(subject_id: Any) -> Optional[str]:
+    """Return ``L_E``/``L_P``/``N_E``/``N_P`` for canonical subject ids, else None."""
+    canonical = canonical_subject_id(subject_id)
+    match = SUBJECT_FOLDER_RE.match(canonical)
+    if not match:
+        return None
+    return f"{match.group('setup').upper()}_{match.group('protocol').upper()}"
+
+
+def _normalize_filter_only_selection_text(text: str) -> Optional[str]:
+    """Normalize DATA_SELECTION tokens that request only ``filter`` folders.
+
+    Accepted examples:
+    - ``FILTER_ONLY`` / ``FILTERED``: every valid filtered subject folder.
+    - ``L_E_FILTER_ONLY`` / ``L_E_FILTER`` / ``FILTER_L_E``: filtered folders
+      inside that group only.
+    """
+    t = (
+        str(text)
+        .strip()
+        .upper()
+        .replace(" ", "")
+        .replace("(FILTERED)", "_FILTERED")
+        .replace("(FILTER)", "_FILTER")
+        .replace("-", "_")
+    )
+    if t in {"FILTER", "FILTERED", "FILTER_ONLY", "ONLY_FILTER", "ONLY_FILTERED"}:
+        return FILTER_ONLY_SELECTION
+    for suffix in ("_FILTER_ONLY", "_ONLY_FILTER", "_FILTERED", "_FILTER"):
+        if t.endswith(suffix):
+            base = t[: -len(suffix)]
+            if not base:
+                return FILTER_ONLY_SELECTION
+            return f"{normalize_data_selection(base)}_{FILTER_ONLY_SELECTION}"
+    for prefix in ("FILTER_ONLY_", "ONLY_FILTER_", "FILTERED_", "FILTER_"):
+        if t.startswith(prefix):
+            base = t[len(prefix) :]
+            if not base:
+                return FILTER_ONLY_SELECTION
+            return f"{normalize_data_selection(base)}_{FILTER_ONLY_SELECTION}"
+    return None
+
+
+def _filter_only_selection_base(normalized_selection: str) -> Optional[str]:
+    """Return the base selection for a normalized filter-only token."""
+    normalized = str(normalized_selection)
+    if normalized == FILTER_ONLY_SELECTION:
+        return ""
+    suffix = f"_{FILTER_ONLY_SELECTION}"
+    if normalized.endswith(suffix):
+        return normalized[: -len(suffix)]
+    return None
+
+
+def selection_requests_filter_only(selection: Any) -> bool:
+    """True when DATA_SELECTION explicitly asks to keep only filter folders."""
+    if selection is None:
+        return False
+    if isinstance(selection, (list, tuple, set)):
+        return any(selection_requests_filter_only(item) for item in selection)
+    return _filter_only_selection_base(normalize_data_selection(selection)) is not None
+
+
+def normalize_data_selection(selection: Any) -> str:
+    """Normalize a notebook data-selection flag.
+
+    Valid group flags are ``L_E``, ``L_P``, ``N_E``, ``N_P``, and ``L_N_E``.
+    A concrete subject id such as ``L_E_14`` is also accepted. Use
+    ``FILTER_ONLY`` for only folders marked ``filter`` across all groups, or
+    ``L_E_FILTER_ONLY`` / ``N_E_FILTER_ONLY`` for only filtered folders inside
+    one group.
+    """
+    if isinstance(selection, (list, tuple, set)):
+        return "+".join(normalize_data_selection(item) for item in selection)
+    text = str(selection).strip().upper().replace(" ", "")
+    filter_only = _normalize_filter_only_selection_text(text)
+    if filter_only is not None:
+        return filter_only
+    if text in {"L_N_E", "L+N_E", "N_L_E", "N+L_E", "N_LE", "NL_E", "LN_E"}:
+        return "L_N_E"
+    if SUBJECT_FOLDER_RE.match(text):
+        return canonical_subject_id(text)
+    return text
+
+
+def _combined_group_label(items: Any) -> str:
+    """Label a multi-element selection by the experiment groups it spans.
+
+    Homogeneous lists collapse to that group (``["L_E_1","L_E_2"]`` -> ``L_E``);
+    an L_E+N_E mix becomes the combined ``L_N_E``; anything else falls back to a
+    descriptive ``custom_<groups>`` name.
+    """
+    groups: list[str] = []
+    for item in items:
+        g = subject_group_code(item) or normalize_data_selection(item)
+        if g and g not in groups:
+            groups.append(g)
+    groups = sorted(groups)
+    if len(groups) == 1:
+        return sanitize_name(groups[0])
+    if set(groups) == {"L_E", "N_E"}:
+        return "L_N_E"
+    return sanitize_name("custom_" + "_".join(groups))
+
+
+def _explicit_subject_list_label(items: Any) -> str:
+    """Stable label for an explicit list of subjects.
+
+    A concrete subject list is a custom selection, not a request for the full
+    experiment group.  Keep each requested subject in the owner label so
+    ``["L_E_1", "L_E_15", "L_E_19"]`` cannot silently become ``L_E``.
+    """
+
+    parts: list[str] = []
+    for item in items:
+        normalized = normalize_data_selection(item)
+        parts.append(sanitize_name(normalized, fallback="subject"))
+    return sanitize_name("_".join(parts), fallback="custom_subjects")
+
+
+def selection_label(selection: Any) -> str:
+    """Folder-safe run label.
+
+    A single subject -- as a string ``"L_E_1"`` or a one-element list
+    ``["L_E_1"]`` -- collapses to the subject id, so the run writes into one
+    ``results/<subject>`` folder. A multi-element explicit subject list keeps a
+    custom subject-list label; named cohort selections are labelled by group.
+    """
+    if isinstance(selection, (list, tuple, set)):
+        items = list(selection)
+        if len(items) == 1:
+            return selection_label(items[0])
+        if selection_is_explicit_subject_only(items):
+            return _explicit_subject_list_label(items)
+        return _combined_group_label(items)
+    return sanitize_name(normalize_data_selection(selection).replace("+", "_plus_"))
+
+
+def _selection_is_cohort_scope(selection: Any) -> bool:
+    """True for group/cohort selections, false for concrete subjects/filter-only."""
+    if selection is None:
+        return True
+    if selection_requests_filter_only(selection):
+        return False
+    if selection_is_explicit_subject_only(selection):
+        return False
+    if isinstance(selection, (list, tuple, set)):
+        return not selection_is_explicit_subject_only(selection)
+    normalized = normalize_data_selection(selection)
+    return normalized in GROUP_SELECTIONS
+
+
+def selection_output_label(
+    selection: Any, *, exclude_filter_folders: bool = False
+) -> str:
+    """Folder-safe run label that marks pre-filter cohort outputs.
+
+    When ``EXCLUDE_FILTER_FOLDERS`` is False for a group/cohort selection, the
+    run includes folders marked ``filter``. Those outputs are labelled
+    ``<selection>_before_filter`` so they cannot be confused with the clean
+    post-filter cohort. Explicit single subjects and ``FILTER_ONLY`` selections
+    keep their direct labels.
+    """
+    base = selection_label(selection) if selection is not None else "all_subjects"
+    if not exclude_filter_folders and _selection_is_cohort_scope(selection):
+        return f"{base}_before_filter"
+    return base
+
+
+def subject_matches_selection(subject_id: Any, selection: Any) -> bool:
+    """True when ``subject_id`` belongs to the requested selection."""
+    if isinstance(selection, (list, tuple, set)):
+        return any(subject_matches_selection(subject_id, item) for item in selection)
+    normalized = normalize_data_selection(selection)
+    filter_only_base = _filter_only_selection_base(normalized)
+    if filter_only_base is not None:
+        if not should_filter_analysis_path(subject_id):
+            return False
+        return True if not filter_only_base else subject_matches_selection(subject_id, filter_only_base)
+    subject = canonical_subject_id(subject_id)
+    group = subject_group_code(subject)
+    if normalized in GROUP_SELECTIONS:
+        return group in GROUP_SELECTIONS[normalized]
+    return subject == canonical_subject_id(normalized)
+
+
+def is_single_subject_selection(
+    selection: Any, subject_ids: Optional[list[str]] = None
+) -> bool:
+    """Return True when the run target is one concrete subject, not a group."""
+    if isinstance(selection, (list, tuple, set)):
+        return len(selection) == 1 and is_single_subject_selection(
+            next(iter(selection)), subject_ids
+        )
+    normalized = normalize_data_selection(selection)
+    if SUBJECT_FOLDER_RE.match(normalized) is None:
+        return False
+    if subject_ids is None:
+        return True
+    return len(subject_ids) == 1 and canonical_subject_id(subject_ids[0]) == normalized
+
+
+def _rmtree_windows_retry(
+    path: Path, *, attempts: int = 6, delay_seconds: float = 0.2
+) -> None:
+    """Remove a tree, retrying transient Windows/Dropbox file-handle locks."""
+    import gc
+    import os
+    import stat
+    import time
+
+    target = Path(path)
+    if not target.exists():
+        return
+
+    def _onerror(func: Any, failed_path: str, exc_info: Any) -> None:
+        os.chmod(failed_path, stat.S_IWRITE)
+        func(failed_path)
+
+    last_error: Optional[Exception] = None
+    for _ in range(max(1, attempts)):
+        try:
+            shutil.rmtree(target, onerror=_onerror)
+            return
+        except (PermissionError, OSError) as exc:
+            last_error = exc
+            gc.collect()
+            time.sleep(delay_seconds)
+    if last_error is not None:
+        raise last_error
+
+
+def reset_output_root(output_root: Path) -> Path:
+    """Delete and recreate a run-specific output folder.
+
+    Guards against deleting an anchor/home directory or a broad ``results`` root;
+    callers must pass a run-specific child such as ``results/N_E`` or a subject
+    folder ``results/N_E_1``.
+    """
+    output_root = Path(output_root).resolve()
+    if output_root == Path(output_root.anchor).resolve() or output_root == Path.home().resolve():
+        raise ValueError(f"Refusing to reset unsafe output root: {output_root}")
+    if output_root.name.lower() in {"results", "result", "results_old", "redults"}:
+        raise ValueError(
+            "Refusing to delete a broad results root directly. "
+            "Pass a run-specific child folder such as results/N_E."
+        )
+    if output_root.exists():
+        _rmtree_windows_retry(output_root, attempts=20, delay_seconds=0.35)
+    output_root.mkdir(parents=True, exist_ok=True)
+    return output_root
+
+
+def clear_output_root(output_root: Path) -> Path:
+    """Delete one subject/group owner folder if it exists -- WITHOUT recreating it.
+
+    Used to wipe stale content from a folder this run is about to (re)make, while
+    leaving every other folder in ``results/`` untouched. Unlike
+    ``reset_output_root`` it does not ``mkdir`` an empty shell: the folder is
+    recreated lazily only when an output is written into it, so an interrupted run
+    never leaves empty subject/group folders. Same safety guards as
+    ``reset_output_root``.
+    """
+    output_root = Path(output_root).resolve()
+    if output_root == Path(output_root.anchor).resolve() or output_root == Path.home().resolve():
+        raise ValueError(f"Refusing to clear unsafe output root: {output_root}")
+    if output_root.name.lower() in {"results", "result", "results_old", "redults"}:
+        raise ValueError(
+            "Refusing to delete a broad results root directly. "
+            "Pass a run-specific child folder such as results/N_E."
+        )
+    if output_root.exists():
+        _rmtree_windows_retry(output_root, attempts=20, delay_seconds=0.35)
+    return output_root
+
+
+def _results_root_from_fig_dir(fig_dir: Path) -> Path:
+    """Recover the results root from a ``<root>/figures[/<type>]`` directory.
+
+    Drops the ``figures`` segment (and everything below it) plus an optional
+    ``_group_level`` aggregate segment, so all figure routing shares one anchor.
+    """
+    parts = fig_dir.parts
+    base = Path(*parts[: parts.index("figures")]) if "figures" in parts else fig_dir
+    if base.name == "_group_level":
+        base = base.parent
+    return base
+
+
+def _figures_base(output_root: Path) -> Path:
+    """``<selection-root>/figures`` for the selection's aggregate figures.
+
+    Figure-producing functions receive the run output root (``results/<LABEL>/csv``
+    or the legacy ``_group_level`` root). Figures live beside the table tree under
+    ``results/<LABEL>/figures`` so the figure and CSV trees are siblings.
+    """
+    p = Path(output_root)
+    if p.name in {"_group_level", "csv"}:
+        p = p.parent
+    return p / "figures"
+
+
+def _selection_figures_root(fig_dir: Path) -> Path:
+    """``results/<LABEL>/figures`` from any figure dir (drops type subfolders)."""
+    return _results_root_from_fig_dir(fig_dir) / "figures"
+
+
+def subject_figure_path(fig_dir: Path, subject_id: Any, filename: str) -> Path:
+    """Per-participant figure path ``results/<subject>/figures/<file>``.
+
+    Subject folders are siblings of the selection folder (mirroring the
+    psychophysics tree), so a subject's figures live together under their own
+    ``figures`` folder regardless of which figure type produced them (the type
+    stays encoded in ``filename``, e.g. ``subject_L_E_1_xy_*.png``).
+    """
+    sid = sanitize_name(subject_id, fallback="unknown_subject")
+    subject_base = _results_root_from_fig_dir(fig_dir).parent
+    subject_dir = subject_base / sid / "figures"
     subject_dir.mkdir(parents=True, exist_ok=True)
     return subject_dir / filename
 
 
-def subject_figure_path_for_scope(fig_dir: Path, scope_name: str, filename: str) -> Path:
-    """Route ``subject_<id>`` scope figures into an ``<id>/`` folder."""
+def group_figure_path(fig_dir: Path, group: Any, filename: str) -> Path:
+    """Group-aggregate figure path ``results/<LABEL>/figures/<group>/<file>``.
 
-    subject_prefix = "subject_"
-    if scope_name.startswith(subject_prefix):
-        subject_id = scope_name[len(subject_prefix) :]
-        return subject_figure_path(fig_dir, subject_id, filename)
+    Group-level (aggregate) figures live under the selection folder's ``figures``
+    tree, in a per-group subfolder. The group identity is also encoded in
+    ``filename`` so files never collide.
+    """
+    # Keep "+" so a combined group reads as "N+L_E" rather than "N_L_E".
+    safe_group = re.sub(r"[^A-Za-z0-9._+-]+", "_", str(group)).strip("._-") or "unknown_group"
+    group_dir = _selection_figures_root(fig_dir) / safe_group
+    group_dir.mkdir(parents=True, exist_ok=True)
+    return group_dir / filename
+
+
+_BEFORE_FILTER_SUFFIX = "_before_filter"
+
+
+def _selection_owner_from_fig_dir(fig_dir: Path) -> str:
+    """Return the active run owner label for a figure directory."""
+
+    return _results_root_from_fig_dir(fig_dir).name
+
+
+def _base_selection_owner_label(owner: Any) -> str:
+    """Canonical owner label without transient run suffixes."""
+
+    label = _rename_group_label(str(owner))
+    if label.endswith(_BEFORE_FILTER_SUFFIX):
+        label = label[: -len(_BEFORE_FILTER_SUFFIX)]
+    return _rename_group_label(label)
+
+
+def _owner_is_custom_selection_label(owner: Any) -> bool:
+    """True for explicit-list/filter-only owner labels that must not widen."""
+
+    base = _base_selection_owner_label(owner)
+    if base == FILTER_ONLY_SELECTION or base.endswith("_FILTER_ONLY"):
+        return True
+    return len(re.findall(r"[LN]_[EP]_\d+", base, flags=re.IGNORECASE)) > 1
+
+
+def _owner_allowed_experiment_groups(fig_dir: Path) -> tuple[str, ...]:
+    """Experiment-group outputs that belong to the current run owner.
+
+    Named full-group runs emit only that group. Named combined-group runs keep
+    the member groups plus the combined aggregate. Custom explicit subject lists
+    emit no full-group owner folders; their aggregate is the custom owner itself.
+    """
+
+    base = _base_selection_owner_label(_selection_owner_from_fig_dir(fig_dir))
+    if base in FULL_EXPERIMENT_GROUPS:
+        return (base,)
+    if base in COMBINED_EXPERIMENT_GROUPS:
+        return tuple(COMBINED_EXPERIMENT_GROUPS[base]) + (base,)
+    if _owner_is_custom_selection_label(base):
+        return ()
+    # Legacy/unscoped call sites (for example direct unit-test tmp roots) do not
+    # carry a selection label, so preserve the historical all-groups behavior.
+    return tuple(FULL_EXPERIMENT_GROUPS) + tuple(COMBINED_EXPERIMENT_GROUPS)
+
+
+def _owner_allows_experiment_group_output(fig_dir: Path, group: Any) -> bool:
+    return _rename_group_label(str(group)) in _owner_allowed_experiment_groups(fig_dir)
+
+
+def _aggregate_group_frames_for_output(
+    fig_dir: Path, df: pd.DataFrame
+) -> list[tuple[str, pd.DataFrame]]:
+    """Return aggregate plotting scopes allowed for the current output owner.
+
+    This is the central guard that prevents explicit subject lists from being
+    widened to their full experiment group.  For a custom list, the only group
+    aggregate is the current owner and its rows are exactly the selected rows in
+    ``df``.
+    """
+
+    if not _has_multiple_subjects(df) or "subject_id" not in df.columns:
+        return []
+    gdf = df.copy()
+    gdf["_full_group"] = gdf["subject_id"].map(_group_from_subject_id)
+    base = _base_selection_owner_label(_selection_owner_from_fig_dir(fig_dir))
+    if base in FULL_EXPERIMENT_GROUPS:
+        sub = gdf[gdf["_full_group"] == base]
+        return [(base, sub)] if not sub.empty else []
+    if base in COMBINED_EXPERIMENT_GROUPS:
+        frames: list[tuple[str, pd.DataFrame]] = []
+        for group in COMBINED_EXPERIMENT_GROUPS[base]:
+            sub = gdf[gdf["_full_group"] == group]
+            if sub["subject_id"].nunique() > 0:
+                frames.append((group, sub))
+        combined = gdf[gdf["_full_group"].isin(COMBINED_EXPERIMENT_GROUPS[base])]
+        if combined["subject_id"].nunique() > 0:
+            frames.append((base, combined))
+        return frames
+    if not _owner_is_custom_selection_label(base):
+        frames = [
+            (grp, gdf[gdf["_full_group"] == grp])
+            for grp in sorted(gdf["_full_group"].dropna().unique(), key=str)
+        ]
+        for cname, members in COMBINED_EXPERIMENT_GROUPS.items():
+            sub = gdf[gdf["_full_group"].isin(members)]
+            if sub["subject_id"].nunique() > 0:
+                frames.append((cname, sub))
+        return frames
+    owner = sanitize_name(_selection_owner_from_fig_dir(fig_dir), fallback="custom_group")
+    return [(owner, gdf)]
+
+
+def general_figure_path(fig_dir: Path, filename: str) -> Path:
+    """General (all-participant) figure path ``results/<LABEL>/figures/all/<file>``."""
+    all_dir = _selection_figures_root(fig_dir) / "all"
+    all_dir.mkdir(parents=True, exist_ok=True)
+    return all_dir / filename
+
+
+def subject_figure_path_for_scope(fig_dir: Path, scope_name: str, filename: str) -> Path:
+    """Route scope figures: ``subject_<id>`` -> participant folder, full-group
+    scopes -> ``<results>/<group>/``, everything else -> the global figures dir."""
+
+    if scope_name.startswith("subject_"):
+        return subject_figure_path(fig_dir, scope_name[len("subject_") :], filename)
+    for prefix in ("experiment_group_", "group_"):
+        if scope_name.startswith(prefix):
+            group = scope_name[len(prefix) :]
+            if _is_full_experiment_group(group) and _owner_allows_experiment_group_output(
+                fig_dir, group
+            ):
+                return group_figure_path(fig_dir, group, filename)
+            break
     return fig_dir / filename
+
+
+def _scope_output_dir(fig_dir: Path, scope_name: str) -> Optional[Path]:
+    """Destination folder for a ``_group_variants`` scope under the new layout.
+
+    - ``experiment_group_<G>`` for a full group (L_E/L_P/N_E/N_P or combined) ->
+      ``results/<LABEL>/figures/<G>/`` (group-aggregate figures).
+    - ``subject_group_*`` / ``workspace_*`` -> ``None`` (dropped: once restricted to
+      the true experiment group they duplicate the ``experiment_group`` panel).
+    - ``success_*`` -> ``None`` (the combined success-vs-failure figure is emitted
+      separately, and the ``all`` figure already shows both).
+    - everything else (``all``, ``finger_*``, ``stiffness_*``, ``protocol_*`` ...)
+      -> ``results/<LABEL>/figures/all/`` (general figures).
+
+    Returns ``None`` when the scope figure should not be produced.
+    """
+    for prefix in ("experiment_group_", "group_"):
+        if scope_name.startswith(prefix):
+            group = _rename_group_label(scope_name[len(prefix) :])
+            if _is_full_experiment_group(group) and _owner_allows_experiment_group_output(
+                fig_dir, group
+            ):
+                d = _selection_figures_root(fig_dir) / group
+                d.mkdir(parents=True, exist_ok=True)
+                return d
+            return None
+    if scope_name.startswith(("subject_group_", "workspace_", "success_")):
+        return None
+    d = _selection_figures_root(fig_dir) / "all"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def normalize_finger_condition(value: Any) -> Any:
@@ -217,13 +1346,56 @@ def normalize_finger_condition(value: Any) -> Any:
 
 
 def should_ignore_analysis_path(path: Path | str) -> bool:
-    """Return True for raw-data paths excluded from the requested analysis."""
+    """Return True for raw-data paths excluded from the requested analysis.
 
-    text = str(path).replace("_", " ").replace("-", " ").lower()
-    return any(
+    Each path part is normalized (``_``/``-``/space collapsed to a single space,
+    lower-cased) so that any folder carrying a ``not`` token -- ``not finish``,
+    ``not_include``, ``not-anything`` -- is dropped, alongside the legacy
+    ``old``/``unfinished`` markers. Words that merely contain the letters
+    ``not`` (``notes``, ``cannot``) are kept because the match is word-bounded.
+    """
+
+    parts = [
+        str(part).replace("_", " ").replace("-", " ").lower()
+        for part in Path(path).parts
+    ]
+    text = " ".join(parts)
+    if any(
         pattern.replace("_", " ").replace("-", " ") in text
         for pattern in IGNORED_PATH_PATTERNS
+    ):
+        return True
+    return any(re.search(r"\bnot\b", part) for part in parts)
+
+
+def should_filter_analysis_path(path: Path | str) -> bool:
+    """Return True for folders marked as manually filtered.
+
+    This is intentionally separate from :func:`should_ignore_analysis_path`:
+    ``not finish``/``old``/``unfinished`` paths are always excluded, while
+    ``filter`` folders are controlled by the notebook-level cohort flag.
+    """
+
+    parts = [
+        str(part).replace("_", " ").replace("-", " ").lower()
+        for part in Path(path).parts
+    ]
+    text = " ".join(parts)
+    return any(
+        re.search(rf"\b{re.escape(pattern)}\b", text)
+        for pattern in FILTER_PATH_PATTERNS
     )
+
+
+def selection_is_explicit_subject_only(selection: Any) -> bool:
+    """True when the user explicitly requested concrete subject id(s)."""
+    if selection is None:
+        return False
+    if isinstance(selection, (list, tuple, set)):
+        return bool(selection) and all(
+            selection_is_explicit_subject_only(item) for item in selection
+        )
+    return SUBJECT_FOLDER_RE.match(normalize_data_selection(selection)) is not None
 
 
 def experiment_group_for_subject(subject_id: Any, subject_group: Any = np.nan) -> Any:
@@ -561,6 +1733,43 @@ def _sem(s: pd.Series) -> float:
     return float(x.std(ddof=1) / math.sqrt(len(x)))
 
 
+def _stable_derivative_dt(
+    time_s: pd.Series,
+    group_keys: Optional[Any] = None,
+    *,
+    min_fraction_of_median: float = 0.25,
+) -> pd.Series:
+    """Time deltas for derivatives, with duplicate/tiny gaps marked invalid.
+
+    Camera/tracker logs occasionally contain repeated or near-repeated
+    timestamps. Dividing a normal pixel jump by a 0--2 ms logging artifact
+    creates impossible velocity spikes, which then dominate radial/tangential
+    and 3D proxy plots.  The derivative should be undefined for those gaps, not
+    explosively large.
+    """
+
+    t = pd.to_numeric(time_s, errors="coerce")
+    if group_keys is None:
+        dt = t.diff()
+    else:
+        dt = t.groupby(group_keys, sort=False).diff()
+    positive = dt[np.isfinite(dt) & (dt > 0)]
+    if positive.empty:
+        return pd.Series(np.nan, index=dt.index, dtype=float)
+    median_dt = float(positive.median())
+    min_dt = median_dt * min_fraction_of_median if median_dt > 0 else 0.0
+    return dt.where(dt > min_dt)
+
+
+def _join_unique_nonempty(s: pd.Series) -> str:
+    vals = [
+        str(v).strip()
+        for v in s.dropna().unique()
+        if str(v).strip() and str(v).strip().lower() != "nan"
+    ]
+    return ";".join(vals)
+
+
 def _ci95_mean(s: pd.Series) -> tuple[float, float]:
     x = pd.to_numeric(s, errors="coerce").dropna()
     if len(x) <= 1:
@@ -653,7 +1862,9 @@ def _normalized_jerk_cost(segment: pd.DataFrame, *, path_length_px: float) -> fl
     squared_jerk = np.square(d["jx_px_s3"].to_numpy(dtype=float)) + np.square(
         d["jy_px_s3"].to_numpy(dtype=float)
     )
-    trapezoid = getattr(np, "trapezoid", np.trapz)
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is None:
+        trapezoid = lambda y, x: np.sum((y[:-1] + y[1:]) * 0.5 * np.diff(x))
     integral = float(trapezoid(squared_jerk, d["time_s"].to_numpy(dtype=float)))
     return (
         float((duration**5 / (path_length_px**2)) * integral)
@@ -1011,17 +2222,58 @@ def _correct_response_from_answer(
     return float(chosen == max(stiffness_1, stiffness_2))
 
 
-def discover_trials(data_root: Path) -> pd.DataFrame:
-    """Discover answers.csv files and map answer rows to pair tracking/video files."""
+def discover_trials(
+    data_root: Path,
+    *,
+    selection: Any = None,
+    exclude_filter_folders: bool = False,
+    pilot_onboarding_trials: int = PILOT_ONBOARDING_TRIALS,
+) -> pd.DataFrame:
+    """Discover answers.csv files and map answer rows to pair tracking/video files.
+
+    The first ``pilot_onboarding_trials`` comparison trials in each subject's
+    session are an onboarding/familiarisation phase and are skipped entirely so
+    they never enter the kinematic, segment, or summary tables. Pass
+    ``pilot_onboarding_trials=0`` to keep all trials (useful for unit tests
+    and small synthetic fixtures).
+
+    ``selection`` restricts discovery to a subject/group/combined cohort (see
+    ``subject_matches_selection``). ``None`` keeps every valid subject folder.
+    This is the single point where the data selection is applied; every
+    downstream table derives from the filtered manifest.
+
+    ``exclude_filter_folders`` drops folders carrying a ``filter`` token from
+    group/cohort selections. Explicit subject requests are kept even when the
+    folder name contains ``filter`` so ``DATA_SELECTION = "L_E_16"`` remains
+    inspectable.
+    """
+    pilot_onboarding_trials = max(0, int(pilot_onboarding_trials))
     rows: list[dict[str, Any]] = []
+    skip_filter_folders = (
+        exclude_filter_folders
+        and not selection_is_explicit_subject_only(selection)
+        and not selection_requests_filter_only(selection)
+    )
     for subject_dir in sorted(
         p
         for p in Path(data_root).iterdir()
         if p.is_dir() and not should_ignore_analysis_path(p)
     ):
+        if skip_filter_folders and should_filter_analysis_path(subject_dir.name):
+            continue
+        if selection is not None and not subject_matches_selection(
+            subject_dir.name, selection
+        ):
+            continue
         all_answer_files = sorted(subject_dir.rglob("answers.csv"))
         answer_files = sorted(
-            p for p in all_answer_files if not should_ignore_analysis_path(p)
+            p
+            for p in all_answer_files
+            if not should_ignore_analysis_path(p)
+            and not (
+                skip_filter_folders
+                and should_filter_analysis_path(p.relative_to(subject_dir))
+            )
         )
         if not answer_files:
             if all_answer_files:
@@ -1068,6 +2320,8 @@ def discover_trials(data_root: Path) -> pd.DataFrame:
                 if np.isfinite(pair_number) and pair_number > 0
                 else int(i + 1)
             )
+            if trial_index <= pilot_onboarding_trials:
+                continue
             pair_dir = answer_file.parent / f"pair_{trial_index:03d}"
             object_1_stiffness = _first_numeric(
                 row, ["object_1_stiffness", "first_stiffness", "stiffness_1"]
@@ -1191,6 +2445,7 @@ def compute_tracking_kinematics(
             ).dt.total_seconds()
         else:
             d["time_s"] = np.arange(len(d)) / 30.0
+        d = d.sort_values("time_s", kind="stable").reset_index(drop=True)
         d["trial_time_s"] = d["time_s"]
         trial_duration = (
             float(d["time_s"].max()) if d["time_s"].notna().any() else np.nan
@@ -1243,9 +2498,11 @@ def compute_tracking_kinematics(
             d.groupby("stiffness_segment_id", sort=False).ngroup() + 1
         )
 
-        whole_dt = d["time_s"].diff().replace(0, np.nan)
+        whole_dt = pd.to_numeric(d["time_s"], errors="coerce").diff()
         median_dt = (
-            float(whole_dt.dropna().median()) if whole_dt.dropna().size else 1.0 / 30.0
+            float(whole_dt[whole_dt > 0].dropna().median())
+            if whole_dt[whole_dt > 0].dropna().size
+            else 1.0 / 30.0
         )
         fs = 1.0 / median_dt if median_dt > 0 else 30.0
         d["x_lpf_px"] = _butter_filter(
@@ -1263,10 +2520,8 @@ def compute_tracking_kinematics(
 
         x_for_deriv = d["x_lpf_px"].where(d["x_lpf_px"].notna(), d["x_centered_px"])
         y_for_deriv = d["y_lpf_px"].where(d["y_lpf_px"].notna(), d["y_centered_px"])
-        segment_dt = (
-            d.groupby("stiffness_segment_id", sort=False)["time_s"]
-            .diff()
-            .replace(0, np.nan)
+        segment_dt = _stable_derivative_dt(
+            d["time_s"], d["stiffness_segment_id"], min_fraction_of_median=0.25
         )
         d["vx_px_s"] = (
             x_for_deriv.groupby(d["stiffness_segment_id"], sort=False).diff()
@@ -1436,19 +2691,19 @@ def compute_tracking_kinematics(
                     "duration_s": float(seg["stiffness_duration_s"].iloc[0]),
                     "pair_duration_s": trial_duration,
                     "sampling_rate_hz": fs,
-                    "mean_x_centered_px": float(movement["x_centered_px"].mean()),
-                    "mean_y_centered_px": float(movement["y_centered_px"].mean()),
-                    "mean_x_workspace_cm": float(movement["x_workspace_cm"].mean())
+                    "mean_x_centered_px": float(movement["x_centered_px"].median()),
+                    "mean_y_centered_px": float(movement["y_centered_px"].median()),
+                    "mean_x_workspace_cm": float(movement["x_workspace_cm"].median())
                     if "x_workspace_cm" in movement.columns
                     else np.nan,
-                    "mean_y_workspace_cm": float(movement["y_workspace_cm"].mean())
+                    "mean_y_workspace_cm": float(movement["y_workspace_cm"].median())
                     if "y_workspace_cm" in movement.columns
                     else np.nan,
-                    "mean_r_workspace_cm": float(movement["r_workspace_cm"].mean())
+                    "mean_r_workspace_cm": float(movement["r_workspace_cm"].median())
                     if "r_workspace_cm" in movement.columns
                     else np.nan,
                     "mean_r_workspace_normalized": float(
-                        movement["r_workspace_normalized"].mean()
+                        movement["r_workspace_normalized"].median()
                     )
                     if "r_workspace_normalized" in movement.columns
                     else np.nan,
@@ -1492,10 +2747,10 @@ def compute_tracking_kinematics(
                     if "side_camera_interpretation_note" in movement.columns
                     and movement["side_camera_interpretation_note"].notna().any()
                     else np.nan,
-                    "mean_r_center_px": float(movement["r_center_px"].mean()),
+                    "mean_r_center_px": float(movement["r_center_px"].median()),
                     "max_r_center_px": float(movement["r_center_px"].max()),
                     "mean_thumb_active_span_px": float(
-                        movement["thumb_active_span_px"].mean()
+                        movement["thumb_active_span_px"].median()
                     )
                     if "thumb_active_span_px" in movement.columns
                     else np.nan,
@@ -1509,35 +2764,35 @@ def compute_tracking_kinematics(
                     "straightness_index": net_disp / path_len
                     if path_len > 0
                     else np.nan,
-                    "mean_vx_px_s": float(movement["vx_px_s"].mean()),
-                    "mean_vy_px_s": float(movement["vy_px_s"].mean()),
-                    "mean_speed_px_s": float(movement["speed_px_s"].mean()),
+                    "mean_vx_px_s": float(movement["vx_px_s"].median()),
+                    "mean_vy_px_s": float(movement["vy_px_s"].median()),
+                    "mean_speed_px_s": float(movement["speed_px_s"].median()),
                     "max_speed_px_s": float(movement["speed_px_s"].max()),
-                    "mean_ax_px_s2": float(movement["ax_px_s2"].mean()),
-                    "mean_ay_px_s2": float(movement["ay_px_s2"].mean()),
+                    "mean_ax_px_s2": float(movement["ax_px_s2"].median()),
+                    "mean_ay_px_s2": float(movement["ay_px_s2"].median()),
                     "mean_acceleration_px_s2": float(
-                        movement["acceleration_px_s2"].mean()
+                        movement["acceleration_px_s2"].median()
                     ),
                     "max_acceleration_px_s2": float(
                         movement["acceleration_px_s2"].max()
                     ),
-                    "mean_jerk_px_s3": float(movement["jerk_px_s3"].mean()),
+                    "mean_jerk_px_s3": float(movement["jerk_px_s3"].median()),
                     "max_jerk_px_s3": float(movement["jerk_px_s3"].max()),
                     "normalized_jerk_cost": _normalized_jerk_cost(movement, path_length_px=path_len),
-                    "mean_curvature_1_px": float(movement["curvature_1_px"].mean()),
+                    "mean_curvature_1_px": float(movement["curvature_1_px"].median()),
                     "median_curvature_1_px": float(movement["curvature_1_px"].median()),
                     "speed_curvature_power_law_slope": speed_curvature["slope"],
                     "speed_curvature_power_law_intercept": speed_curvature["intercept"],
                     "speed_curvature_power_law_r2": speed_curvature["r2"],
                     "speed_curvature_power_law_n": speed_curvature["n"],
                     "mean_radial_velocity_px_s": float(
-                        movement["radial_velocity_px_s"].mean()
+                        movement["radial_velocity_px_s"].median()
                     ),
                     "mean_abs_radial_velocity_px_s": float(
-                        movement["radial_velocity_px_s"].abs().mean()
+                        movement["radial_velocity_px_s"].abs().median()
                     ),
                     "mean_abs_tangential_velocity_px_s": float(
-                        movement["tangential_velocity_px_s"].abs().mean()
+                        movement["tangential_velocity_px_s"].abs().median()
                     ),
                     "dominant_movement_angle_deg": dominant_angle,
                     "dominant_movement_direction": _direction_label(dominant_angle),
@@ -1559,26 +2814,26 @@ def compute_tracking_kinematics(
                 trial_time_fraction=("trial_time_fraction", "mean"),
                 stiffness_start_fraction=("stiffness_start_fraction", "first"),
                 stiffness_end_fraction=("stiffness_end_fraction", "first"),
-                x_centered_px=("x_centered_px", "mean"),
-                y_centered_px=("y_centered_px", "mean"),
-                r_center_px=("r_center_px", "mean"),
-                vx_px_s=("vx_px_s", "mean"),
-                vy_px_s=("vy_px_s", "mean"),
-                speed_px_s=("speed_px_s", "mean"),
-                ax_px_s2=("ax_px_s2", "mean"),
-                ay_px_s2=("ay_px_s2", "mean"),
-                acceleration_px_s2=("acceleration_px_s2", "mean"),
-                curvature_1_px=("curvature_1_px", "mean"),
-                jx_px_s3=("jx_px_s3", "mean"),
-                jy_px_s3=("jy_px_s3", "mean"),
-                jerk_px_s3=("jerk_px_s3", "mean"),
-                radial_velocity_px_s=("radial_velocity_px_s", "mean"),
-                tangential_velocity_px_s=("tangential_velocity_px_s", "mean"),
+                x_centered_px=("x_centered_px", "median"),
+                y_centered_px=("y_centered_px", "median"),
+                r_center_px=("r_center_px", "median"),
+                vx_px_s=("vx_px_s", "median"),
+                vy_px_s=("vy_px_s", "median"),
+                speed_px_s=("speed_px_s", "median"),
+                ax_px_s2=("ax_px_s2", "median"),
+                ay_px_s2=("ay_px_s2", "median"),
+                acceleration_px_s2=("acceleration_px_s2", "median"),
+                curvature_1_px=("curvature_1_px", "median"),
+                jx_px_s3=("jx_px_s3", "median"),
+                jy_px_s3=("jy_px_s3", "median"),
+                jerk_px_s3=("jerk_px_s3", "median"),
+                radial_velocity_px_s=("radial_velocity_px_s", "median"),
+                tangential_velocity_px_s=("tangential_velocity_px_s", "median"),
                 movement_angle_deg=("movement_angle_deg", lambda s: _circ_mean_deg(s)),
-                x_workspace_cm=("x_workspace_cm", "mean"),
-                y_workspace_cm=("y_workspace_cm", "mean"),
-                r_workspace_cm=("r_workspace_cm", "mean"),
-                r_workspace_normalized=("r_workspace_normalized", "mean"),
+                x_workspace_cm=("x_workspace_cm", "median"),
+                y_workspace_cm=("y_workspace_cm", "median"),
+                r_workspace_cm=("r_workspace_cm", "median"),
+                r_workspace_normalized=("r_workspace_normalized", "median"),
                 workspace_setup=("workspace_setup", "first"),
                 workspace_label=("workspace_label", "first"),
                 workspace_width_cm=("workspace_width_cm", "first"),
@@ -1590,13 +2845,13 @@ def compute_tracking_kinematics(
                     "side_camera_interpretation_note",
                     "first",
                 ),
-                thumb_x_centered_px=("thumb_x_centered_px", "mean"),
-                thumb_y_centered_px=("thumb_y_centered_px", "mean"),
-                active_finger_x_centered_px=("active_finger_x_centered_px", "mean"),
-                active_finger_y_centered_px=("active_finger_y_centered_px", "mean"),
-                thumb_active_dx_px=("thumb_active_dx_px", "mean"),
-                thumb_active_dy_px=("thumb_active_dy_px", "mean"),
-                thumb_active_span_px=("thumb_active_span_px", "mean"),
+                thumb_x_centered_px=("thumb_x_centered_px", "median"),
+                thumb_y_centered_px=("thumb_y_centered_px", "median"),
+                active_finger_x_centered_px=("active_finger_x_centered_px", "median"),
+                active_finger_y_centered_px=("active_finger_y_centered_px", "median"),
+                thumb_active_dx_px=("thumb_active_dx_px", "median"),
+                thumb_active_dy_px=("thumb_active_dy_px", "median"),
+                thumb_active_span_px=("thumb_active_span_px", "median"),
                 hand_orientation_xy_deg=(
                     "hand_orientation_xy_deg",
                     lambda s: _circ_mean_deg(s),
@@ -1731,6 +2986,279 @@ def _skin_mask_z_from_frame(frame: np.ndarray) -> dict[str, float]:
     }
 
 
+Z_TRACKING_FILENAME = "z_tracking.csv"
+Z_TRACKING_VALUE_COLUMNS = (
+    "z_active_finger_lift_px",
+    "z_hand_midpoint_lift_px",
+    "z_thumb_lift_px",
+)
+
+
+def _estimate_sample_rate_hz(time_s: pd.Series) -> float:
+    t = pd.to_numeric(time_s, errors="coerce").dropna().sort_values()
+    dt = t.diff().dropna()
+    dt = dt[dt > 0]
+    if dt.empty:
+        return np.nan
+    return float(1.0 / dt.median())
+
+
+def _load_z_tracking_csv(side_video: Path) -> pd.DataFrame | None:
+    """Load frame-by-frame MediaPipe side-camera Z tracking if it exists.
+
+    ``z_tracking.csv`` is generated beside ``side_camera.mp4`` by
+    ``results/create_z_treacking_from_side_videos.py``.  Missing hand-detection
+    frames are filled by linear interpolation over video time so downstream
+    kinematics receive a continuous Z trajectory while preserving the original
+    detection flag/rate.
+    """
+
+    z_path = side_video.parent / Z_TRACKING_FILENAME
+    if not z_path.exists():
+        return pd.DataFrame(
+            {
+                "z_tracking_file": [str(z_path)],
+                "z_tracking_warning": ["missing_z_tracking_csv"],
+            }
+        )
+    try:
+        raw = read_csv_flexible(z_path)
+    except Exception:
+        return pd.DataFrame(
+            {
+                "z_tracking_file": [str(z_path)],
+                "z_tracking_warning": ["could_not_read_z_tracking_csv"],
+            }
+        )
+    if "timestamp_s" not in raw.columns:
+        return pd.DataFrame(
+            {
+                "z_tracking_file": [str(z_path)],
+                "z_tracking_warning": ["missing_timestamp_s"],
+            }
+        )
+
+    z_col = next((c for c in Z_TRACKING_VALUE_COLUMNS if c in raw.columns), None)
+    if z_col is None:
+        return pd.DataFrame(
+            {
+                "z_tracking_file": [str(z_path)],
+                "z_tracking_warning": ["missing_z_value_column"],
+            }
+        )
+
+    z = raw.copy()
+    z["timestamp_s"] = pd.to_numeric(z["timestamp_s"], errors="coerce")
+    z = z.dropna(subset=["timestamp_s"]).sort_values("timestamp_s").reset_index(drop=True)
+    if z.empty:
+        return pd.DataFrame(
+            {
+                "z_tracking_file": [str(z_path)],
+                "z_tracking_warning": ["empty_z_tracking_csv"],
+            }
+        )
+
+    z["frame_index"] = np.arange(len(z), dtype=int)
+    raw_z = pd.to_numeric(z[z_col], errors="coerce")
+    if "z_tracking_flag" in z.columns:
+        detected = z["z_tracking_flag"].astype(str).str.lower().eq("ok") & raw_z.notna()
+    else:
+        detected = raw_z.notna()
+    z["side_detected"] = detected.astype(int)
+    z["side_z_lift_raw_px"] = raw_z.where(detected)
+
+    if z["side_z_lift_raw_px"].notna().any():
+        # Smooth over black/no-detection frames with time-ordered linear
+        # interpolation.  ``both`` fills short edge gaps from the nearest valid
+        # detection instead of leaving beginning/end black frames unusable.
+        z["side_z_lift_px"] = z["side_z_lift_raw_px"].interpolate(
+            method="linear", limit_direction="both"
+        )
+        z["side_z_interpolated"] = (
+            z["side_detected"].eq(0) & z["side_z_lift_px"].notna()
+        ).astype(int)
+        z["z_tracking_warning"] = np.where(
+            z["side_z_interpolated"].eq(1),
+            "interpolated_no_hand_detection",
+            "",
+        )
+    else:
+        z["side_z_lift_px"] = np.nan
+        z["side_z_interpolated"] = 0
+        z["z_tracking_warning"] = "no_usable_z_tracking_detection"
+
+    duration = float(z["timestamp_s"].max()) if z["timestamp_s"].notna().any() else np.nan
+    z["side_trial_time_fraction"] = np.where(
+        duration > 0,
+        z["timestamp_s"] / duration,
+        0.0,
+    )
+    z["side_trial_time_fraction"] = (
+        pd.to_numeric(z["side_trial_time_fraction"], errors="coerce")
+        .fillna(0.0)
+        .clip(0.0, 1.0)
+    )
+    z["side_time_s"] = z["timestamp_s"]
+    z["side_fps"] = _estimate_sample_rate_hz(z["timestamp_s"])
+    z["side_frame_count"] = len(z)
+    z["side_frame_width"] = np.nan
+    z["side_frame_height"] = np.nan
+    z["side_z_top_y_px"] = np.nan
+    z["side_z_centroid_y_px"] = np.nan
+    z["side_z_lift_centroid_px"] = np.nan
+    z["side_x_centroid_px"] = np.nan
+    z["side_x_from_frame_center_px"] = np.nan
+    z["side_mask_area_px"] = np.nan
+    z["side_z_source"] = f"{Z_TRACKING_FILENAME}:{z_col}"
+    z["z_tracking_file"] = str(z_path)
+    if "z_tracking_flag" not in z.columns:
+        z["z_tracking_flag"] = np.where(detected, "ok", "missing_z")
+    return z
+
+
+def _sample_side_z_rows(
+    rows: pd.DataFrame, samples_per_video: Optional[int]
+) -> pd.DataFrame:
+    """Return an evenly spaced, bounded subset of side-Z rows.
+
+    ``z_tracking.csv`` is frame-by-frame, so a full experiment can contain
+    millions of side-camera rows.  The notebook-facing ``samples_per_video``
+    knob is intentionally applied here, after segment slicing, so summaries keep
+    start/middle/end coverage without materializing every frame.
+    """
+
+    if rows.empty or samples_per_video is None:
+        return rows
+    n_samples = max(1, int(samples_per_video))
+    if len(rows) <= n_samples:
+        return rows
+    positions = np.linspace(0, len(rows) - 1, n_samples)
+    take = np.unique(np.rint(positions).astype(int))
+    return rows.iloc[take].copy()
+
+
+def _z_tracking_rows_for_segment(
+    z_tracking: pd.DataFrame,
+    meta: pd.Series,
+    video: Path,
+    start_fraction: float,
+    end_fraction: float,
+    samples_per_video: Optional[int],
+) -> pd.DataFrame:
+    """Return z_tracking rows restricted to one stiffness segment."""
+
+    if z_tracking.empty or "side_z_lift_px" not in z_tracking.columns:
+        warning = (
+            z_tracking["z_tracking_warning"].dropna().iloc[0]
+            if "z_tracking_warning" in z_tracking.columns
+            and z_tracking["z_tracking_warning"].notna().any()
+            else "empty_or_invalid_z_tracking_csv"
+        )
+        return pd.DataFrame(
+            [
+                {
+                    **meta.to_dict(),
+                    "side_video_file": str(video),
+                    "frame_index": np.nan,
+                    "side_time_s": np.nan,
+                    "side_trial_time_fraction": np.nan,
+                    "side_time_fraction": np.nan,
+                    "side_fps": np.nan,
+                    "side_frame_count": np.nan,
+                    "side_frame_width": np.nan,
+                    "side_frame_height": np.nan,
+                    "side_detected": 0,
+                    "side_z_top_y_px": np.nan,
+                    "side_z_centroid_y_px": np.nan,
+                    "side_z_lift_px": np.nan,
+                    "side_z_lift_centroid_px": np.nan,
+                    "side_x_centroid_px": np.nan,
+                    "side_x_from_frame_center_px": np.nan,
+                    "side_x_from_center_camera_corrected_px": np.nan,
+                    "side_mask_area_px": np.nan,
+                    "side_z_source": Z_TRACKING_FILENAME,
+                    "side_video_warning": warning,
+                    "z_tracking_warning": warning,
+                    "z_tracking_file": str(video.parent / Z_TRACKING_FILENAME),
+                    "z_tracking_flag": "invalid_z_tracking_csv",
+                    "side_z_interpolated": 0,
+                }
+            ]
+        )
+
+    trial_fraction = pd.to_numeric(
+        z_tracking["side_trial_time_fraction"], errors="coerce"
+    )
+    selected = z_tracking[
+        trial_fraction.between(start_fraction, end_fraction, inclusive="both")
+    ].copy()
+    if selected.empty:
+        # Very short segment or timestamp mismatch: keep the closest sample so
+        # the segment carries an explicit warning instead of disappearing.
+        midpoint = (start_fraction + end_fraction) / 2.0
+        closest_idx = (trial_fraction - midpoint).abs().idxmin()
+        selected = z_tracking.loc[[closest_idx]].copy()
+        selected["z_tracking_warning"] = "nearest_z_tracking_sample_used"
+
+    denom = max(end_fraction - start_fraction, 1e-12)
+    selected["side_time_fraction"] = (
+        (pd.to_numeric(selected["side_trial_time_fraction"], errors="coerce") - start_fraction)
+        / denom
+    ).clip(0.0, 1.0)
+    selected = _sample_side_z_rows(selected, samples_per_video)
+    selected["side_video_file"] = str(video)
+    selected["side_video_warning"] = ""
+    for col, val in meta.items():
+        if col not in selected.columns:
+            selected[col] = val
+    return selected
+
+
+def _finalize_side_sample_values(vals: pd.DataFrame) -> pd.DataFrame:
+    vals = add_side_camera_angle_normalization_columns(vals)
+    vals = vals.sort_values("side_time_s").copy()
+    dt = _stable_derivative_dt(vals["side_time_s"], min_fraction_of_median=0.25)
+    if "side_x_from_frame_center_px" in vals.columns:
+        vals["side_lateral_velocity_raw_px_s"] = (
+            pd.to_numeric(vals["side_x_from_frame_center_px"], errors="coerce")
+            .diff()
+            .divide(dt)
+        )
+    if "side_x_from_center_camera_corrected_px" in vals.columns:
+        vals["side_lateral_velocity_camera_corrected_px_s"] = (
+            pd.to_numeric(
+                vals["side_x_from_center_camera_corrected_px"],
+                errors="coerce",
+            )
+            .diff()
+            .divide(dt)
+        )
+    vals["side_z_velocity_px_s"] = (
+        pd.to_numeric(vals["side_z_lift_px"], errors="coerce").diff().divide(dt)
+    )
+    if {
+        "side_lateral_velocity_raw_px_s",
+        "side_z_velocity_px_s",
+    }.issubset(vals.columns):
+        vals["side_motion_direction_raw_deg"] = np.degrees(
+            np.arctan2(
+                vals["side_z_velocity_px_s"],
+                vals["side_lateral_velocity_raw_px_s"],
+            )
+        )
+    if {
+        "side_lateral_velocity_camera_corrected_px_s",
+        "side_z_velocity_px_s",
+    }.issubset(vals.columns):
+        vals["side_motion_direction_camera_corrected_deg"] = np.degrees(
+            np.arctan2(
+                vals["side_z_velocity_px_s"],
+                vals["side_lateral_velocity_camera_corrected_px_s"],
+            )
+        )
+    return vals
+
+
 def add_side_camera_angle_normalization_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Add pixel-space side-camera mirror correction for L/right vs N/left views.
 
@@ -1773,20 +3301,66 @@ def add_side_camera_angle_normalization_columns(df: pd.DataFrame) -> pd.DataFram
     return out
 
 
+def _summarize_side_z_by_stiffness(side_trial_summary: pd.DataFrame) -> pd.DataFrame:
+    """Side-camera Z/lift summary collapsed to one row per stiffness value.
+
+    Shared by ``estimate_side_video_z`` (whole selection) and the per-subject
+    report builder (``save_individual_subject_reports``) so a single subject's
+    side-Z-by-stiffness figure matches what a standalone single-subject run
+    produces. ``side_trial_summary`` carries ``subject_id``, so the per-subject
+    builder simply filters to one subject before calling this.
+    """
+    if side_trial_summary is None or side_trial_summary.empty:
+        return pd.DataFrame()
+    return (
+        side_trial_summary.groupby(["stiffness_value"], dropna=False)
+        .agg(
+            n_trials=("trial_index_raw", "count"),
+            n_subjects=("subject_id", "nunique"),
+            mean_side_z_lift_px=("mean_side_z_lift_px", "median"),
+            sem_side_z_lift_px=("mean_side_z_lift_px", _sem),
+            max_side_z_lift_px=("max_side_z_lift_px", "mean"),
+            mean_side_x_from_center_camera_corrected_px=(
+                "mean_side_x_from_center_camera_corrected_px",
+                "median",
+            ),
+            mean_side_lift_lateral_angle_camera_corrected_deg=(
+                "mean_side_lift_lateral_angle_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
+            mean_side_motion_direction_camera_corrected_deg=(
+                "mean_side_motion_direction_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
+            success_rate=("correct_response", "mean"),
+        )
+        .reset_index()
+    )
+
+
 def estimate_side_video_z(
     trial_summary: pd.DataFrame,
     *,
-    samples_per_video: int = 6,
+    samples_per_video: int = 30,
     max_trials: Optional[int] = None,
 ) -> dict[str, pd.DataFrame]:
-    """Estimate side-view vertical motion in pixels from side_camera.mp4.
+    """Estimate side-view vertical motion in pixels.
+
+    Prefer frame-by-frame MediaPipe ``z_tracking.csv`` files generated beside
+    each ``side_camera.mp4``.  Missing/no-detection rows in those files are
+    filled by linear interpolation over video time, while ``side_detected`` and
+    ``side_detection_rate`` preserve the original detection quality.
+
+    If ``z_tracking.csv`` is absent or invalid, the segment is kept with
+    ``side_detected = 0`` and a warning flag; the legacy sparse skin-mask
+    estimate is intentionally not used.
 
     When ``trial_summary`` is the segment-level table from
     :func:`compute_tracking_kinematics`, side frames are sampled only over that
     stiffness block's time window. This keeps side-view summaries aligned with
     participant x stiffness, matching the top-view kinematic outputs.
     """
-    rows: list[dict[str, Any]] = []
+    sample_frames: list[pd.DataFrame] = []
     selected = (
         trial_summary[trial_summary.get("side_video_exists", False).astype(bool)]
         .copy()
@@ -1795,18 +3369,19 @@ def estimate_side_video_z(
     selected = add_workspace_normalization_columns(selected)
     if max_trials is not None:
         selected = selected.head(max_trials)
+    # Side videos are grouped by file: the segment-level `selected` table can
+    # hold several stiffness segments for the same recording, and those rows are
+    # contiguous because `selected` is sorted by (subject_id, trial_index_raw).
+    # The frame-by-frame MediaPipe Z file is loaded once per side video and then
+    # sliced by each stiffness segment's time window.
+    current_video_str: Optional[str] = None
+    current_z_tracking: pd.DataFrame | None = None
     for _, meta in selected.iterrows():
         video = Path(str(meta.get("side_video_file", "")))
-        cap = cv2.VideoCapture(str(video))
-        if not cap.isOpened():
-            rows.append(
-                {**meta.to_dict(), "side_video_warning": "could_not_open_side_video"}
-            )
-            continue
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
-        width = float(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or np.nan)
-        height = float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or np.nan)
+        video_str = str(video)
+        if video_str != current_video_str:
+            current_video_str = video_str
+            current_z_tracking = _load_z_tracking_csv(video)
         start_fraction = pd.to_numeric(
             pd.Series([meta.get("stiffness_start_fraction", 0.0)]), errors="coerce"
         ).iloc[0]
@@ -1819,101 +3394,21 @@ def estimate_side_video_z(
             end_fraction = 1.0
         start_fraction = float(np.clip(start_fraction, 0.0, 1.0))
         end_fraction = float(np.clip(max(end_fraction, start_fraction), 0.0, 1.0))
-        start_frame = int(round(start_fraction * max(0, frame_count - 1)))
-        end_frame = int(round(end_fraction * max(0, frame_count - 1)))
-        positions = np.linspace(
-            start_frame, max(start_frame, end_frame), max(1, samples_per_video)
-        ).astype(int)
-        trial_rows: list[dict[str, Any]] = []
-        for pos in positions:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
-            ok, frame = cap.read()
-            if not ok:
-                continue
-            trial_fraction = (
-                float(pos / max(1, frame_count - 1)) if frame_count > 1 else 0.0
-            )
-            denom = max(end_fraction - start_fraction, 1e-12)
-            side_time_fraction = float(
-                np.clip((trial_fraction - start_fraction) / denom, 0.0, 1.0)
-            )
-            trial_rows.append(
-                {
-                    **meta.to_dict(),
-                    "side_video_file": str(video),
-                    "frame_index": int(pos),
-                    "side_time_s": float(pos / fps) if fps > 0 else np.nan,
-                    "side_trial_time_fraction": trial_fraction,
-                    "side_time_fraction": side_time_fraction,
-                    "side_fps": fps,
-                    "side_frame_count": frame_count,
-                    "side_frame_width": width,
-                    "side_frame_height": height,
-                    **_skin_mask_z_from_frame(frame),
-                    "side_video_warning": "",
-                }
-            )
-        cap.release()
-        if trial_rows:
-            vals = pd.DataFrame(trial_rows)
-            detected = vals[vals["side_detected"] == 1]
-            baseline = (
-                float(detected["side_z_top_y_px"].quantile(0.95))
-                if not detected.empty
-                else np.nan
-            )
-            vals["side_z_lift_px"] = baseline - vals["side_z_top_y_px"]
-            vals["side_z_lift_centroid_px"] = (
-                float(vals["side_z_centroid_y_px"].quantile(0.95))
-                - vals["side_z_centroid_y_px"]
-                if vals["side_z_centroid_y_px"].notna().any()
-                else np.nan
-            )
-            vals = add_side_camera_angle_normalization_columns(vals)
-            vals = vals.sort_values("side_time_s").copy()
-            dt = pd.to_numeric(vals["side_time_s"], errors="coerce").diff().replace(
-                0, np.nan
-            )
-            if "side_x_from_frame_center_px" in vals.columns:
-                vals["side_lateral_velocity_raw_px_s"] = (
-                    pd.to_numeric(vals["side_x_from_frame_center_px"], errors="coerce")
-                    .diff()
-                    .divide(dt)
-                )
-            if "side_x_from_center_camera_corrected_px" in vals.columns:
-                vals["side_lateral_velocity_camera_corrected_px_s"] = (
-                    pd.to_numeric(
-                        vals["side_x_from_center_camera_corrected_px"],
-                        errors="coerce",
-                    )
-                    .diff()
-                    .divide(dt)
-                )
-            vals["side_z_velocity_px_s"] = (
-                pd.to_numeric(vals["side_z_lift_px"], errors="coerce").diff().divide(dt)
-            )
-            if {
-                "side_lateral_velocity_raw_px_s",
-                "side_z_velocity_px_s",
-            }.issubset(vals.columns):
-                vals["side_motion_direction_raw_deg"] = np.degrees(
-                    np.arctan2(
-                        vals["side_z_velocity_px_s"],
-                        vals["side_lateral_velocity_raw_px_s"],
-                    )
-                )
-            if {
-                "side_lateral_velocity_camera_corrected_px_s",
-                "side_z_velocity_px_s",
-            }.issubset(vals.columns):
-                vals["side_motion_direction_camera_corrected_deg"] = np.degrees(
-                    np.arctan2(
-                        vals["side_z_velocity_px_s"],
-                        vals["side_lateral_velocity_camera_corrected_px_s"],
-                    )
-                )
-            rows.extend(vals.to_dict("records"))
-    side_samples = pd.DataFrame(rows)
+        vals = _z_tracking_rows_for_segment(
+            current_z_tracking if current_z_tracking is not None else pd.DataFrame(),
+            meta,
+            video,
+            start_fraction,
+            end_fraction,
+            samples_per_video,
+        )
+        vals = _finalize_side_sample_values(vals)
+        sample_frames.append(vals)
+    side_samples = (
+        pd.concat(sample_frames, ignore_index=True, sort=False)
+        if sample_frames
+        else pd.DataFrame()
+    )
     if side_samples.empty:
         return {
             "side_samples": side_samples,
@@ -1922,6 +3417,13 @@ def estimate_side_video_z(
             "side_stiffness_summary": pd.DataFrame(),
             "side_subject_stiffness_summary": pd.DataFrame(),
         }
+    if "z_tracking_warning" not in side_samples.columns:
+        side_samples["z_tracking_warning"] = ""
+    if "z_tracking_file" not in side_samples.columns:
+        side_samples["z_tracking_file"] = ""
+    side_samples["missing_z_tracking_csv"] = (
+        side_samples["z_tracking_warning"].astype(str).eq("missing_z_tracking_csv").astype(int)
+    )
 
     base_keys = ["subject_id", "trial_index_raw"]
     if "stiffness_segment_id" in side_samples.columns:
@@ -1941,16 +3443,19 @@ def estimate_side_video_z(
             signed_stiffness_delta=("signed_stiffness_delta", "first"),
             correct_response=("correct_response", "first"),
             side_video_file=("side_video_file", "first"),
+            z_tracking_file=("z_tracking_file", "first"),
+            z_tracking_warning=("z_tracking_warning", _join_unique_nonempty),
+            missing_z_tracking_csv=("missing_z_tracking_csv", "max"),
             side_camera_side=("side_camera_side", "first"),
             side_camera_view_sign=("side_camera_view_sign", "first"),
             n_side_samples=("frame_index", "count"),
             side_detection_rate=("side_detected", "mean"),
-            mean_side_z_lift_px=("side_z_lift_px", "mean"),
+            mean_side_z_lift_px=("side_z_lift_px", "median"),
             max_side_z_lift_px=("side_z_lift_px", "max"),
-            mean_side_x_from_center_raw_px=("side_x_from_frame_center_px", "mean"),
+            mean_side_x_from_center_raw_px=("side_x_from_frame_center_px", "median"),
             mean_side_x_from_center_camera_corrected_px=(
                 "side_x_from_center_camera_corrected_px",
-                "mean",
+                "median",
             ),
             max_abs_side_x_from_center_camera_corrected_px=(
                 "side_x_from_center_camera_corrected_px",
@@ -1968,7 +3473,7 @@ def estimate_side_video_z(
                 "side_motion_direction_camera_corrected_deg",
                 lambda s: _circ_mean_deg(s),
             ),
-            mean_side_mask_area_px=("side_mask_area_px", "mean"),
+            mean_side_mask_area_px=("side_mask_area_px", "median"),
         )
         .reset_index()
     )
@@ -2006,11 +3511,11 @@ def estimate_side_video_z(
             n_frames=("frame_index", "count"),
             side_time_fraction=("side_time_fraction", "mean"),
             side_trial_time_fraction=("side_trial_time_fraction", "mean"),
-            mean_side_z_lift_px=("side_z_lift_px", "mean"),
+            mean_side_z_lift_px=("side_z_lift_px", "median"),
             sem_side_z_lift_px=("side_z_lift_px", _sem),
             mean_side_x_from_center_camera_corrected_px=(
                 "side_x_from_center_camera_corrected_px",
-                "mean",
+                "median",
             ),
             mean_side_lift_lateral_angle_camera_corrected_deg=(
                 "side_lift_lateral_angle_camera_corrected_deg",
@@ -2037,12 +3542,12 @@ def estimate_side_video_z(
         )
         .agg(
             n_trials=("trial_index_raw", "count"),
-            mean_side_z_lift_px=("mean_side_z_lift_px", "mean"),
+            mean_side_z_lift_px=("mean_side_z_lift_px", "median"),
             sem_side_z_lift_px=("mean_side_z_lift_px", _sem),
             max_side_z_lift_px=("max_side_z_lift_px", "mean"),
             mean_side_x_from_center_camera_corrected_px=(
                 "mean_side_x_from_center_camera_corrected_px",
-                "mean",
+                "median",
             ),
             mean_side_lift_lateral_angle_camera_corrected_deg=(
                 "mean_side_lift_lateral_angle_camera_corrected_deg",
@@ -2056,30 +3561,7 @@ def estimate_side_video_z(
         )
         .reset_index()
     )
-    side_stiffness_summary = (
-        side_trial_summary.groupby(["stiffness_value"], dropna=False)
-        .agg(
-            n_trials=("trial_index_raw", "count"),
-            n_subjects=("subject_id", "nunique"),
-            mean_side_z_lift_px=("mean_side_z_lift_px", "mean"),
-            sem_side_z_lift_px=("mean_side_z_lift_px", _sem),
-            max_side_z_lift_px=("max_side_z_lift_px", "mean"),
-            mean_side_x_from_center_camera_corrected_px=(
-                "mean_side_x_from_center_camera_corrected_px",
-                "mean",
-            ),
-            mean_side_lift_lateral_angle_camera_corrected_deg=(
-                "mean_side_lift_lateral_angle_camera_corrected_deg",
-                lambda s: _circ_mean_deg(s),
-            ),
-            mean_side_motion_direction_camera_corrected_deg=(
-                "mean_side_motion_direction_camera_corrected_deg",
-                lambda s: _circ_mean_deg(s),
-            ),
-            success_rate=("correct_response", "mean"),
-        )
-        .reset_index()
-    )
+    side_stiffness_summary = _summarize_side_z_by_stiffness(side_trial_summary)
     return {
         "side_samples": side_samples,
         "side_trial_summary": side_trial_summary,
@@ -2190,11 +3672,11 @@ def summarize_kinematics(
         .agg(
             n_trials=("trial_index_raw", "count"),
             success_rate=("correct_response", "mean"),
-            mean_x_centered_px=("mean_x_centered_px", "mean"),
-            mean_y_centered_px=("mean_y_centered_px", "mean"),
-            mean_speed_px_s=("mean_speed_px_s", "mean"),
-            mean_r_center_px=("mean_r_center_px", "mean"),
-            mean_path_length_px=("path_length_px", "mean"),
+            mean_x_centered_px=("mean_x_centered_px", "median"),
+            mean_y_centered_px=("mean_y_centered_px", "median"),
+            mean_speed_px_s=("mean_speed_px_s", "median"),
+            mean_r_center_px=("mean_r_center_px", "median"),
+            mean_path_length_px=("path_length_px", "median"),
         )
         .reset_index()
     )
@@ -2236,9 +3718,9 @@ def summarize_kinematics(
         ts.groupby(distance_cols, dropna=False)
         .agg(
             n_trials=("trial_index_raw", "count"),
-            mean_max_r_center_px=("max_r_center_px", "mean"),
+            mean_max_r_center_px=("max_r_center_px", "median"),
             success_rate=("correct_response", "mean"),
-            mean_speed_px_s=("mean_speed_px_s", "mean"),
+            mean_speed_px_s=("mean_speed_px_s", "median"),
         )
         .reset_index()
     )
@@ -2261,31 +3743,31 @@ def summarize_kinematics(
         .agg(
             n_trials=("trial_index_raw", "count"),
             success_rate=("correct_response", "mean"),
-            mean_x_centered_px=("mean_x_centered_px", "mean"),
-            mean_y_centered_px=("mean_y_centered_px", "mean"),
-            mean_x_workspace_cm=("mean_x_workspace_cm", "mean"),
-            mean_y_workspace_cm=("mean_y_workspace_cm", "mean"),
-            mean_r_workspace_cm=("mean_r_workspace_cm", "mean"),
-            mean_r_workspace_normalized=("mean_r_workspace_normalized", "mean"),
-            mean_max_r_center_px=("max_r_center_px", "mean"),
-            mean_thumb_active_span_px=("mean_thumb_active_span_px", "mean"),
+            mean_x_centered_px=("mean_x_centered_px", "median"),
+            mean_y_centered_px=("mean_y_centered_px", "median"),
+            mean_x_workspace_cm=("mean_x_workspace_cm", "median"),
+            mean_y_workspace_cm=("mean_y_workspace_cm", "median"),
+            mean_r_workspace_cm=("mean_r_workspace_cm", "median"),
+            mean_r_workspace_normalized=("mean_r_workspace_normalized", "median"),
+            mean_max_r_center_px=("max_r_center_px", "median"),
+            mean_thumb_active_span_px=("mean_thumb_active_span_px", "median"),
             mean_hand_orientation_xy_deg=(
                 "mean_hand_orientation_xy_deg",
                 lambda s: _circ_mean_deg(s),
             ),
-            mean_vx_px_s=("mean_vx_px_s", "mean"),
-            mean_vy_px_s=("mean_vy_px_s", "mean"),
-            mean_speed_px_s=("mean_speed_px_s", "mean"),
-            mean_ax_px_s2=("mean_ax_px_s2", "mean"),
-            mean_ay_px_s2=("mean_ay_px_s2", "mean"),
-            mean_acceleration_px_s2=("mean_acceleration_px_s2", "mean"),
-            mean_jerk_px_s3=("mean_jerk_px_s3", "mean"),
-            mean_normalized_jerk_cost=("normalized_jerk_cost", "mean"),
-            mean_curvature_1_px=("mean_curvature_1_px", "mean"),
+            mean_vx_px_s=("mean_vx_px_s", "median"),
+            mean_vy_px_s=("mean_vy_px_s", "median"),
+            mean_speed_px_s=("mean_speed_px_s", "median"),
+            mean_ax_px_s2=("mean_ax_px_s2", "median"),
+            mean_ay_px_s2=("mean_ay_px_s2", "median"),
+            mean_acceleration_px_s2=("mean_acceleration_px_s2", "median"),
+            mean_jerk_px_s3=("mean_jerk_px_s3", "median"),
+            mean_normalized_jerk_cost=("normalized_jerk_cost", "median"),
+            mean_curvature_1_px=("mean_curvature_1_px", "median"),
             speed_curvature_power_law_slope=("speed_curvature_power_law_slope", "mean"),
             speed_curvature_power_law_r2=("speed_curvature_power_law_r2", "mean"),
-            mean_path_length_px=("path_length_px", "mean"),
-            mean_straightness_index=("straightness_index", "mean"),
+            mean_path_length_px=("path_length_px", "median"),
+            mean_straightness_index=("straightness_index", "median"),
             circular_mean_direction_deg=(
                 "dominant_movement_angle_deg",
                 lambda s: _circ_mean_deg(s),
@@ -2305,27 +3787,27 @@ def summarize_kinematics(
             n_trials=("trial_index_raw", "count"),
             n_subjects=("subject_id", "nunique"),
             success_rate=("correct_response", "mean"),
-            mean_x_centered_px=("mean_x_centered_px", "mean"),
-            mean_y_centered_px=("mean_y_centered_px", "mean"),
+            mean_x_centered_px=("mean_x_centered_px", "median"),
+            mean_y_centered_px=("mean_y_centered_px", "median"),
             sem_x_centered_px=("mean_x_centered_px", _sem),
             sem_y_centered_px=("mean_y_centered_px", _sem),
-            mean_vx_px_s=("mean_vx_px_s", "mean"),
-            mean_vy_px_s=("mean_vy_px_s", "mean"),
+            mean_vx_px_s=("mean_vx_px_s", "median"),
+            mean_vy_px_s=("mean_vy_px_s", "median"),
             sem_vx_px_s=("mean_vx_px_s", _sem),
             sem_vy_px_s=("mean_vy_px_s", _sem),
-            mean_speed_px_s=("mean_speed_px_s", "mean"),
+            mean_speed_px_s=("mean_speed_px_s", "median"),
             sem_speed_px_s=("mean_speed_px_s", _sem),
-            mean_ax_px_s2=("mean_ax_px_s2", "mean"),
-            mean_ay_px_s2=("mean_ay_px_s2", "mean"),
+            mean_ax_px_s2=("mean_ax_px_s2", "median"),
+            mean_ay_px_s2=("mean_ay_px_s2", "median"),
             sem_ax_px_s2=("mean_ax_px_s2", _sem),
             sem_ay_px_s2=("mean_ay_px_s2", _sem),
-            mean_acceleration_px_s2=("mean_acceleration_px_s2", "mean"),
+            mean_acceleration_px_s2=("mean_acceleration_px_s2", "median"),
             sem_acceleration_px_s2=("mean_acceleration_px_s2", _sem),
-            mean_jerk_px_s3=("mean_jerk_px_s3", "mean"),
+            mean_jerk_px_s3=("mean_jerk_px_s3", "median"),
             sem_jerk_px_s3=("mean_jerk_px_s3", _sem),
-            mean_normalized_jerk_cost=("normalized_jerk_cost", "mean"),
+            mean_normalized_jerk_cost=("normalized_jerk_cost", "median"),
             sem_normalized_jerk_cost=("normalized_jerk_cost", _sem),
-            mean_path_length_px=("path_length_px", "mean"),
+            mean_path_length_px=("path_length_px", "median"),
             circular_mean_direction_deg=(
                 "dominant_movement_angle_deg",
                 lambda s: _circ_mean_deg(s),
@@ -2338,6 +3820,8 @@ def summarize_kinematics(
         tb = add_success_label_column(
             add_protocol_demographic_factors(add_workspace_normalization_columns(time_bins))
         )
+        if "az_px_s2" not in tb.columns:
+            tb["az_px_s2"] = np.nan
         if "stiffness_value" not in tb.columns:
             tb["stiffness_value"] = pd.to_numeric(
                 tb.get("comparison_value", np.nan), errors="coerce"
@@ -2364,31 +3848,32 @@ def summarize_kinematics(
                 time_fraction=("time_fraction", "mean"),
                 stiffness_time_fraction=("stiffness_time_fraction", "mean"),
                 trial_time_fraction=("trial_time_fraction", "mean"),
-                mean_x_centered_px=("x_centered_px", "mean"),
-                mean_y_centered_px=("y_centered_px", "mean"),
-                mean_x_workspace_cm=("x_workspace_cm", "mean"),
-                mean_y_workspace_cm=("y_workspace_cm", "mean"),
-                mean_r_workspace_normalized=("r_workspace_normalized", "mean"),
+                mean_x_centered_px=("x_centered_px", "median"),
+                mean_y_centered_px=("y_centered_px", "median"),
+                mean_x_workspace_cm=("x_workspace_cm", "median"),
+                mean_y_workspace_cm=("y_workspace_cm", "median"),
+                mean_r_workspace_normalized=("r_workspace_normalized", "median"),
                 sem_x_centered_px=("x_centered_px", _sem),
                 sem_y_centered_px=("y_centered_px", _sem),
-                mean_r_center_px=("r_center_px", "mean"),
+                mean_r_center_px=("r_center_px", "median"),
                 sem_r_center_px=("r_center_px", _sem),
-                mean_vx_px_s=("vx_px_s", "mean"),
-                mean_vy_px_s=("vy_px_s", "mean"),
+                mean_vx_px_s=("vx_px_s", "median"),
+                mean_vy_px_s=("vy_px_s", "median"),
                 sem_vx_px_s=("vx_px_s", _sem),
                 sem_vy_px_s=("vy_px_s", _sem),
-                mean_speed_px_s=("speed_px_s", "mean"),
+                mean_speed_px_s=("speed_px_s", "median"),
                 sem_speed_px_s=("speed_px_s", _sem),
-                mean_ax_px_s2=("ax_px_s2", "mean"),
-                mean_ay_px_s2=("ay_px_s2", "mean"),
+                mean_ax_px_s2=("ax_px_s2", "median"),
+                mean_ay_px_s2=("ay_px_s2", "median"),
+                mean_az_px_s2=("az_px_s2", "median"),
                 sem_ax_px_s2=("ax_px_s2", _sem),
                 sem_ay_px_s2=("ay_px_s2", _sem),
-                mean_acceleration_px_s2=("acceleration_px_s2", "mean"),
+                mean_acceleration_px_s2=("acceleration_px_s2", "median"),
                 sem_acceleration_px_s2=("acceleration_px_s2", _sem),
-                mean_jerk_px_s3=("jerk_px_s3", "mean"),
+                mean_jerk_px_s3=("jerk_px_s3", "median"),
                 sem_jerk_px_s3=("jerk_px_s3", _sem),
-                mean_radial_velocity_px_s=("radial_velocity_px_s", "mean"),
-                mean_tangential_velocity_px_s=("tangential_velocity_px_s", "mean"),
+                mean_radial_velocity_px_s=("radial_velocity_px_s", "median"),
+                mean_tangential_velocity_px_s=("tangential_velocity_px_s", "median"),
             )
             .reset_index()
         )
@@ -2398,15 +3883,16 @@ def summarize_kinematics(
                 n_trials=("tracking_file", "nunique"),
                 n_subjects=("subject_id", "nunique"),
                 time_fraction=("time_fraction", "mean"),
-                mean_x_centered_px=("x_centered_px", "mean"),
-                mean_y_centered_px=("y_centered_px", "mean"),
-                mean_vx_px_s=("vx_px_s", "mean"),
-                mean_vy_px_s=("vy_px_s", "mean"),
-                mean_speed_px_s=("speed_px_s", "mean"),
-                mean_ax_px_s2=("ax_px_s2", "mean"),
-                mean_ay_px_s2=("ay_px_s2", "mean"),
-                mean_acceleration_px_s2=("acceleration_px_s2", "mean"),
-                mean_jerk_px_s3=("jerk_px_s3", "mean"),
+                mean_x_centered_px=("x_centered_px", "median"),
+                mean_y_centered_px=("y_centered_px", "median"),
+                mean_vx_px_s=("vx_px_s", "median"),
+                mean_vy_px_s=("vy_px_s", "median"),
+                mean_speed_px_s=("speed_px_s", "median"),
+                mean_ax_px_s2=("ax_px_s2", "median"),
+                mean_ay_px_s2=("ay_px_s2", "median"),
+                mean_az_px_s2=("az_px_s2", "median"),
+                mean_acceleration_px_s2=("acceleration_px_s2", "median"),
+                mean_jerk_px_s3=("jerk_px_s3", "median"),
             )
             .reset_index()
         )
@@ -2476,6 +3962,44 @@ KINEMATIC_INTERACTION_SCOPES = [
         "description": "Only samples/segments where the active stiffness equals the comparison value.",
     },
 ]
+
+DEFAULT_KINEMATIC_INTERACTION_OUTPUT_SCOPES = ("all",)
+
+
+def _kinematic_interaction_scope_specs(
+    interaction_scopes: Optional[Iterable[str]] = None,
+) -> list[dict[str, str]]:
+    """Return configured interaction scope specs requested for output writing.
+
+    The general kinematics run should write only the ``all`` branch by default.
+    Standard/comparison filtering remains available for dedicated functions, but
+    it is no longer emitted as extra top-level result folders unless explicitly
+    requested by a caller.
+    """
+
+    requested = tuple(interaction_scopes or DEFAULT_KINEMATIC_INTERACTION_OUTPUT_SCOPES)
+    lookup: dict[str, dict[str, str]] = {}
+    for spec in KINEMATIC_INTERACTION_SCOPES:
+        for key in (
+            spec["interaction_scope"],
+            spec["interaction_code"],
+            spec["folder_name"],
+        ):
+            lookup[str(key).strip().lower()] = spec
+
+    selected: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for name in requested:
+        key = str(name).strip().lower()
+        if key not in lookup:
+            valid = ", ".join(spec["interaction_scope"] for spec in KINEMATIC_INTERACTION_SCOPES)
+            raise ValueError(f"Unknown kinematic interaction scope {name!r}. Expected one of: {valid}")
+        spec = lookup[key]
+        scope = spec["interaction_scope"]
+        if scope not in seen:
+            selected.append(spec)
+            seen.add(scope)
+    return selected
 
 
 def _kinematic_condition_columns(df: pd.DataFrame) -> list[str]:
@@ -2637,11 +4161,11 @@ def compute_expanded_kinematic_scope_tables(
             means = summary[["comparison_value", "mean", "n_observations"]].dropna(
                 subset=["mean"]
             )
-            levels = means["comparison_value"].tolist()
-            for i, level_a in enumerate(levels):
-                for level_b in levels[i + 1 :]:
-                    row_a = means[means["comparison_value"] == level_a].iloc[0]
-                    row_b = means[means["comparison_value"] == level_b].iloc[0]
+            records = list(means.to_dict("records"))
+            for i, row_a in enumerate(records):
+                for row_b in records[i + 1 :]:
+                    level_a = row_a["comparison_value"]
+                    level_b = row_b["comparison_value"]
                     pair_rows.append(
                         {
                             "comparison_scope": scope,
@@ -2753,6 +4277,8 @@ def _save_interaction_summary_block(
     trial_kinematic_summary: pd.DataFrame,
     trajectory_time_bins: pd.DataFrame,
     side_z_trial_summary: Optional[pd.DataFrame] = None,
+    side_z_samples: Optional[pd.DataFrame] = None,
+    interaction_scope: str = "all",
     fig_dpi: int = 160,
     save_figures: bool = True,
 ) -> dict[str, pd.DataFrame]:
@@ -2851,7 +4377,10 @@ def _save_interaction_summary_block(
     }
     _save_named_tables(output_root, spatial_tables)
 
-    subject_va = compute_subject_velocity_acceleration_analysis(trajectory_time_bins)
+    subject_va = compute_subject_velocity_acceleration_analysis(
+        trajectory_time_bins,
+        side_z_samples=side_z_samples,
+    )
     va_tables = {
         "subject_velocity_acceleration_profile": subject_va.get(
             "subject_velocity_acceleration_profile", pd.DataFrame()
@@ -2876,6 +4405,22 @@ def _save_interaction_summary_block(
         ),
     }
     _save_named_tables(output_root, va_tables)
+    velocity_suggestion_tables = {
+        name: subject_va.get(name, pd.DataFrame())
+        for name in [
+            "velocity_xyz_components_normalized_time_median",
+            "velocity_magnitude_normalized_time_median",
+            "velocity_radial_normalized_time_median",
+            "velocity_tangential_normalized_time_median",
+            "velocity_decomposition_profile",
+            "velocity_curviness_summary",
+            "velocity_interpretation_notes",
+        ]
+    }
+    if interaction_scope == "all":
+        save_velocity_suggestion_tables(output_root, velocity_suggestion_tables)
+    else:
+        velocity_suggestion_tables = {}
 
     if not side_trials.empty:
         save_csv(side_trials, output_root, "side_z_trial_summary.csv")
@@ -2903,6 +4448,15 @@ def _save_interaction_summary_block(
         save_subject_velocity_acceleration_figures(
             output_root,
             va_tables["subject_velocity_acceleration_profile"],
+            include_acceleration_stiffness_figures=interaction_scope == "all",
+            include_average_acceleration_stiffness_figure=interaction_scope == "all",
+            fig_dpi=fig_dpi,
+        )
+        save_velocity_suggestion_figures(
+            output_root,
+            va_tables["subject_velocity_acceleration_profile"],
+            include_subject_figures=interaction_scope == "all",
+            include_aggregate_figures=interaction_scope == "all",
             fig_dpi=fig_dpi,
         )
         save_hand_orientation_plane_figures(
@@ -2911,11 +4465,11 @@ def _save_interaction_summary_block(
             hand_tables["hand_orientation_plane_trials"],
             fig_dpi=fig_dpi,
         )
-        save_hand_orientation_axis_matrix_figures(
-            output_root, hand_tables["hand_orientation_plane_trials"], fig_dpi=fig_dpi
-        )
         save_movement_cycle_hand_angle_figures(
-            output_root, trajectory_time_bins, fig_dpi=fig_dpi
+            output_root,
+            trajectory_time_bins,
+            side_z_samples=side_z_samples,
+            fig_dpi=fig_dpi,
         )
         save_kinematic_figures(
             output_root,
@@ -2923,6 +4477,8 @@ def _save_interaction_summary_block(
             output_tables["group_time_summary"],
             output_tables["direction_success_summary"],
             output_tables["distance_success_summary"],
+            side_z_samples=side_z_samples,
+            include_time_acceleration_figure=interaction_scope == "all",
             fig_dpi=fig_dpi,
         )
 
@@ -2932,6 +4488,7 @@ def _save_interaction_summary_block(
         **advanced_tables,
         **spatial_tables,
         **va_tables,
+        **velocity_suggestion_tables,
         **hand_tables,
     }
 
@@ -2948,15 +4505,17 @@ def save_interaction_filtered_kinematic_outputs(
     fig_dpi: int = 160,
     save_figures: bool = True,
     save_sample_tables: bool = False,
+    interaction_scopes: Optional[Iterable[str]] = None,
 ) -> pd.DataFrame:
-    """Write mirrored all/S/C kinematic analysis folders.
+    """Write interaction-filtered kinematic analysis folders.
 
-    The existing flat ``results`` directory remains compatible.  This helper
-    adds a branch architecture under ``results``:
+    By default this writes only the ``all`` branch.  Standard/comparison
+    filtering is still available for dedicated callers via ``interaction_scopes``,
+    but those split folders are not part of the normal kinematics results tree.
 
     - ``all``: the current/legacy analysis over every stiffness segment.
-    - ``standard`` (code ``S``): only standard-value interaction segments.
-    - ``Comparison`` (code ``C``): only comparison-value interaction segments.
+    - optional ``standard`` (code ``S``): only standard-value interaction segments.
+    - optional ``Comparison`` (code ``C``): only comparison-value interaction segments.
 
     Each branch recalculates subject, group, scope, motor-control, trajectory,
     velocity/acceleration, hand-orientation, and success-linked tables from the
@@ -2967,10 +4526,14 @@ def save_interaction_filtered_kinematic_outputs(
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     save_experiment_setup_context(output_root)
+    # Scope copies live inside the selected subject/group owner folder. Normal
+    # runs write only ``all``; standard/comparison branches are available only
+    # for explicit callers.
+    scopes_root = output_root.parent if output_root.name == "_group_level" else output_root
     index_rows: list[dict[str, Any]] = []
-    for spec in KINEMATIC_INTERACTION_SCOPES:
+    for spec in _kinematic_interaction_scope_specs(interaction_scopes):
         scope = spec["interaction_scope"]
-        folder = output_root / spec["folder_name"]
+        folder = scopes_root / spec["folder_name"]
         folder.mkdir(parents=True, exist_ok=True)
         save_experiment_setup_context(folder)
 
@@ -2979,6 +4542,11 @@ def save_interaction_filtered_kinematic_outputs(
         side_trial_subset = (
             filter_kinematic_interaction(side_z_trial_summary, scope)
             if side_z_trial_summary is not None
+            else pd.DataFrame()
+        )
+        side_sample_subset = (
+            filter_kinematic_interaction(side_z_samples, scope)
+            if side_z_samples is not None
             else pd.DataFrame()
         )
         save_csv(trial_subset, folder, "trial_kinematic_summary.csv")
@@ -3004,7 +4572,7 @@ def save_interaction_filtered_kinematic_outputs(
             )
         if save_sample_tables and side_z_samples is not None:
             save_csv(
-                filter_kinematic_interaction(side_z_samples, scope),
+                side_sample_subset,
                 folder,
                 "side_z_samples.csv",
             )
@@ -3014,6 +4582,8 @@ def save_interaction_filtered_kinematic_outputs(
             trial_kinematic_summary=trial_subset,
             trajectory_time_bins=time_subset,
             side_z_trial_summary=side_trial_subset,
+            side_z_samples=side_sample_subset,
+            interaction_scope=scope,
             fig_dpi=fig_dpi,
             save_figures=save_figures,
         )
@@ -3034,6 +4604,7 @@ def save_interaction_filtered_kinematic_outputs(
 
     index = pd.DataFrame(index_rows)
     save_csv(index, output_root, "interaction_analysis_folder_index.csv")
+    _prune_empty_dirs(scopes_root)
     return index
 
 
@@ -3375,7 +4946,7 @@ def save_motor_control_figures(
     fig_dpi: int = 160,
 ) -> list[Path]:
     """Save repeated-measures motor-control figures."""
-    fig_dir = output_root / "figures"
+    fig_dir = _figures_base(output_root)
     fig_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     selected_metrics = metrics or [
@@ -3785,14 +5356,14 @@ def compute_trajectory_similarity_analysis(
             time_fraction=("time_fraction", "mean")
             if "time_fraction" in tb.columns
             else ("trajectory_time_bin", "mean"),
-            mean_x_centered_px=("x_centered_px", "mean"),
-            mean_y_centered_px=("y_centered_px", "mean"),
+            mean_x_centered_px=("x_centered_px", "median"),
+            mean_y_centered_px=("y_centered_px", "median"),
             sd_x_centered_px=("x_centered_px", "std"),
             sd_y_centered_px=("y_centered_px", "std"),
-            mean_r_center_px=("r_center_px", "mean")
+            mean_r_center_px=("r_center_px", "median")
             if "r_center_px" in tb.columns
             else ("x_centered_px", "mean"),
-            mean_speed_px_s=("speed_px_s", "mean")
+            mean_speed_px_s=("speed_px_s", "median")
             if "speed_px_s" in tb.columns
             else ("x_centered_px", "mean"),
             sd_speed_px_s=("speed_px_s", "std")
@@ -3812,10 +5383,10 @@ def compute_trajectory_similarity_analysis(
         )
         .agg(
             n_time_bins=("trajectory_time_bin", "count"),
-            mean_xy_variability_px=("xy_variability_px", "mean"),
+            mean_xy_variability_px=("xy_variability_px", "median"),
             max_xy_variability_px=("xy_variability_px", "max"),
-            mean_speed_variability_px_s=("sd_speed_px_s", "mean"),
-            mean_trajectory_radius_px=("mean_r_center_px", "mean"),
+            mean_speed_variability_px_s=("sd_speed_px_s", "median"),
+            mean_trajectory_radius_px=("mean_r_center_px", "median"),
         )
         .reset_index()
     )
@@ -3919,9 +5490,9 @@ def compute_trajectory_similarity_analysis(
                 dropna=False,
             )
             .agg(
-                x_centered_px=("x_centered_px", "mean"),
-                y_centered_px=("y_centered_px", "mean"),
-                speed_px_s=("speed_px_s", "mean")
+                x_centered_px=("x_centered_px", "median"),
+                y_centered_px=("y_centered_px", "median"),
+                speed_px_s=("speed_px_s", "median")
                 if "speed_px_s" in tb.columns
                 else ("x_centered_px", "mean"),
             )
@@ -3999,7 +5570,7 @@ def save_advanced_kinematic_figures(
     *,
     fig_dpi: int = 160,
 ) -> list[Path]:
-    fig_dir = output_root / "figures"
+    fig_dir = _figures_base(output_root)
     fig_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
 
@@ -4046,19 +5617,60 @@ def save_advanced_kinematic_figures(
         ].copy()
         if not sub.empty:
             fig, ax = plt.subplots(figsize=(7.5, 4.5))
-            ax.bar(
-                sub["comparison"],
-                sub["mean"],
-                yerr=sub["sem"],
-                capsize=3,
-                color="#F58518",
-                alpha=0.85,
-            )
+            x = np.arange(len(sub))
+            width = 0.72
+            legend_seen: set[str] = set()
+            for i, row in enumerate(sub.itertuples()):
+                comparison = str(getattr(row, "comparison"))
+                parts = [p.strip() for p in comparison.split("-")]
+                first = parts[0] if len(parts) > 0 else ""
+                second = parts[1] if len(parts) > 1 else ""
+                height = getattr(row, "mean")
+                sem = getattr(row, "sem")
+                ax.bar(
+                    x[i] - width / 4,
+                    height,
+                    width=width / 2,
+                    color=FINGER_TO_COLOR.get(first, "#777777"),
+                    alpha=0.90,
+                    label=FINGER_LABELS.get(first, first)
+                    if first and first not in legend_seen
+                    else None,
+                )
+                if first:
+                    legend_seen.add(first)
+                ax.bar(
+                    x[i] + width / 4,
+                    height,
+                    width=width / 2,
+                    color=FINGER_TO_COLOR.get(second, "#BBBBBB"),
+                    alpha=0.90,
+                    label=FINGER_LABELS.get(second, second)
+                    if second and second not in legend_seen
+                    else None,
+                )
+                if second:
+                    legend_seen.add(second)
+                if pd.notna(sem):
+                    ax.errorbar(
+                        x[i],
+                        height,
+                        yerr=sem,
+                        color="0.15",
+                        capsize=3,
+                        fmt="none",
+                        linewidth=1.0,
+                    )
+            ax.set_xticks(x)
+            ax.set_xticklabels(sub["comparison"].astype(str), rotation=30, ha="right")
             ax.set_ylabel("Mean XY trajectory distance (px)")
             ax.set_xlabel("Finger comparison")
-            ax.set_title("Paired between-finger trajectory separation")
+            ax.set_title(
+                "Paired between-finger trajectory separation\n"
+                "each bar is split by the two compared fingers"
+            )
             ax.grid(axis="y", alpha=0.25)
-            fig.autofmt_xdate(rotation=30, ha="right")
+            ax.legend(title="Finger half-colors", fontsize=8)
             fig.tight_layout()
             out = fig_dir / "between_finger_trajectory_distance.png"
             fig.savefig(out, dpi=fig_dpi)
@@ -4383,9 +5995,9 @@ def save_subject_xy_trajectory_figures(
     Each figure keeps the subject separate and overlays that person's finger and
     stiffness trajectories in camera-centered XY coordinates. Circle=start,
     x=end. Thin pale lines are individual stiffness trajectories; thick lines
-    are the subject's finger-average trajectory.
+    are the subject's finger-median trajectory.
     """
-    fig_dir = output_root / "figures" / "subject_xy_trajectories"
+    fig_dir = _figures_base(output_root) / "subject_xy_trajectories"
     fig_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     if subject_xy_trajectory.empty:
@@ -4450,7 +6062,7 @@ def save_subject_xy_trajectory_figures(
                         marker="x",
                     )
             avg = f_df.groupby("trajectory_time_bin", as_index=False).agg(
-                x=("x_centered_px", "mean"), y=("y_centered_px", "mean")
+                x=("x_centered_px", "median"), y=("y_centered_px", "median")
             )
             avg = avg.sort_values("trajectory_time_bin")
             if not avg.empty:
@@ -4487,7 +6099,7 @@ def save_subject_xy_trajectory_figures(
         ax.set_xlabel("X from workspace center (px)")
         ax.set_ylabel("Y from workspace center (px)")
         ax.set_title(
-            f"Subject {subject}: XY trajectories in space\nthin=stiffness-specific, thick=finger average; o=start, X=end"
+            f"Subject {subject}: median XY trajectory by finger\nthin=stiffness-specific, thick=finger median; o=start, X=end"
         )
         ax.legend(loc="best", fontsize=8)
         ax.grid(alpha=0.2)
@@ -4495,7 +6107,7 @@ def save_subject_xy_trajectory_figures(
         out = subject_figure_path(
             fig_dir,
             subject,
-            f"subject_{sanitize_name(subject)}_xy_trajectories.png",
+            f"median_xy_trajectory_by_finger_subject_{sanitize_name(subject)}.png",
         )
         fig.savefig(out, dpi=fig_dpi)
         plt.close(fig)
@@ -4545,7 +6157,7 @@ def save_subject_xy_trajectory_figures(
                     )
                 avg = (
                     g_scope.groupby("trajectory_time_bin", as_index=False)
-                    .agg(x=("x_centered_px", "mean"), y=("y_centered_px", "mean"))
+                    .agg(x=("x_centered_px", "median"), y=("y_centered_px", "median"))
                     .sort_values("trajectory_time_bin")
                 )
                 if not avg.empty:
@@ -4563,7 +6175,7 @@ def save_subject_xy_trajectory_figures(
             ax.set_ylim(*xy_limits)
             ax.set_xlabel("X from workspace center (px, original analog scale)")
             ax.set_ylabel("Y from workspace center (px, original analog scale)")
-            ax.set_title(f"{title}\nthin=participant paths, thick=average path")
+            ax.set_title(f"{title}\nthin=participant paths, thick=median path")
             ax.legend(fontsize=8, title=scope_name)
             ax.grid(alpha=0.2)
             fig.tight_layout()
@@ -4580,15 +6192,168 @@ def save_subject_xy_trajectory_figures(
     return paths
 
 
+def add_side_z_velocity_acceleration_to_time_bins(
+    time_bins: pd.DataFrame,
+    side_z_samples: pd.DataFrame,
+    *,
+    n_time_bins: int = 50,
+) -> pd.DataFrame:
+    """Merge vertical Vz/Az (from the side-camera Z lift) into the time bins.
+
+    Reuses the side-camera depth already produced by :func:`estimate_side_video_z`
+    (``side_z_lift_px`` and its real-time velocity ``side_z_velocity_px_s``). Side
+    frames are placed into the *same* within-segment ``trajectory_time_bin`` used
+    for the top-view kinematics, then averaged per
+    ``subject x finger x stiffness x bin`` so ``vz_px_s``/``az_px_s2`` line up with
+    the in-plane ``vx_px_s``/``ax_px_s2`` already in the bins. Returns ``time_bins``
+    unchanged if the required columns are absent.
+    """
+    bin_keys = {"subject_id", "finger_condition", "stiffness_value", "trajectory_time_bin"}
+    side_needed = {"subject_id", "finger_condition", "stiffness_value", "side_time_fraction", "side_z_lift_px"}
+    if (
+        time_bins is None
+        or time_bins.empty
+        or not bin_keys.issubset(time_bins.columns)
+        or side_z_samples is None
+        or side_z_samples.empty
+        or not side_needed.issubset(side_z_samples.columns)
+    ):
+        return time_bins
+
+    side = side_z_samples.copy()
+    side["finger_condition"] = side["finger_condition"].map(normalize_finger_condition)
+    for col in [
+        "stiffness_value",
+        "side_time_fraction",
+        "side_z_lift_px",
+        "side_time_s",
+        "side_z_velocity_px_s",
+    ]:
+        if col in side.columns:
+            side[col] = pd.to_numeric(side[col], errors="coerce")
+
+    seg_keys = [
+        k for k in ["subject_id", "trial_index_raw", "stiffness_segment_id"] if k in side.columns
+    ]
+    if "side_time_s" in side.columns and seg_keys:
+        side = side.sort_values(seg_keys + ["side_time_s"])
+        dt = _stable_derivative_dt(
+            side["side_time_s"],
+            [side[k] for k in seg_keys],
+            min_fraction_of_median=0.25,
+        )
+        # Vz / Az are the first and second real-time derivatives of the reused
+        # side-camera Z lift within each video segment (same formula as
+        # estimate_side_video_z builds side_z_velocity_px_s).
+        side["side_z_velocity_px_s"] = (
+            side.groupby(seg_keys, sort=False)["side_z_lift_px"].diff() / dt
+        )
+        side["side_z_acceleration_px_s2"] = (
+            side.groupby(seg_keys, sort=False)["side_z_velocity_px_s"].diff() / dt
+        )
+    else:
+        side["side_z_velocity_px_s"] = np.nan
+        side["side_z_acceleration_px_s2"] = np.nan
+
+    frac = pd.to_numeric(side["side_time_fraction"], errors="coerce").fillna(0).clip(0, 1)
+    side["trajectory_time_bin"] = np.minimum(
+        (frac * n_time_bins).astype(int) + 1, n_time_bins
+    )
+
+    keys = ["subject_id", "finger_condition", "stiffness_value", "trajectory_time_bin"]
+    agg = (
+        side.groupby(keys, dropna=False)
+        .agg(
+            vz_px_s=("side_z_velocity_px_s", "mean"),
+            az_px_s2=("side_z_acceleration_px_s2", "mean"),
+            z_lift_px=("side_z_lift_px", "mean"),
+        )
+        .reset_index()
+    )
+
+    out = time_bins.copy()
+    out["finger_condition"] = out["finger_condition"].map(normalize_finger_condition)
+    out["stiffness_value"] = pd.to_numeric(out["stiffness_value"], errors="coerce")
+    out["trajectory_time_bin"] = pd.to_numeric(
+        out["trajectory_time_bin"], errors="coerce"
+    )
+    out = out.drop(
+        columns=[
+            c
+            for c in [
+                "vz_px_s",
+                "az_px_s2",
+                "z_lift_px",
+                "vx_3d_px_s",
+                "vy_3d_px_s",
+                "vz_3d_proxy_px_s",
+                "speed_3d_proxy_px_s",
+                "ax_3d_px_s2",
+                "ay_3d_px_s2",
+                "az_3d_proxy_px_s2",
+                "acceleration_3d_proxy_px_s2",
+            ]
+            if c in out.columns
+        ]
+    )
+    out = out.merge(agg, on=keys, how="left")
+
+    # Make the 3D velocity/acceleration columns explicit for downstream
+    # velocity/acceleration analysis.  X/Y components come from the top-camera
+    # trajectory; Z comes only from the side-camera MediaPipe z_tracking.csv path
+    # already merged above.  If z_tracking.csv is missing/invalid, vz/az remain
+    # NaN so the 3D magnitudes are also NaN instead of silently falling back to
+    # the old side-video skin-mask calculation.
+    for col in ["vx_px_s", "vy_px_s", "vz_px_s", "ax_px_s2", "ay_px_s2", "az_px_s2"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "vx_px_s" in out.columns:
+        out["vx_3d_px_s"] = out["vx_px_s"]
+    if "vy_px_s" in out.columns:
+        out["vy_3d_px_s"] = out["vy_px_s"]
+    if "vz_px_s" in out.columns:
+        out["vz_3d_proxy_px_s"] = out["vz_px_s"]
+    if {"vx_3d_px_s", "vy_3d_px_s", "vz_3d_proxy_px_s"}.issubset(out.columns):
+        out["speed_3d_proxy_px_s"] = np.sqrt(
+            np.square(out["vx_3d_px_s"])
+            + np.square(out["vy_3d_px_s"])
+            + np.square(out["vz_3d_proxy_px_s"])
+        )
+    if "ax_px_s2" in out.columns:
+        out["ax_3d_px_s2"] = out["ax_px_s2"]
+    if "ay_px_s2" in out.columns:
+        out["ay_3d_px_s2"] = out["ay_px_s2"]
+    if "az_px_s2" in out.columns:
+        out["az_3d_proxy_px_s2"] = out["az_px_s2"]
+    if {"ax_3d_px_s2", "ay_3d_px_s2", "az_3d_proxy_px_s2"}.issubset(out.columns):
+        out["acceleration_3d_proxy_px_s2"] = np.sqrt(
+            np.square(out["ax_3d_px_s2"])
+            + np.square(out["ay_3d_px_s2"])
+            + np.square(out["az_3d_proxy_px_s2"])
+        )
+    return out
+
+
+
 def compute_subject_velocity_acceleration_analysis(
     time_bins: pd.DataFrame,
+    side_z_samples: Optional[pd.DataFrame] = None,
+    *,
+    n_time_bins: int = 50,
 ) -> dict[str, pd.DataFrame]:
     """Create subject-first velocity and acceleration profiles.
 
     Uses existing derivative columns computed in ``compute_tracking_kinematics``.
     Rows preserve subject x finger x stiffness x normalized-time-bin, allowing
-    per-person inspection before any group-level inference.
+    per-person inspection before any group-level inference. When ``side_z_samples``
+    is supplied, vertical Vz/Az columns derived from the already-computed
+    side-camera Z lift are merged in first so the profiles carry depth alongside
+    the in-plane motion.
     """
+    if side_z_samples is not None:
+        time_bins = add_side_z_velocity_acceleration_to_time_bins(
+            time_bins, side_z_samples, n_time_bins=n_time_bins
+        )
     empty = {
         "subject_velocity_acceleration_profile": pd.DataFrame(),
         "subject_velocity_acceleration_summary": pd.DataFrame(),
@@ -4597,6 +6362,13 @@ def compute_subject_velocity_acceleration_analysis(
         "velocity_stiffness_influence_summary": pd.DataFrame(),
         "velocity_finger_influence_summary": pd.DataFrame(),
         "velocity_time_influence_summary": pd.DataFrame(),
+        "velocity_xyz_components_normalized_time_median": pd.DataFrame(),
+        "velocity_magnitude_normalized_time_median": pd.DataFrame(),
+        "velocity_radial_normalized_time_median": pd.DataFrame(),
+        "velocity_tangential_normalized_time_median": pd.DataFrame(),
+        "velocity_decomposition_profile": pd.DataFrame(),
+        "velocity_curviness_summary": pd.DataFrame(),
+        "velocity_interpretation_notes": velocity_interpretation_notes_table(),
     }
     required = {
         "subject_id",
@@ -4611,6 +6383,7 @@ def compute_subject_velocity_acceleration_analysis(
         "vx_3d_px_s",
         "vy_3d_px_s",
         "vz_3d_proxy_px_s",
+        "speed_3d_proxy_px_s",
         "speed_px_s",
         "ax_px_s2",
         "ay_px_s2",
@@ -4618,6 +6391,7 @@ def compute_subject_velocity_acceleration_analysis(
         "ax_3d_px_s2",
         "ay_3d_px_s2",
         "az_3d_proxy_px_s2",
+        "acceleration_3d_proxy_px_s2",
         "acceleration_px_s2",
     }
     if (
@@ -4643,6 +6417,7 @@ def compute_subject_velocity_acceleration_analysis(
         "vy_3d_px_s",
         "vz_3d_proxy_px_s",
         "speed_px_s",
+        "speed_3d_proxy_px_s",
         "ax_px_s2",
         "ay_px_s2",
         "az_px_s2",
@@ -4650,24 +6425,57 @@ def compute_subject_velocity_acceleration_analysis(
         "ay_3d_px_s2",
         "az_3d_proxy_px_s2",
         "acceleration_px_s2",
+        "acceleration_3d_proxy_px_s2",
         "jx_px_s3",
         "jy_px_s3",
         "jerk_px_s3",
         "radial_velocity_px_s",
         "tangential_velocity_px_s",
+        "x_centered_px",
+        "y_centered_px",
+        "z_lift_px",
+        "movement_angle_deg",
         "correct_response",
     ]
     for col in numeric_cols:
         if col in tb.columns:
             tb[col] = pd.to_numeric(tb[col], errors="coerce")
 
+    # Distance-from-center magnitude per axis, so the subject profile can also
+    # drive standard-vs-comparison |X|/|Y| position figures (X axis = movement
+    # cycle bin, Y axis = absolute centered position).
+    if "x_centered_px" in tb.columns:
+        tb["abs_x_centered_px"] = tb["x_centered_px"].abs()
+    if "y_centered_px" in tb.columns:
+        tb["abs_y_centered_px"] = tb["y_centered_px"].abs()
+    if "z_lift_px" in tb.columns:
+        tb["abs_z_lift_px"] = tb["z_lift_px"].abs()
+
     # Fill derivative magnitudes if a caller provides only components.
     if "speed_px_s" not in tb.columns and {"vx_px_s", "vy_px_s"}.issubset(tb.columns):
         tb["speed_px_s"] = np.hypot(tb["vx_px_s"], tb["vy_px_s"])
+    if (
+        "speed_3d_proxy_px_s" not in tb.columns
+        and {"vx_px_s", "vy_px_s", "vz_3d_proxy_px_s"}.issubset(tb.columns)
+    ):
+        tb["speed_3d_proxy_px_s"] = np.sqrt(
+            np.square(tb["vx_px_s"])
+            + np.square(tb["vy_px_s"])
+            + np.square(tb["vz_3d_proxy_px_s"])
+        )
     if "acceleration_px_s2" not in tb.columns and {"ax_px_s2", "ay_px_s2"}.issubset(
         tb.columns
     ):
         tb["acceleration_px_s2"] = np.hypot(tb["ax_px_s2"], tb["ay_px_s2"])
+    if (
+        "acceleration_3d_proxy_px_s2" not in tb.columns
+        and {"ax_px_s2", "ay_px_s2", "az_3d_proxy_px_s2"}.issubset(tb.columns)
+    ):
+        tb["acceleration_3d_proxy_px_s2"] = np.sqrt(
+            np.square(tb["ax_px_s2"])
+            + np.square(tb["ay_px_s2"])
+            + np.square(tb["az_3d_proxy_px_s2"])
+        )
 
     group_cols = [
         "subject_id",
@@ -4692,6 +6500,8 @@ def compute_subject_velocity_acceleration_analysis(
         "workspace_width_cm",
         "workspace_height_cm",
         "success_label",
+        "standard_value",
+        "comparison_value",
     ]:
         if col in tb.columns:
             agg_spec[col] = (col, "first")
@@ -4702,19 +6512,40 @@ def compute_subject_velocity_acceleration_analysis(
     for col in [
         "vx_px_s",
         "vy_px_s",
+        "vz_px_s",
+        "vx_3d_px_s",
+        "vy_3d_px_s",
+        "vz_3d_proxy_px_s",
         "speed_px_s",
+        "speed_3d_proxy_px_s",
         "ax_px_s2",
         "ay_px_s2",
+        "az_px_s2",
+        "ax_3d_px_s2",
+        "ay_3d_px_s2",
+        "az_3d_proxy_px_s2",
         "acceleration_px_s2",
+        "acceleration_3d_proxy_px_s2",
         "jx_px_s3",
         "jy_px_s3",
         "jerk_px_s3",
         "radial_velocity_px_s",
         "tangential_velocity_px_s",
+        "x_centered_px",
+        "y_centered_px",
+        "z_lift_px",
+        "abs_x_centered_px",
+        "abs_y_centered_px",
+        "abs_z_lift_px",
     ]:
         if col in tb.columns:
             agg_spec[col] = (col, "mean")
             agg_spec[f"sd_{col}"] = (col, "std")
+    # Movement direction is an angle, so collapse the within-bin samples with a
+    # circular mean (matching the movement_cycle direction figures) rather than a
+    # plain arithmetic mean that would mishandle the +/-180 deg wrap.
+    if "movement_angle_deg" in tb.columns:
+        agg_spec["movement_angle_deg"] = ("movement_angle_deg", _circ_mean_deg)
 
     profile = tb.groupby(group_cols, dropna=False).agg(**agg_spec).reset_index()
     if {"vx_px_s", "vy_px_s"}.issubset(profile.columns):
@@ -4770,6 +6601,7 @@ def compute_subject_velocity_acceleration_analysis(
             "vx_3d_px_s",
             "vy_3d_px_s",
             "vz_3d_proxy_px_s",
+            "speed_3d_proxy_px_s",
             "speed_px_s",
             "ax_px_s2",
             "ay_px_s2",
@@ -4777,6 +6609,7 @@ def compute_subject_velocity_acceleration_analysis(
             "ax_3d_px_s2",
             "ay_3d_px_s2",
             "az_3d_proxy_px_s2",
+            "acceleration_3d_proxy_px_s2",
             "acceleration_px_s2",
             "jx_px_s3",
             "jy_px_s3",
@@ -4846,10 +6679,14 @@ def compute_subject_velocity_acceleration_analysis(
                     for c in [
                         "vx_px_s",
                         "vy_px_s",
+                        "vz_3d_proxy_px_s",
                         "speed_px_s",
+                        "speed_3d_proxy_px_s",
                         "ax_px_s2",
                         "ay_px_s2",
+                        "az_3d_proxy_px_s2",
                         "acceleration_px_s2",
+                        "acceleration_3d_proxy_px_s2",
                         "jx_px_s3",
                         "jy_px_s3",
                         "jerk_px_s3",
@@ -4880,6 +6717,28 @@ def compute_subject_velocity_acceleration_analysis(
                     row["rms_velocity_vector_distance_px_s"] = float(
                         np.sqrt(np.nanmean(np.square(vdist)))
                     )
+                if {
+                    "vx_px_s_a",
+                    "vy_px_s_a",
+                    "vz_3d_proxy_px_s_a",
+                    "vx_px_s_b",
+                    "vy_px_s_b",
+                    "vz_3d_proxy_px_s_b",
+                }.issubset(merged.columns):
+                    vdist3 = np.sqrt(
+                        np.square(merged["vx_px_s_b"] - merged["vx_px_s_a"])
+                        + np.square(merged["vy_px_s_b"] - merged["vy_px_s_a"])
+                        + np.square(
+                            merged["vz_3d_proxy_px_s_b"]
+                            - merged["vz_3d_proxy_px_s_a"]
+                        )
+                    )
+                    row["mean_velocity_vector_distance_3d_proxy_px_s"] = float(
+                        np.nanmean(vdist3)
+                    )
+                    row["rms_velocity_vector_distance_3d_proxy_px_s"] = float(
+                        np.sqrt(np.nanmean(np.square(vdist3)))
+                    )
                 if {"ax_px_s2_a", "ay_px_s2_a", "ax_px_s2_b", "ay_px_s2_b"}.issubset(
                     merged.columns
                 ):
@@ -4893,10 +6752,42 @@ def compute_subject_velocity_acceleration_analysis(
                     row["rms_acceleration_vector_distance_px_s2"] = float(
                         np.sqrt(np.nanmean(np.square(adist)))
                     )
+                if {
+                    "ax_px_s2_a",
+                    "ay_px_s2_a",
+                    "az_3d_proxy_px_s2_a",
+                    "ax_px_s2_b",
+                    "ay_px_s2_b",
+                    "az_3d_proxy_px_s2_b",
+                }.issubset(merged.columns):
+                    adist3 = np.sqrt(
+                        np.square(merged["ax_px_s2_b"] - merged["ax_px_s2_a"])
+                        + np.square(merged["ay_px_s2_b"] - merged["ay_px_s2_a"])
+                        + np.square(
+                            merged["az_3d_proxy_px_s2_b"]
+                            - merged["az_3d_proxy_px_s2_a"]
+                        )
+                    )
+                    row["mean_acceleration_vector_distance_3d_proxy_px_s2"] = float(
+                        np.nanmean(adist3)
+                    )
+                    row["rms_acceleration_vector_distance_3d_proxy_px_s2"] = float(
+                        np.sqrt(np.nanmean(np.square(adist3)))
+                    )
                 if {"speed_px_s_a", "speed_px_s_b"}.issubset(merged.columns):
                     sdiff = merged["speed_px_s_b"] - merged["speed_px_s_a"]
                     row["speed_profile_rmse_px_s"] = float(
                         np.sqrt(np.nanmean(np.square(sdiff)))
+                    )
+                if {"speed_3d_proxy_px_s_a", "speed_3d_proxy_px_s_b"}.issubset(
+                    merged.columns
+                ):
+                    sdiff3 = (
+                        merged["speed_3d_proxy_px_s_b"]
+                        - merged["speed_3d_proxy_px_s_a"]
+                    )
+                    row["speed_profile_rmse_3d_proxy_px_s"] = float(
+                        np.sqrt(np.nanmean(np.square(sdiff3)))
                     )
                 if {"acceleration_px_s2_a", "acceleration_px_s2_b"}.issubset(
                     merged.columns
@@ -4907,16 +6798,43 @@ def compute_subject_velocity_acceleration_analysis(
                     row["acceleration_profile_rmse_px_s2"] = float(
                         np.sqrt(np.nanmean(np.square(accdiff)))
                     )
+                if {
+                    "acceleration_3d_proxy_px_s2_a",
+                    "acceleration_3d_proxy_px_s2_b",
+                }.issubset(merged.columns):
+                    accdiff3 = (
+                        merged["acceleration_3d_proxy_px_s2_b"]
+                        - merged["acceleration_3d_proxy_px_s2_a"]
+                    )
+                    row["acceleration_profile_rmse_3d_proxy_px_s2"] = float(
+                        np.sqrt(np.nanmean(np.square(accdiff3)))
+                    )
                 distance_rows.append(row)
     distance = pd.DataFrame(distance_rows)
     va_metric_distribution = summarize_metric_distribution(
         summary,
         ["subject_id", "finger_condition"],
         [
+            "mean_vx_px_s",
+            "peak_abs_vx_px_s",
+            "mean_vy_px_s",
+            "peak_abs_vy_px_s",
+            "mean_vz_3d_proxy_px_s",
+            "peak_abs_vz_3d_proxy_px_s",
             "mean_speed_px_s",
             "peak_abs_speed_px_s",
+            "mean_ax_px_s2",
+            "peak_abs_ax_px_s2",
+            "mean_ay_px_s2",
+            "peak_abs_ay_px_s2",
+            "mean_az_3d_proxy_px_s2",
+            "peak_abs_az_3d_proxy_px_s2",
             "mean_acceleration_px_s2",
             "peak_abs_acceleration_px_s2",
+            "mean_speed_3d_proxy_px_s",
+            "peak_abs_speed_3d_proxy_px_s",
+            "mean_acceleration_3d_proxy_px_s2",
+            "peak_abs_acceleration_3d_proxy_px_s2",
             "mean_jerk_px_s3",
             "peak_abs_jerk_px_s3",
             "late_minus_early_speed_px_s",
@@ -4930,10 +6848,29 @@ def compute_subject_velocity_acceleration_analysis(
         .agg(
             n_observations=("speed_px_s", "count"),
             n_subjects=("subject_id", "nunique"),
-            mean_velocity_px_s=("speed_px_s", "mean"),
-            median_velocity_px_s=("speed_px_s", "median"),
+            median_vx_px_s=("vx_px_s", "median"),
+            median_vy_px_s=("vy_px_s", "median"),
+            median_vz_3d_proxy_px_s=("vz_3d_proxy_px_s", "median")
+            if "vz_3d_proxy_px_s" in profile.columns
+            else ("speed_px_s", "median"),
+            mean_velocity_px_s=("speed_px_s", "median"),
+            mean_velocity_3d_proxy_px_s=("speed_3d_proxy_px_s", "median")
+            if "speed_3d_proxy_px_s" in profile.columns
+            else ("speed_px_s", "median"),
             sem_velocity_px_s=("speed_px_s", _sem),
-            mean_acceleration_px_s2=("acceleration_px_s2", "mean"),
+            median_ax_px_s2=("ax_px_s2", "median")
+            if "ax_px_s2" in profile.columns
+            else ("speed_px_s", "median"),
+            median_ay_px_s2=("ay_px_s2", "median")
+            if "ay_px_s2" in profile.columns
+            else ("speed_px_s", "median"),
+            median_az_3d_proxy_px_s2=("az_3d_proxy_px_s2", "median")
+            if "az_3d_proxy_px_s2" in profile.columns
+            else ("speed_px_s", "median"),
+            mean_acceleration_px_s2=("acceleration_px_s2", "median"),
+            mean_acceleration_3d_proxy_px_s2=("acceleration_3d_proxy_px_s2", "median")
+            if "acceleration_3d_proxy_px_s2" in profile.columns
+            else ("acceleration_px_s2", "median"),
         )
         .reset_index()
         if {"speed_px_s", "acceleration_px_s2"}.issubset(profile.columns)
@@ -4944,10 +6881,29 @@ def compute_subject_velocity_acceleration_analysis(
         .agg(
             n_observations=("speed_px_s", "count"),
             n_subjects=("subject_id", "nunique"),
-            mean_velocity_px_s=("speed_px_s", "mean"),
-            median_velocity_px_s=("speed_px_s", "median"),
+            median_vx_px_s=("vx_px_s", "median"),
+            median_vy_px_s=("vy_px_s", "median"),
+            median_vz_3d_proxy_px_s=("vz_3d_proxy_px_s", "median")
+            if "vz_3d_proxy_px_s" in profile.columns
+            else ("speed_px_s", "median"),
+            mean_velocity_px_s=("speed_px_s", "median"),
+            mean_velocity_3d_proxy_px_s=("speed_3d_proxy_px_s", "median")
+            if "speed_3d_proxy_px_s" in profile.columns
+            else ("speed_px_s", "median"),
             sem_velocity_px_s=("speed_px_s", _sem),
-            mean_acceleration_px_s2=("acceleration_px_s2", "mean"),
+            median_ax_px_s2=("ax_px_s2", "median")
+            if "ax_px_s2" in profile.columns
+            else ("speed_px_s", "median"),
+            median_ay_px_s2=("ay_px_s2", "median")
+            if "ay_px_s2" in profile.columns
+            else ("speed_px_s", "median"),
+            median_az_3d_proxy_px_s2=("az_3d_proxy_px_s2", "median")
+            if "az_3d_proxy_px_s2" in profile.columns
+            else ("speed_px_s", "median"),
+            mean_acceleration_px_s2=("acceleration_px_s2", "median"),
+            mean_acceleration_3d_proxy_px_s2=("acceleration_3d_proxy_px_s2", "median")
+            if "acceleration_3d_proxy_px_s2" in profile.columns
+            else ("acceleration_px_s2", "median"),
         )
         .reset_index()
         if {"speed_px_s", "acceleration_px_s2"}.issubset(profile.columns)
@@ -4966,15 +6922,31 @@ def compute_subject_velocity_acceleration_analysis(
             .agg(
                 n_observations=("speed_px_s", "count"),
                 n_subjects=("subject_id", "nunique"),
-                mean_velocity_px_s=("speed_px_s", "mean"),
-                median_velocity_px_s=("speed_px_s", "median"),
-                mean_acceleration_px_s2=("acceleration_px_s2", "mean")
+                median_vx_px_s=("vx_px_s", "median")
+                if "vx_px_s" in temp.columns
+                else ("speed_px_s", "median"),
+                median_vy_px_s=("vy_px_s", "median")
+                if "vy_px_s" in temp.columns
+                else ("speed_px_s", "median"),
+                median_vz_3d_proxy_px_s=("vz_3d_proxy_px_s", "median")
+                if "vz_3d_proxy_px_s" in temp.columns
+                else ("speed_px_s", "median"),
+                mean_velocity_px_s=("speed_px_s", "median"),
+                mean_velocity_3d_proxy_px_s=("speed_3d_proxy_px_s", "median")
+                if "speed_3d_proxy_px_s" in temp.columns
+                else ("speed_px_s", "median"),
+                mean_acceleration_px_s2=("acceleration_px_s2", "median")
                 if "acceleration_px_s2" in temp.columns
-                else ("speed_px_s", "mean"),
+                else ("speed_px_s", "median"),
+                mean_acceleration_3d_proxy_px_s2=(
+                    "acceleration_3d_proxy_px_s2",
+                    "median",
+                )
+                if "acceleration_3d_proxy_px_s2" in temp.columns
+                else ("speed_px_s", "median"),
             )
             .reset_index()
         )
-
     return {
         "subject_velocity_acceleration_profile": profile,
         "subject_velocity_acceleration_summary": summary,
@@ -4983,7 +6955,691 @@ def compute_subject_velocity_acceleration_analysis(
         "velocity_stiffness_influence_summary": velocity_stiffness_influence,
         "velocity_finger_influence_summary": velocity_finger_influence,
         "velocity_time_influence_summary": velocity_time_influence,
+        **compute_velocity_suggestion_tables(profile),
     }
+
+
+def add_velocity_decomposition_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add 3D proxy speed plus radial/tangential decomposition columns.
+
+    The 3D proxy uses the in-plane x/y movement and the side-camera z-lift when
+    present. It does not change the existing 2D velocity columns; it only adds
+    derived columns for the velocity-specific result folder.
+    """
+    out = df.copy()
+    for col in [
+        "x_centered_px",
+        "y_centered_px",
+        "z_lift_px",
+        "vx_px_s",
+        "vy_px_s",
+        "vz_px_s",
+        "vz_3d_proxy_px_s",
+        "speed_px_s",
+        "radial_velocity_px_s",
+        "tangential_velocity_px_s",
+    ]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    vz_col = _first_existing_column(out, ["vz_px_s", "vz_3d_proxy_px_s"])
+    z = out["z_lift_px"] if "z_lift_px" in out.columns else 0.0
+    vz = out[vz_col] if vz_col is not None else 0.0
+    if {"vx_px_s", "vy_px_s"}.issubset(out.columns):
+        out["speed_3d_proxy_px_s"] = np.sqrt(
+            np.square(out["vx_px_s"])
+            + np.square(out["vy_px_s"])
+            + np.square(vz)
+        )
+    elif "speed_px_s" in out.columns:
+        out["speed_3d_proxy_px_s"] = out["speed_px_s"]
+    if "vx_px_s" in out.columns:
+        out["velocity_x_axis_px_s"] = out["vx_px_s"]
+    if "vy_px_s" in out.columns:
+        out["velocity_y_axis_px_s"] = out["vy_px_s"]
+    if vz_col is not None:
+        out["velocity_z_axis_3d_proxy_px_s"] = out[vz_col]
+    if {"x_centered_px", "y_centered_px", "vx_px_s", "vy_px_s"}.issubset(out.columns):
+        radius = np.sqrt(
+            np.square(out["x_centered_px"])
+            + np.square(out["y_centered_px"])
+            + np.square(z)
+        )
+        radial_num = (
+            out["x_centered_px"] * out["vx_px_s"]
+            + out["y_centered_px"] * out["vy_px_s"]
+            + z * vz
+        )
+        out["radial_velocity_3d_proxy_px_s"] = np.where(radius > 0, radial_num / radius, np.nan)
+        radial_unit_x = np.where(radius > 0, out["x_centered_px"] / radius, np.nan)
+        radial_unit_y = np.where(radius > 0, out["y_centered_px"] / radius, np.nan)
+        radial_unit_z = np.where(radius > 0, z / radius, np.nan)
+        out["radial_velocity_x_3d_proxy_px_s"] = (
+            out["radial_velocity_3d_proxy_px_s"] * radial_unit_x
+        )
+        out["radial_velocity_y_3d_proxy_px_s"] = (
+            out["radial_velocity_3d_proxy_px_s"] * radial_unit_y
+        )
+        out["radial_velocity_z_3d_proxy_px_s"] = (
+            out["radial_velocity_3d_proxy_px_s"] * radial_unit_z
+        )
+        out["tangential_velocity_x_3d_proxy_px_s"] = (
+            out["vx_px_s"] - out["radial_velocity_x_3d_proxy_px_s"]
+        )
+        out["tangential_velocity_y_3d_proxy_px_s"] = (
+            out["vy_px_s"] - out["radial_velocity_y_3d_proxy_px_s"]
+        )
+        out["tangential_velocity_z_3d_proxy_px_s"] = (
+            vz - out["radial_velocity_z_3d_proxy_px_s"]
+        )
+        if "speed_3d_proxy_px_s" in out.columns:
+            tangent_sq = np.square(out["speed_3d_proxy_px_s"]) - np.square(
+                out["radial_velocity_3d_proxy_px_s"]
+            )
+            out["tangential_speed_3d_proxy_px_s"] = np.sqrt(np.maximum(tangent_sq, 0.0))
+    if "tangential_velocity_px_s" in out.columns:
+        out["abs_tangential_velocity_px_s"] = out["tangential_velocity_px_s"].abs()
+    if {"tangential_speed_3d_proxy_px_s", "radial_velocity_3d_proxy_px_s"}.issubset(out.columns):
+        denom = out["radial_velocity_3d_proxy_px_s"].abs()
+        out["tangential_radial_velocity_ratio_3d_proxy"] = np.where(
+            denom > 1e-9,
+            out["tangential_speed_3d_proxy_px_s"] / denom,
+            np.nan,
+        )
+    return out
+
+
+VELOCITY_SUGGESTION_METRICS: dict[str, list[tuple[str, str]]] = {
+    "xyz_components": [
+        ("velocity_x_axis_px_s", "X-axis velocity from top camera (px/s)"),
+        ("velocity_y_axis_px_s", "Y-axis velocity from top camera (px/s)"),
+        ("velocity_z_axis_3d_proxy_px_s", "Z-axis velocity from z_tracking.csv (px/s)"),
+    ],
+    "magnitude": [
+        ("speed_px_s", "2D velocity magnitude (px/s)"),
+        ("speed_3d_proxy_px_s", "3D proxy velocity magnitude (px/s)"),
+    ],
+    "radial": [
+        ("radial_velocity_px_s", "2D signed radial velocity (px/s)"),
+        ("radial_velocity_3d_proxy_px_s", "3D proxy signed radial velocity (px/s)"),
+    ],
+    "tangential": [
+        ("tangential_velocity_px_s", "2D signed tangential velocity (px/s)"),
+        ("abs_tangential_velocity_px_s", "2D tangential velocity magnitude (px/s)"),
+        ("tangential_speed_3d_proxy_px_s", "3D proxy tangential velocity magnitude (px/s)"),
+    ],
+}
+
+
+def velocity_interpretation_notes_table() -> pd.DataFrame:
+    """Human-readable notes for interpreting velocity result folders."""
+    return pd.DataFrame(
+        [
+            {
+                "topic": "magnitude_vs_velocity",
+                "note": (
+                    "speed_px_s is the 2D velocity magnitude sqrt(vx_px_s^2 + "
+                    "vy_px_s^2), while speed_3d_proxy_px_s also includes "
+                    "Z velocity from z_tracking.csv when available. Signed "
+                    "directional motion is represented by X/Y/Z component "
+                    "columns plus radial/tangential decomposition columns."
+                ),
+            },
+            {
+                "topic": "xyz_velocity_components",
+                "note": (
+                    "velocity_x_axis_px_s and velocity_y_axis_px_s come from "
+                    "the top-camera trajectory. velocity_z_axis_3d_proxy_px_s "
+                    "comes from z_tracking.csv-derived side-camera Z lift."
+                ),
+            },
+            {
+                "topic": "radial_velocity_sign",
+                "note": (
+                    "radial_velocity_px_s is signed: positive means movement "
+                    "away from the center; negative means movement toward the "
+                    "center."
+                ),
+            },
+            {
+                "topic": "tangential_velocity_sign",
+                "note": (
+                    "tangential_velocity_px_s is signed around the center. "
+                    "Oscillatory X/Y movement can therefore appear above and "
+                    "below zero in radial/tangential or Vx/Vy plots, while "
+                    "velocity magnitude stays non-negative."
+                ),
+            },
+            {
+                "topic": "s_vs_c_magnitude",
+                "note": (
+                    "standard_vs_comparison_Magnitude uses speed_px_s, the 2D "
+                    "in-plane velocity magnitude. The velocity suggestion outputs "
+                    "also report X/Y/Z component plots and speed_3d_proxy_px_s, "
+                    "which includes the side-camera Z dimension when available."
+                ),
+            },
+        ]
+    )
+
+
+def _velocity_metric_long_table(profile: pd.DataFrame, family: str, stat: str) -> pd.DataFrame:
+    df = add_velocity_decomposition_columns(profile)
+    metrics = [(c, label) for c, label in VELOCITY_SUGGESTION_METRICS[family] if c in df.columns]
+    if not metrics:
+        return pd.DataFrame()
+    group_cols = [
+        c
+        for c in [
+            "subject_id",
+            "subject_group",
+            EXPERIMENT_GROUP_COLUMN,
+            "workspace_setup",
+            "finger_condition",
+            "stiffness_value",
+            "trajectory_time_bin",
+        ]
+        if c in df.columns
+    ]
+    rows: list[pd.DataFrame] = []
+    for col, label in metrics:
+        agg = (
+            df.groupby(group_cols, dropna=False)
+            .agg(
+                time_fraction=("time_fraction", "mean")
+                if "time_fraction" in df.columns
+                else ("trajectory_time_bin", "mean"),
+                value=(col, stat),
+                n_observations=(col, "count"),
+            )
+            .reset_index()
+        )
+        agg.insert(0, "velocity_family", family)
+        agg.insert(1, "metric", col)
+        agg.insert(2, "metric_label", label)
+        agg.insert(3, "statistic", stat)
+        rows.append(agg)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def compute_velocity_suggestion_tables(profile: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Build velocity-only CSV tables for normalized-time median outputs."""
+    if profile is None or profile.empty:
+        return {
+            "velocity_xyz_components_normalized_time_median": pd.DataFrame(),
+            "velocity_magnitude_normalized_time_median": pd.DataFrame(),
+            "velocity_radial_normalized_time_median": pd.DataFrame(),
+            "velocity_tangential_normalized_time_median": pd.DataFrame(),
+            "velocity_decomposition_profile": pd.DataFrame(),
+            "velocity_curviness_summary": pd.DataFrame(),
+            "velocity_interpretation_notes": velocity_interpretation_notes_table(),
+        }
+    decomposed = add_velocity_decomposition_columns(profile)
+    tables: dict[str, pd.DataFrame] = {}
+    for family in ("xyz_components", "magnitude", "radial", "tangential"):
+        tables[f"velocity_{family}_normalized_time_median"] = _velocity_metric_long_table(
+            decomposed, family, "median"
+        )
+    keep_cols = [
+        c
+        for c in [
+            "subject_id",
+            "subject_group",
+            EXPERIMENT_GROUP_COLUMN,
+            "finger_condition",
+            "stiffness_value",
+            "trajectory_time_bin",
+            "time_fraction",
+            "x_centered_px",
+            "y_centered_px",
+            "z_lift_px",
+            "vx_px_s",
+            "vy_px_s",
+            "vz_px_s",
+            "vz_3d_proxy_px_s",
+            "velocity_x_axis_px_s",
+            "velocity_y_axis_px_s",
+            "velocity_z_axis_3d_proxy_px_s",
+            "speed_px_s",
+            "speed_3d_proxy_px_s",
+            "radial_velocity_px_s",
+            "radial_velocity_3d_proxy_px_s",
+            "radial_velocity_x_3d_proxy_px_s",
+            "radial_velocity_y_3d_proxy_px_s",
+            "radial_velocity_z_3d_proxy_px_s",
+            "tangential_velocity_px_s",
+            "abs_tangential_velocity_px_s",
+            "tangential_speed_3d_proxy_px_s",
+            "tangential_velocity_x_3d_proxy_px_s",
+            "tangential_velocity_y_3d_proxy_px_s",
+            "tangential_velocity_z_3d_proxy_px_s",
+            "tangential_radial_velocity_ratio_3d_proxy",
+        ]
+        if c in decomposed.columns
+    ]
+    tables["velocity_decomposition_profile"] = decomposed[keep_cols].copy()
+    if {
+        "subject_id",
+        "finger_condition",
+        "stiffness_value",
+        "tangential_radial_velocity_ratio_3d_proxy",
+    }.issubset(decomposed.columns):
+        tables["velocity_curviness_summary"] = (
+            decomposed.groupby(
+                [
+                    c
+                    for c in [
+                        "subject_id",
+                        "subject_group",
+                        EXPERIMENT_GROUP_COLUMN,
+                        "finger_condition",
+                        "stiffness_value",
+                    ]
+                    if c in decomposed.columns
+                ],
+                dropna=False,
+            )
+            .agg(
+                median_tangential_radial_ratio=(
+                    "tangential_radial_velocity_ratio_3d_proxy",
+                    "median",
+                ),
+                median_tangential_speed_3d_proxy_px_s=(
+                    "tangential_speed_3d_proxy_px_s",
+                    "median",
+                ),
+                median_abs_radial_velocity_3d_proxy_px_s=(
+                    "radial_velocity_3d_proxy_px_s",
+                    lambda s: pd.to_numeric(s, errors="coerce").abs().median(),
+                ),
+                n_observations=("tangential_radial_velocity_ratio_3d_proxy", "count"),
+            )
+            .reset_index()
+        )
+    else:
+        tables["velocity_curviness_summary"] = pd.DataFrame()
+    tables["velocity_interpretation_notes"] = velocity_interpretation_notes_table()
+    return tables
+
+
+def save_velocity_suggestion_tables(output_root: Path, tables: dict[str, pd.DataFrame]) -> None:
+    """Write only the added velocity-suggestion CSV files under ``velocity``."""
+    for name, df in tables.items():
+        if not name.startswith("velocity_"):
+            continue
+        sub = velocity_result_subfolder(name) or "others"
+        save_csv_path(df, Path(output_root) / "velocity" / sub / f"{name}.csv")
+
+
+def save_velocity_suggestion_figures(
+    output_root: Path,
+    subject_velocity_acceleration_profile: pd.DataFrame,
+    *,
+    include_subject_figures: bool = True,
+    include_aggregate_figures: bool = True,
+    fig_dpi: int = 160,
+) -> list[Path]:
+    """Save velocity-only figures in components/magnitude/radial/tangential folders."""
+    fig_dir = _figures_base(output_root) / "velocity_suggestions"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    if subject_velocity_acceleration_profile is None or subject_velocity_acceleration_profile.empty:
+        save_csv(pd.DataFrame({"figure": []}), output_root, "velocity_suggestion_figure_manifest.csv")
+        return paths
+
+    profile = add_velocity_decomposition_columns(subject_velocity_acceleration_profile)
+    profile["finger_condition"] = profile["finger_condition"].map(normalize_finger_condition)
+    for col in [
+        "stiffness_value",
+        "trajectory_time_bin",
+        "time_fraction",
+        "velocity_x_axis_px_s",
+        "velocity_y_axis_px_s",
+        "velocity_z_axis_3d_proxy_px_s",
+        "speed_px_s",
+        "speed_3d_proxy_px_s",
+        "radial_velocity_px_s",
+        "tangential_velocity_px_s",
+    ]:
+        if col in profile.columns:
+            profile[col] = pd.to_numeric(profile[col], errors="coerce")
+
+    family_primary = {
+        "x_axis": ("velocity_x_axis_px_s", "X-axis velocity", "px/s"),
+        "y_axis": ("velocity_y_axis_px_s", "Y-axis velocity", "px/s"),
+        "z_axis": ("velocity_z_axis_3d_proxy_px_s", "Z-axis velocity (3D proxy)", "px/s"),
+        "magnitude": ("speed_3d_proxy_px_s", "3D proxy velocity magnitude", "px/s"),
+        "radial": ("radial_velocity_px_s", "Signed radial velocity", "px/s"),
+        "tangential": ("tangential_velocity_px_s", "Signed tangential velocity", "px/s"),
+    }
+    cmap = plt.get_cmap(STIFFNESS_CMAP)
+
+    def _save_time_family(
+        frame: pd.DataFrame,
+        *,
+        family: str,
+        statistic: str,
+        title_scope: str,
+        curve_scope: str = "all fingers",
+        out_path: Path,
+    ) -> None:
+        metric_col, label, unit = family_primary[family]
+        if metric_col not in frame.columns or not frame[metric_col].notna().any():
+            return
+        stiffness_values = sorted(
+            pd.to_numeric(frame["stiffness_value"], errors="coerce").dropna().unique()
+        )
+        if not stiffness_values:
+            return
+        fig, ax = plt.subplots(figsize=(9.5, 5.2))
+        for i, stiffness in enumerate(stiffness_values):
+            g = frame[
+                pd.to_numeric(frame["stiffness_value"], errors="coerce") == stiffness
+            ]
+            if g.empty:
+                continue
+            agg = (
+                g.groupby("trajectory_time_bin", as_index=False)
+                .agg(time_fraction=("time_fraction", "mean"), value=(metric_col, statistic))
+                .sort_values("trajectory_time_bin")
+            )
+            if not agg["value"].notna().any():
+                continue
+            ax.plot(
+                agg["time_fraction"],
+                agg["value"],
+                color=cmap(i / max(1, len(stiffness_values) - 1)),
+                linewidth=2.4,
+                label=f"{stiffness:g}",
+            )
+        ax.axhline(0, color="0.75", linewidth=0.8)
+        ax.set_xlabel("Normalized stiffness-segment time")
+        ax.set_ylabel(f"{label} ({unit})")
+        statistic_label = statistic.capitalize()
+        ax.set_title(
+            f"{statistic_label} {label.lower()} vs normalized time by stiffness\n"
+            f"{title_scope}; {statistic} by time-bin; {curve_scope}"
+        )
+        ax.legend(fontsize=8, title="Stiffness")
+        ax.grid(alpha=0.25)
+        fig.tight_layout()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=fig_dpi)
+        plt.close(fig)
+        paths.append(out_path)
+
+    def _save_xyz_time_family(
+        frame: pd.DataFrame,
+        *,
+        statistic: str,
+        title_scope: str,
+        curve_scope: str = "all fingers",
+        out_path: Path,
+    ) -> None:
+        """Save one figure that shows the X, Y, and Z velocity components."""
+        component_specs = [
+            ("X-axis velocity", "velocity_x_axis_px_s", "px/s"),
+            ("Y-axis velocity", "velocity_y_axis_px_s", "px/s"),
+            ("Z-axis velocity (3D proxy)", "velocity_z_axis_3d_proxy_px_s", "px/s"),
+        ]
+        if not any(
+            col in frame.columns and frame[col].notna().any()
+            for _, col, _ in component_specs
+        ):
+            return
+        stiffness_values = sorted(
+            pd.to_numeric(frame["stiffness_value"], errors="coerce").dropna().unique()
+        )
+        if not stiffness_values:
+            return
+        fig, axes = plt.subplots(3, 1, figsize=(9.5, 10.8), sharex=True)
+        plotted_any = False
+        for ax, (label, col, unit) in zip(axes, component_specs):
+            ax.axhline(0, color="0.75", linewidth=0.8)
+            ax.grid(alpha=0.25)
+            ax.set_ylabel(f"{label}\n({unit})")
+            if col not in frame.columns or not frame[col].notna().any():
+                ax.text(
+                    0.5,
+                    0.5,
+                    "no data",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                    color="0.55",
+                )
+                continue
+            for i, stiffness in enumerate(stiffness_values):
+                g = frame[
+                    pd.to_numeric(frame["stiffness_value"], errors="coerce")
+                    == stiffness
+                ]
+                if g.empty:
+                    continue
+                agg = (
+                    g.groupby("trajectory_time_bin", as_index=False)
+                    .agg(time_fraction=("time_fraction", "mean"), value=(col, statistic))
+                    .sort_values("trajectory_time_bin")
+                )
+                if not agg["value"].notna().any():
+                    continue
+                ax.plot(
+                    agg["time_fraction"],
+                    agg["value"],
+                    color=cmap(i / max(1, len(stiffness_values) - 1)),
+                    linewidth=2.2,
+                    label=f"{stiffness:g}",
+                )
+                plotted_any = True
+            ax.set_title(f"{label} vs normalized time")
+        axes[-1].set_xlabel("Normalized stiffness-segment time")
+        handles, labels = axes[0].get_legend_handles_labels()
+        if handles:
+            axes[0].legend(handles, labels, fontsize=8, title="Stiffness")
+        fig.suptitle(
+            f"{statistic.capitalize()} signed X/Y/Z velocity components by stiffness\n"
+            f"{title_scope}; {statistic} by time-bin; {curve_scope}",
+            y=0.995,
+        )
+        fig.tight_layout()
+        if plotted_any:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(out_path, dpi=fig_dpi)
+            paths.append(out_path)
+        plt.close(fig)
+
+    def _save_curviness(frame: pd.DataFrame, *, title_scope: str, out_path: Path) -> None:
+        radial_col = _first_existing_column(
+            frame, ["radial_velocity_3d_proxy_px_s", "radial_velocity_px_s"]
+        )
+        tangential_col = _first_existing_column(
+            frame, ["tangential_speed_3d_proxy_px_s", "tangential_velocity_px_s"]
+        )
+        if radial_col is None or tangential_col is None:
+            return
+        required = {radial_col, tangential_col, "stiffness_value"}
+        if not required.issubset(frame.columns):
+            return
+        fig, ax = plt.subplots(figsize=(6.8, 6.2))
+        stiffness_values = sorted(
+            pd.to_numeric(frame["stiffness_value"], errors="coerce").dropna().unique()
+        )
+        for i, stiffness in enumerate(stiffness_values):
+            g = frame[
+                pd.to_numeric(frame["stiffness_value"], errors="coerce") == stiffness
+            ]
+            if g.empty:
+                continue
+            ax.scatter(
+                g[radial_col],
+                g[tangential_col],
+                s=16,
+                alpha=0.55,
+                color=cmap(i / max(1, len(stiffness_values) - 1)),
+                label=f"{stiffness:g}",
+            )
+        ax.axhline(0, color="0.75", linewidth=0.8)
+        ax.axvline(0, color="0.75", linewidth=0.8)
+        ax.set_xlabel("Signed radial velocity (3D proxy when available, px/s)")
+        ax.set_ylabel("Tangential speed (3D proxy when available, px/s)")
+        ax.set_title(
+            "Velocity curviness proxy\n"
+            f"{title_scope}; ideal straight radial motion stays near tangential=0"
+        )
+        ax.legend(fontsize=8, title="Stiffness")
+        ax.grid(alpha=0.25)
+        fig.tight_layout()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=fig_dpi)
+        plt.close(fig)
+        paths.append(out_path)
+
+    if include_subject_figures:
+        for subject, s in profile.groupby("subject_id", dropna=False):
+            if pd.isna(subject) or s.empty:
+                continue
+            safe_subject = sanitize_name(subject)
+            for family in ("x_axis", "y_axis", "z_axis", "magnitude", "radial", "tangential"):
+                statistic = "median"
+                _save_time_family(
+                    s,
+                    family=family,
+                    statistic=statistic,
+                    title_scope=f"subject {subject}",
+                    out_path=subject_figure_path(
+                        fig_dir,
+                        subject,
+                        f"velocity_{family}_normalized_time_{statistic}_subject_{safe_subject}.png",
+                    ),
+                )
+                for finger in _ordered_fingers(s["finger_condition"].dropna().unique()):
+                    finger_frame = s[s["finger_condition"].astype(str) == str(finger)]
+                    if finger_frame.empty:
+                        continue
+                    _save_time_family(
+                        finger_frame,
+                        family=family,
+                        statistic=statistic,
+                        title_scope=f"subject {subject}",
+                        curve_scope=(
+                            f"finger {FINGER_LABELS.get(str(finger), str(finger))}"
+                        ),
+                        out_path=subject_figure_path(
+                            fig_dir,
+                            subject,
+                            (
+                                f"velocity_{family}_normalized_time_{statistic}"
+                                f"_subject_{safe_subject}_finger_{sanitize_name(finger)}.png"
+                            ),
+                        ),
+                    )
+            statistic = "median"
+            _save_xyz_time_family(
+                s,
+                statistic=statistic,
+                title_scope=f"subject {subject}",
+                out_path=subject_figure_path(
+                    fig_dir,
+                    subject,
+                    f"velocity_xyz_axes_normalized_time_{statistic}_subject_{safe_subject}.png",
+                ),
+            )
+            for finger in _ordered_fingers(s["finger_condition"].dropna().unique()):
+                finger_frame = s[s["finger_condition"].astype(str) == str(finger)]
+                if finger_frame.empty:
+                    continue
+                _save_xyz_time_family(
+                    finger_frame,
+                    statistic=statistic,
+                    title_scope=f"subject {subject}",
+                    curve_scope=f"finger {FINGER_LABELS.get(str(finger), str(finger))}",
+                    out_path=subject_figure_path(
+                        fig_dir,
+                        subject,
+                        (
+                            f"velocity_xyz_axes_normalized_time_{statistic}"
+                            f"_subject_{safe_subject}_finger_{sanitize_name(finger)}.png"
+                        ),
+                    ),
+                )
+            _save_curviness(
+                s,
+                title_scope=f"subject {subject}",
+                out_path=subject_figure_path(
+                    fig_dir,
+                    subject,
+                    f"velocity_curviness_radial_vs_tangential_subject_{safe_subject}.png",
+                ),
+            )
+
+    if include_aggregate_figures:
+        for family in ("x_axis", "y_axis", "z_axis", "magnitude", "radial", "tangential"):
+            statistic = "median"
+            _save_time_family(
+                profile,
+                family=family,
+                statistic=statistic,
+                title_scope="all included participants",
+                out_path=fig_dir / f"velocity_{family}_normalized_time_{statistic}.png",
+            )
+            for finger in _ordered_fingers(profile["finger_condition"].dropna().unique()):
+                finger_frame = profile[
+                    profile["finger_condition"].astype(str) == str(finger)
+                ]
+                if finger_frame.empty:
+                    continue
+                _save_time_family(
+                    finger_frame,
+                    family=family,
+                    statistic=statistic,
+                    title_scope="all included participants",
+                    curve_scope=f"finger {FINGER_LABELS.get(str(finger), str(finger))}",
+                    out_path=(
+                        fig_dir
+                        / (
+                            f"velocity_{family}_normalized_time_{statistic}"
+                            f"_finger_{sanitize_name(finger)}.png"
+                        )
+                    ),
+                )
+        statistic = "median"
+        _save_xyz_time_family(
+            profile,
+            statistic=statistic,
+            title_scope="all included participants",
+            out_path=fig_dir / f"velocity_xyz_axes_normalized_time_{statistic}.png",
+        )
+        for finger in _ordered_fingers(profile["finger_condition"].dropna().unique()):
+            finger_frame = profile[
+                profile["finger_condition"].astype(str) == str(finger)
+            ]
+            if finger_frame.empty:
+                continue
+            _save_xyz_time_family(
+                finger_frame,
+                statistic=statistic,
+                title_scope="all included participants",
+                curve_scope=f"finger {FINGER_LABELS.get(str(finger), str(finger))}",
+                out_path=(
+                    fig_dir
+                    / (
+                        f"velocity_xyz_axes_normalized_time_{statistic}"
+                        f"_finger_{sanitize_name(finger)}.png"
+                    )
+                ),
+            )
+        _save_curviness(
+            profile,
+            title_scope="all included participants",
+            out_path=fig_dir / "velocity_curviness_radial_vs_tangential.png",
+        )
+
+    save_csv(
+        pd.DataFrame({"figure": [str(p) for p in paths]}),
+        output_root,
+        "velocity_suggestion_figure_manifest.csv",
+    )
+    return paths
+
 
 
 def save_subject_velocity_acceleration_figures(
@@ -4991,10 +7647,19 @@ def save_subject_velocity_acceleration_figures(
     subject_velocity_acceleration_profile: pd.DataFrame,
     *,
     max_subjects: Optional[int] = None,
+    include_subject_figures: bool = True,
+    include_aggregate_figures: bool = True,
+    include_acceleration_stiffness_figures: bool = True,
+    include_average_acceleration_stiffness_figure: bool = True,
     fig_dpi: int = 160,
 ) -> list[Path]:
-    """Save one velocity/acceleration profile figure per subject."""
-    fig_dir = output_root / "figures" / "subject_velocity_acceleration"
+    """Save velocity/acceleration profile figures.
+
+    ``include_subject_figures`` is intended for single-subject runs. Group runs
+    can set it to ``False`` so the output contains only group-level summaries and
+    no individual participant plots.
+    """
+    fig_dir = _figures_base(output_root) / "subject_velocity_acceleration"
     fig_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     if subject_velocity_acceleration_profile.empty:
@@ -5053,28 +7718,33 @@ def save_subject_velocity_acceleration_figures(
     if max_subjects is not None:
         subjects = subjects[:max_subjects]
 
-    for subject in subjects:
-        s = profile[profile["subject_id"] == subject].copy()
-        if s.empty:
-            continue
-        fig, axes = plt.subplots(2, 3, figsize=(16, 8), sharex=True)
+    def _save_subject_component_stack(
+        subject: Any,
+        subject_frame: pd.DataFrame,
+        *,
+        component_specs: list[tuple[str, str | None, str]],
+        title_metric: str,
+        filename: str,
+    ) -> None:
+        fig, axes = plt.subplots(3, 1, figsize=(9.5, 11.0), sharex=True)
         cmap = plt.get_cmap(STIFFNESS_CMAP)
         stiffness_values = sorted(
-            pd.to_numeric(s["stiffness_value"], errors="coerce").dropna().unique()
+            pd.to_numeric(subject_frame["stiffness_value"], errors="coerce").dropna().unique()
         )
         stiffness_to_color = {
             stiffness: cmap(i / max(1, len(stiffness_values) - 1))
             for i, stiffness in enumerate(stiffness_values)
         }
-        agg_cols = {
-            "time_fraction": ("time_fraction", "mean"),
-        }
-        if "sampling_rate_hz" in s.columns:
+        agg_cols = {"time_fraction": ("time_fraction", "mean")}
+        if "sampling_rate_hz" in subject_frame.columns:
             agg_cols["sampling_rate_hz"] = ("sampling_rate_hz", "median")
-        for _, col, _ in velocity_components + acceleration_components:
+        for _, col, _ in component_specs:
             if col is not None:
-                agg_cols[col] = (col, "mean")
-        for stiffness, g_stiffness in s.groupby("stiffness_value", dropna=False):
+                agg_cols[col] = (col, "median")
+
+        component_has_data = {component: False for component, _, _ in component_specs}
+        cutoff_labels: list[str] = []
+        for stiffness, g_stiffness in subject_frame.groupby("stiffness_value", dropna=False):
             g_stiffness = g_stiffness.sort_values("trajectory_time_bin")
             avg = (
                 g_stiffness.groupby("trajectory_time_bin", as_index=False)
@@ -5084,18 +7754,10 @@ def save_subject_velocity_acceleration_figures(
             color = stiffness_to_color.get(stiffness, "0.35")
             label = f"{float(stiffness):g}" if pd.notna(stiffness) else "missing"
             fs_hz = _estimate_profile_sample_rate_hz(avg)
-            cutoff_labels: list[str] = []
-            for ax, (component, col, unit) in zip(axes[0], velocity_components):
-                if col is None or col not in avg.columns:
-                    ax.text(
-                        0.5,
-                        0.5,
-                        "No Z data" if component == "Vz" else "No data",
-                        ha="center",
-                        va="center",
-                        transform=ax.transAxes,
-                    )
+            for ax, (component, col, unit) in zip(axes, component_specs):
+                if col is None or col not in avg.columns or not avg[col].notna().any():
                     continue
+                component_has_data[component] = True
                 low, high, effective_cutoff = _profile_filter_pair(
                     avg[col],
                     avg["time_fraction"],
@@ -5104,88 +7766,299 @@ def save_subject_velocity_acceleration_figures(
                 )
                 if np.isfinite(effective_cutoff):
                     cutoff_labels.append(f"{effective_cutoff:g}")
-                low = _mask_filter_plot_values(low)
-                high = _mask_filter_plot_values(high)
                 ax.plot(
                     avg["time_fraction"],
-                    low,
+                    _mask_filter_plot_values(low),
                     color=color,
                     linewidth=2.6,
                     label=label,
                 )
                 ax.plot(
                     avg["time_fraction"],
-                    high,
+                    _mask_filter_plot_values(high),
                     color=color,
                     linewidth=1.2,
                     linestyle="--",
                     alpha=0.75,
                 )
                 ax.set_ylabel(f"{component} ({unit})")
-            for ax, (component, col, unit) in zip(axes[1], acceleration_components):
-                if col is None or col not in avg.columns:
+
+        for ax, (component, col, unit) in zip(axes, component_specs):
+            if not component_has_data.get(component, False):
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No Z data" if component.endswith("z") or component.endswith("Z") else "No data",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                    color="0.55",
+                )
+                ax.set_ylabel(f"{component} ({unit})")
+            ax.set_title(f"{component} vs normalized time")
+            ax.axhline(0, color="0.75", linewidth=0.7)
+            ax.grid(alpha=0.2)
+        axes[-1].set_xlabel("Normalized stiffness-segment time")
+        handles, labels = axes[0].get_legend_handles_labels()
+        if handles:
+            axes[0].legend(handles, labels, fontsize=8, title="Stiffness")
+        cutoff_note = ""
+        if cutoff_labels:
+            cutoff_note = f"; LPF/HPF target=10 Hz (effective <= {max(cutoff_labels, key=float)} Hz)"
+        fig.suptitle(
+            f"Subject {subject}: {title_metric} components\n"
+            "X, Y, Z stacked vertically; solid=LPF, dashed=HPF; "
+            f"thick lines=subject median by stiffness, collapsed across fingers{cutoff_note}",
+            y=1.01,
+        )
+        fig.tight_layout()
+        out = subject_figure_path(fig_dir, subject, filename)
+        fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
+        plt.close(fig)
+        paths.append(out)
+
+    def _save_subject_single_component(
+        subject: Any,
+        subject_frame: pd.DataFrame,
+        *,
+        component: str,
+        col: str | None,
+        unit: str,
+        title_metric: str,
+        filename: str,
+    ) -> None:
+        """Save one subject figure for a single signed axis component."""
+        if col is None or col not in subject_frame.columns or not subject_frame[col].notna().any():
+            return
+        fig, ax = plt.subplots(figsize=(9.5, 5.2))
+        cmap = plt.get_cmap(STIFFNESS_CMAP)
+        stiffness_values = sorted(
+            pd.to_numeric(subject_frame["stiffness_value"], errors="coerce")
+            .dropna()
+            .unique()
+        )
+        if not stiffness_values:
+            plt.close(fig)
+            return
+        plotted_any = False
+        for i, stiffness in enumerate(stiffness_values):
+            g = subject_frame[
+                pd.to_numeric(subject_frame["stiffness_value"], errors="coerce")
+                == stiffness
+            ]
+            if g.empty:
+                continue
+            agg_cols = {
+                "time_fraction": ("time_fraction", "mean"),
+                "value": (col, "median"),
+            }
+            if "sampling_rate_hz" in g.columns:
+                agg_cols["sampling_rate_hz"] = ("sampling_rate_hz", "median")
+            avg = (
+                g.groupby("trajectory_time_bin", as_index=False)
+                .agg(**agg_cols)
+                .sort_values("trajectory_time_bin")
+            )
+            if not avg["value"].notna().any():
+                continue
+            fs_hz = _estimate_profile_sample_rate_hz(avg)
+            low, high, _ = _profile_filter_pair(
+                avg["value"],
+                avg["time_fraction"],
+                fs_hz=fs_hz,
+                cutoff_hz=10.0,
+            )
+            color = cmap(i / max(1, len(stiffness_values) - 1))
+            ax.plot(
+                avg["time_fraction"],
+                _mask_filter_plot_values(low),
+                color=color,
+                linewidth=2.6,
+                label=f"{stiffness:g}",
+            )
+            ax.plot(
+                avg["time_fraction"],
+                _mask_filter_plot_values(high),
+                color=color,
+                linewidth=1.2,
+                linestyle="--",
+                alpha=0.75,
+            )
+            plotted_any = True
+        if not plotted_any:
+            plt.close(fig)
+            return
+        ax.axhline(0, color="0.75", linewidth=0.8)
+        ax.set_xlabel("Normalized stiffness-segment time")
+        ax.set_ylabel(f"{component} ({unit})")
+        ax.set_title(
+            f"Subject {subject}: {component} {title_metric} vs normalized time\n"
+            "solid=LPF, dashed=HPF; median by stiffness, collapsed across fingers"
+        )
+        ax.legend(fontsize=8, title="Stiffness")
+        ax.grid(alpha=0.25)
+        fig.tight_layout()
+        out = subject_figure_path(fig_dir, subject, filename)
+        fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
+        plt.close(fig)
+        paths.append(out)
+
+    def _save_subject_acceleration_matrix(
+        subject: Any,
+        subject_frame: pd.DataFrame,
+        *,
+        filename: str,
+    ) -> None:
+        """Subject acceleration as rows Ax/Ay/Az with median profiles only."""
+        fig, axes = plt.subplots(3, 1, figsize=(9.5, 10.5), sharex=True)
+        axes = np.asarray(axes).reshape(3, 1)
+        cmap = plt.get_cmap(STIFFNESS_CMAP)
+        stiffness_values = sorted(
+            pd.to_numeric(subject_frame["stiffness_value"], errors="coerce")
+            .dropna()
+            .unique()
+        )
+        stiffness_to_color = {
+            stiffness: cmap(i / max(1, len(stiffness_values) - 1))
+            for i, stiffness in enumerate(stiffness_values)
+        }
+        stat_specs = [("Median", "median")]
+        plotted_any = False
+        for row_idx, (component, col, unit) in enumerate(acceleration_components):
+            for col_idx, (stat_label, stat_func) in enumerate(stat_specs):
+                ax = axes[row_idx, col_idx]
+                ax.axhline(0, color="0.75", linewidth=0.7)
+                ax.grid(alpha=0.22)
+                if col is None or col not in subject_frame.columns or not subject_frame[col].notna().any():
                     ax.text(
                         0.5,
                         0.5,
                         "No Z data" if component == "Az" else "No data",
                         ha="center",
                         va="center",
+                        color="0.55",
                         transform=ax.transAxes,
                     )
-                    continue
-                low, high, effective_cutoff = _profile_filter_pair(
-                    avg[col],
-                    avg["time_fraction"],
-                    fs_hz=fs_hz,
-                    cutoff_hz=10.0,
-                )
-                if np.isfinite(effective_cutoff):
-                    cutoff_labels.append(f"{effective_cutoff:g}")
-                low = _mask_filter_plot_values(low)
-                high = _mask_filter_plot_values(high)
-                ax.plot(
-                    avg["time_fraction"],
-                    low,
-                    color=color,
-                    linewidth=2.6,
-                    label=label,
-                )
-                ax.plot(
-                    avg["time_fraction"],
-                    high,
-                    color=color,
-                    linewidth=1.2,
-                    linestyle="--",
-                    alpha=0.75,
-                )
-                ax.set_ylabel(f"{component} ({unit})")
-        for ax, (component, _, _) in zip(axes[0], velocity_components):
-            ax.set_title(f"{component} vs normalized time")
-        for ax, (component, _, _) in zip(axes[1], acceleration_components):
-            ax.set_title(f"{component} vs normalized time")
-            ax.set_xlabel("Normalized stiffness-segment time")
-        for ax in axes.ravel():
-            ax.axhline(0, color="0.75", linewidth=0.7)
-            ax.grid(alpha=0.2)
-        axes[0, 0].legend(fontsize=8, title="Stiffness")
-        cutoff_note = ""
-        if cutoff_labels:
-            cutoff_note = f"; LPF/HPF target=10 Hz (effective <= {max(cutoff_labels, key=float)} Hz)"
+                else:
+                    for stiffness in stiffness_values:
+                        g = subject_frame[
+                            pd.to_numeric(subject_frame["stiffness_value"], errors="coerce")
+                            == stiffness
+                        ]
+                        if g.empty:
+                            continue
+                        agg = (
+                            g.groupby("trajectory_time_bin", as_index=False)
+                            .agg(
+                                time_fraction=("time_fraction", "median"),
+                                value=(col, stat_func),
+                                sampling_rate_hz=("sampling_rate_hz", "median")
+                                if "sampling_rate_hz" in g.columns
+                                else ("trajectory_time_bin", "count"),
+                            )
+                            .sort_values("trajectory_time_bin")
+                        )
+                        if not agg["value"].notna().any():
+                            continue
+                        fs_hz = _estimate_profile_sample_rate_hz(agg)
+                        low, _, _ = _profile_filter_pair(
+                            agg["value"],
+                            agg["time_fraction"],
+                            fs_hz=fs_hz,
+                            cutoff_hz=10.0,
+                        )
+                        ax.plot(
+                            agg["time_fraction"],
+                            _mask_filter_plot_values(low),
+                            color=stiffness_to_color.get(stiffness, "0.35"),
+                            linewidth=2.4,
+                            label=f"{stiffness:g}",
+                        )
+                        plotted_any = True
+                if row_idx == 0:
+                    ax.set_title(f"{stat_label} acceleration")
+                if col_idx == 0:
+                    ax.set_ylabel(f"{component} ({unit})")
+                if row_idx == 2:
+                    ax.set_xlabel("Normalized stiffness-segment time")
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        if handles:
+            axes[0, 0].legend(handles, labels, fontsize=8, title="Stiffness")
         fig.suptitle(
-            f"Subject {subject}: velocity and acceleration components\n"
-            "solid=LPF, dashed=HPF; thick lines=subject mean by stiffness, "
-            f"averaged across fingers{cutoff_note}; shown |value| range: 1e-1 to 1e4",
-            y=1.02,
+            f"Subject {subject}: acceleration components by stiffness\n"
+            "rows=X/Y/Z, median profiles only, color=stiffness",
+            y=0.995,
         )
         fig.tight_layout()
-        out = subject_figure_path(
-            fig_dir,
-            subject,
-            f"subject_{sanitize_name(subject)}_velocity_acceleration.png",
-        )
-        fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
+        if plotted_any:
+            out = subject_figure_path(fig_dir, subject, filename)
+            fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
+            paths.append(out)
         plt.close(fig)
-        paths.append(out)
+
+    if include_subject_figures:
+        for subject in subjects:
+            s = profile[profile["subject_id"] == subject].copy()
+            if s.empty:
+                continue
+            _save_subject_component_stack(
+                subject,
+                s,
+                component_specs=velocity_components,
+                title_metric="velocity",
+                filename=f"subject_{sanitize_name(subject)}_velocity.png",
+            )
+            for component, col, unit in velocity_components:
+                _save_subject_single_component(
+                    subject,
+                    s,
+                    component=component,
+                    col=col,
+                    unit=unit,
+                    title_metric="velocity",
+                    filename=(
+                        f"subject_{sanitize_name(subject)}"
+                        f"_velocity_{component[-1].lower()}_axis.png"
+                    ),
+                )
+            _save_subject_acceleration_matrix(
+                subject,
+                s,
+                filename=f"subject_{sanitize_name(subject)}_acceleration_by_stiffness.png",
+            )
+            for component, col, unit in acceleration_components:
+                _save_subject_single_component(
+                    subject,
+                    s,
+                    component=component,
+                    col=col,
+                    unit=unit,
+                    title_metric="acceleration",
+                    filename=(
+                        f"subject_{sanitize_name(subject)}"
+                        f"_acceleration_{component[-1].lower()}_axis_by_stiffness.png"
+                    ),
+                )
+            for finger in _ordered_fingers(s["finger_condition"].dropna().unique()):
+                finger_frame = s[s["finger_condition"].astype(str) == str(finger)]
+                if finger_frame.empty:
+                    continue
+                _save_subject_acceleration_matrix(
+                    subject,
+                    finger_frame,
+                    filename=(
+                        f"subject_{sanitize_name(subject)}"
+                        f"_acceleration_by_stiffness_finger_{sanitize_name(finger)}.png"
+                    ),
+                )
+
+    if not include_aggregate_figures:
+        save_csv(
+            pd.DataFrame({"figure": [str(p) for p in paths]}),
+            output_root,
+            "subject_velocity_acceleration_figure_manifest.csv",
+        )
+        return paths
 
     all_profile = profile.dropna(subset=["time_fraction"]).copy()
     if not all_profile.empty:
@@ -5193,57 +8066,170 @@ def save_subject_velocity_acceleration_figures(
         stiffness_values = sorted(
             pd.to_numeric(all_profile["stiffness_value"], errors="coerce").dropna().unique()
         )
-        fig, ax = plt.subplots(figsize=(9.5, 5.2))
-        for finger in _ordered_fingers(all_profile["finger_condition"].dropna().unique()):
-            g_finger = all_profile[all_profile["finger_condition"] == finger]
-            color = FINGER_TO_COLOR.get(str(finger), "#777777")
-            for _, g_sub in g_finger.groupby("subject_id", dropna=False):
-                g_sub = g_sub.sort_values("trajectory_time_bin")
-                ax.plot(
-                    g_sub["time_fraction"],
-                    g_sub["acceleration_px_s2"],
-                    color=color,
-                    alpha=0.08,
-                    linewidth=0.8,
-                )
-            med = (
-                g_finger.groupby("trajectory_time_bin", as_index=False)
-                .agg(
-                    time_fraction=("time_fraction", "median"),
-                    median_acceleration_px_s2=("acceleration_px_s2", "median"),
-                )
-                .sort_values("trajectory_time_bin")
+
+        # Signed per-axis acceleration vs time, plotted as an (X, Y, Z) matrix.
+        #
+        # The previous figure plotted ``acceleration_px_s2`` -- the Euclidean
+        # magnitude ``hypot(ax, ay)`` -- on a log axis. That magnitude is always
+        # >= 0, so it hides the most informative feature of a probing stroke: the
+        # hand accelerates *outward* (one sign) and then *decelerates / returns
+        # toward the center* (the opposite sign). Using the signed components
+        # ``ax_px_s2``/``ay_px_s2``/``az_px_s2`` on a linear axis with a zero
+        # reference line restores those negative phases. Az is the vertical
+        # (side-camera) component and may be absent; that panel is left blank when
+        # the column is missing or all-NaN.
+        accel_axis_specs = [
+            ("Ax (left-right)", _first_existing_column(all_profile, ["ax_px_s2", "ax_3d_px_s2"])),
+            ("Ay (toward-away)", _first_existing_column(all_profile, ["ay_px_s2", "ay_3d_px_s2"])),
+            ("Az (vertical)", _first_existing_column(all_profile, ["az_px_s2", "az_3d_proxy_px_s2"])),
+        ]
+
+        def _save_acceleration_xyz_figure(frame, *, aggregator, title_scope, filename):
+            fig, axes = plt.subplots(3, 1, figsize=(9.5, 11.0), sharex=True)
+            for ax, (axis_label, col) in zip(axes, accel_axis_specs):
+                ax.axhline(0, color="0.4", linewidth=0.9)
+                ax.grid(alpha=0.25)
+                ax.set_ylabel(f"{axis_label}\nacceleration (px/s²)")
+                if col is None or not frame[col].notna().any():
+                    ax.text(
+                        0.5,
+                        0.5,
+                        "no data",
+                        transform=ax.transAxes,
+                        ha="center",
+                        va="center",
+                        color="0.6",
+                        fontsize=10,
+                    )
+                    continue
+                for finger in _ordered_fingers(
+                    frame["finger_condition"].dropna().unique()
+                ):
+                    g_finger = frame[frame["finger_condition"] == finger]
+                    color = FINGER_TO_COLOR.get(str(finger), "#777777")
+                    # Thin, light traces: every individual movement profile in this
+                    # set (one per participant) so the full spread of motions shows.
+                    for _, g_sub in g_finger.groupby("subject_id", dropna=False):
+                        g_sub = g_sub.sort_values("trajectory_time_bin")
+                        ax.plot(
+                            g_sub["time_fraction"],
+                            g_sub[col],
+                            color=color,
+                            alpha=0.18,
+                            linewidth=0.6,
+                        )
+                    agg = (
+                        g_finger.groupby("trajectory_time_bin", as_index=False)
+                        .agg(
+                            time_fraction=("time_fraction", "median"),
+                            value=(col, aggregator),
+                        )
+                        .sort_values("trajectory_time_bin")
+                    )
+                    if not agg.empty:
+                        ax.plot(
+                            agg["time_fraction"],
+                            agg["value"],
+                            color=color,
+                            linewidth=3.0,
+                            marker="o",
+                            markersize=3,
+                            label=FINGER_LABELS.get(str(finger), str(finger)),
+                        )
+            axes[-1].set_xlabel("Normalized stiffness-segment time")
+            handles, labels = axes[0].get_legend_handles_labels()
+            if handles:
+                axes[0].legend(handles, labels, fontsize=8, title="Finger")
+            fig.suptitle(
+                f"Signed acceleration components vs time {title_scope}\n"
+                f"thin/light = per-participant traces, thick+markers = {aggregator} "
+                "by finger; negative = decelerating / returning toward center",
+                y=0.997,
             )
-            if not med.empty:
-                ax.plot(
-                    med["time_fraction"],
-                    med["median_acceleration_px_s2"],
-                    color=color,
-                    linewidth=3.0,
-                    marker="o",
-                    markersize=3,
-                    label=FINGER_LABELS.get(str(finger), str(finger)),
+            fig.tight_layout()
+            out = fig_dir / filename
+            fig.savefig(out, dpi=fig_dpi)
+            plt.close(fig)
+            paths.append(out)
+
+        def _save_acceleration_axis_figure(
+            frame,
+            *,
+            axis_label: str,
+            col: str | None,
+            aggregator,
+            title_scope,
+            filename,
+        ):
+            if col is None or not frame[col].notna().any():
+                return
+            fig, ax = plt.subplots(figsize=(9.5, 5.4))
+            plotted_any = False
+            ax.axhline(0, color="0.4", linewidth=0.9)
+            ax.grid(alpha=0.25)
+            for finger in _ordered_fingers(frame["finger_condition"].dropna().unique()):
+                g_finger = frame[frame["finger_condition"] == finger]
+                if g_finger.empty:
+                    continue
+                color = FINGER_TO_COLOR.get(str(finger), "#777777")
+                for _, g_sub in g_finger.groupby("subject_id", dropna=False):
+                    g_sub = g_sub.sort_values("trajectory_time_bin")
+                    ax.plot(
+                        g_sub["time_fraction"],
+                        g_sub[col],
+                        color=color,
+                        alpha=0.18,
+                        linewidth=0.6,
+                    )
+                agg = (
+                    g_finger.groupby("trajectory_time_bin", as_index=False)
+                    .agg(time_fraction=("time_fraction", "median"), value=(col, aggregator))
+                    .sort_values("trajectory_time_bin")
                 )
-        ax.set_xlabel("Normalized stiffness-segment time")
-        ax.set_ylabel("Acceleration magnitude (px/s²)")
-        ax.set_title(
-            "Acceleration vs time for all participants (log y-axis)\n"
-            "thin=participant traces, thick+markers=median by finger"
+                if not agg.empty and agg["value"].notna().any():
+                    ax.plot(
+                        agg["time_fraction"],
+                        agg["value"],
+                        color=color,
+                        linewidth=3.0,
+                        marker="o",
+                        markersize=3,
+                        label=FINGER_LABELS.get(str(finger), str(finger)),
+                    )
+                    plotted_any = True
+            if not plotted_any:
+                plt.close(fig)
+                return
+            ax.set_xlabel("Normalized stiffness-segment time")
+            ax.set_ylabel(f"{axis_label} acceleration (px/sֲ²)")
+            ax.set_title(
+                f"Signed {axis_label} acceleration vs time {title_scope}\n"
+                f"thin/light = per-participant traces, thick+markers = {aggregator} by finger"
+            )
+            ax.legend(fontsize=8, title="Finger")
+            fig.tight_layout()
+            out = fig_dir / filename
+            fig.savefig(out, dpi=fig_dpi)
+            plt.close(fig)
+            paths.append(out)
+
+        _save_acceleration_xyz_figure(
+            all_profile,
+            aggregator="median",
+            title_scope="for all participants",
+            filename="all_acceleration_xyz_vs_time_by_finger_median.png",
         )
-        positive_acc = pd.to_numeric(
-            all_profile["acceleration_px_s2"], errors="coerce"
-        )
-        positive_acc = positive_acc[positive_acc > 0]
-        if not positive_acc.empty:
-            ax.set_yscale("log")
-            ax.set_ylim(bottom=float(positive_acc.min()) * 0.8)
-        ax.grid(alpha=0.25)
-        ax.legend(fontsize=8, title="Finger")
-        fig.tight_layout()
-        out = fig_dir / "all_acceleration_vs_time_by_finger_median.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
+        for axis_name, (axis_label, col) in zip(("x", "y", "z"), accel_axis_specs):
+            _save_acceleration_axis_figure(
+                all_profile,
+                axis_label=axis_label,
+                col=col,
+                aggregator="median",
+                title_scope="for all participants",
+                filename=(
+                    f"all_acceleration_{axis_name}_axis_vs_time_by_finger_median.png"
+                ),
+            )
 
         if stiffness_values:
             for stiffness in stiffness_values:
@@ -5253,70 +8239,30 @@ def save_subject_velocity_acceleration_figures(
                 ]
                 if stiffness_profile.empty:
                     continue
-                fig, ax = plt.subplots(figsize=(9.5, 5.2))
-                for finger in _ordered_fingers(
-                    stiffness_profile["finger_condition"].dropna().unique()
-                ):
-                    g_finger = stiffness_profile[
-                        stiffness_profile["finger_condition"] == finger
-                    ]
-                    color = FINGER_TO_COLOR.get(str(finger), "#777777")
-                    for _, g_sub in g_finger.groupby("subject_id", dropna=False):
-                        g_sub = g_sub.sort_values("trajectory_time_bin")
-                        ax.plot(
-                            g_sub["time_fraction"],
-                            g_sub["acceleration_px_s2"],
-                            color=color,
-                            alpha=0.08,
-                            linewidth=0.8,
-                        )
-                    med = (
-                        g_finger.groupby("trajectory_time_bin", as_index=False)
-                        .agg(
-                            time_fraction=("time_fraction", "median"),
-                            median_acceleration_px_s2=(
-                                "acceleration_px_s2",
-                                "median",
+                if include_acceleration_stiffness_figures:
+                    _save_acceleration_xyz_figure(
+                        stiffness_profile,
+                        aggregator="median",
+                        title_scope=f"at stiffness {stiffness:g}",
+                        filename=(
+                            "all_acceleration_xyz_vs_time_by_finger_"
+                            f"median_stiffness_{sanitize_name(stiffness)}.png"
+                        ),
+                    )
+                    for axis_name, (axis_label, col) in zip(
+                        ("x", "y", "z"), accel_axis_specs
+                    ):
+                        _save_acceleration_axis_figure(
+                            stiffness_profile,
+                            axis_label=axis_label,
+                            col=col,
+                            aggregator="median",
+                            title_scope=f"at stiffness {stiffness:g}",
+                            filename=(
+                                f"all_acceleration_{axis_name}_axis_vs_time_by_finger_"
+                                f"median_stiffness_{sanitize_name(stiffness)}.png"
                             ),
                         )
-                        .sort_values("trajectory_time_bin")
-                    )
-                    if not med.empty:
-                        ax.plot(
-                            med["time_fraction"],
-                            med["median_acceleration_px_s2"],
-                            color=color,
-                            linewidth=3.0,
-                            marker="o",
-                            markersize=3,
-                            label=FINGER_LABELS.get(str(finger), str(finger)),
-                        )
-                positive_acc = pd.to_numeric(
-                    stiffness_profile["acceleration_px_s2"], errors="coerce"
-                )
-                positive_acc = positive_acc[positive_acc > 0]
-                if not positive_acc.empty:
-                    ax.set_yscale("log")
-                    ax.set_ylim(bottom=float(positive_acc.min()) * 0.8)
-                ax.set_xlabel("Normalized stiffness-segment time")
-                ax.set_ylabel("Acceleration magnitude (px/s²)")
-                ax.set_title(
-                    f"Acceleration vs time at stiffness {stiffness:g} (log y-axis)\n"
-                    "thin=participant traces, thick+markers=median by finger"
-                )
-                ax.grid(alpha=0.25)
-                ax.legend(fontsize=8, title="Finger")
-                fig.tight_layout()
-                out = (
-                    fig_dir
-                    / (
-                        "all_acceleration_vs_time_by_finger_median_"
-                        f"stiffness_{sanitize_name(stiffness)}.png"
-                    )
-                )
-                fig.savefig(out, dpi=fig_dpi)
-                plt.close(fig)
-                paths.append(out)
 
             fig, ax = plt.subplots(figsize=(9.5, 5.2))
             for i, stiffness in enumerate(stiffness_values):
@@ -5329,7 +8275,7 @@ def save_subject_velocity_acceleration_figures(
                     g.groupby("trajectory_time_bin", as_index=False)
                     .agg(
                         time_fraction=("time_fraction", "mean"),
-                        speed_px_s=("speed_px_s", "mean"),
+                        speed_px_s=("speed_px_s", "median"),
                         sem_speed_px_s=("speed_px_s", _sem),
                     )
                     .sort_values("trajectory_time_bin")
@@ -5342,12 +8288,12 @@ def save_subject_velocity_acceleration_figures(
                     label=f"{stiffness:g}",
                 )
             ax.set_xlabel("Normalized stiffness-segment time")
-            ax.set_ylabel("Velocity / speed (px/s)")
+            ax.set_ylabel("Velocity magnitude (px/s)")
             ax.set_title("Velocity vs time by stiffness value")
             ax.legend(fontsize=8, title="Stiffness")
             ax.grid(alpha=0.25)
             fig.tight_layout()
-            out = fig_dir / "all_velocity_vs_time_by_stiffness.png"
+            out = fig_dir / "velocity_vs_time_by_stiffness.png"
             fig.savefig(out, dpi=fig_dpi)
             plt.close(fig)
             paths.append(out)
@@ -5369,7 +8315,7 @@ def save_subject_velocity_acceleration_figures(
                         g.groupby("trajectory_time_bin", as_index=False)
                         .agg(
                             time_fraction=("time_fraction", "mean"),
-                            speed_px_s=("speed_px_s", "mean"),
+                            speed_px_s=("speed_px_s", "median"),
                         )
                         .sort_values("trajectory_time_bin")
                     )
@@ -5381,7 +8327,7 @@ def save_subject_velocity_acceleration_figures(
                         label=f"{stiffness:g}",
                     )
                 ax.set_xlabel("Normalized stiffness-segment time")
-                ax.set_ylabel("Velocity / speed (px/s)")
+                ax.set_ylabel("Velocity magnitude (px/s)")
                 ax.set_title(
                     "Velocity vs time by stiffness value\n"
                     f"Finger: {FINGER_LABELS.get(str(finger), str(finger))}"
@@ -5391,120 +8337,945 @@ def save_subject_velocity_acceleration_figures(
                 fig.tight_layout()
                 out = (
                     fig_dir
-                    / f"all_velocity_vs_time_by_stiffness_finger_{sanitize_name(finger)}.png"
+                    / f"velocity_vs_time_by_stiffness_finger_{sanitize_name(finger)}.png"
                 )
                 fig.savefig(out, dpi=fig_dpi)
                 plt.close(fig)
                 paths.append(out)
 
-            by_stiffness = (
-                all_profile.groupby("stiffness_value", as_index=False)
+            fingers = _ordered_fingers(all_profile["finger_condition"].dropna().unique())
+            by_stiffness_finger_speed = (
+                all_profile.groupby(
+                    ["stiffness_value", "finger_condition"],
+                    as_index=False,
+                    dropna=False,
+                )
                 .agg(
-                    mean_speed_px_s=("speed_px_s", "mean"),
+                    mean_speed_px_s=("speed_px_s", "median"),
                     median_speed_px_s=("speed_px_s", "median"),
                     sem_speed_px_s=("speed_px_s", _sem),
                     n_observations=("speed_px_s", "count"),
                 )
-                .sort_values("stiffness_value")
+                .sort_values(["stiffness_value", "finger_condition"])
             )
-            fig, ax = plt.subplots(figsize=(8.5, 5.0))
-            colors = [
-                cmap(i / max(1, len(by_stiffness) - 1)) for i in range(len(by_stiffness))
-            ]
-            ax.bar(
-                by_stiffness["stiffness_value"].astype(str),
-                by_stiffness["mean_speed_px_s"],
-                yerr=by_stiffness["sem_speed_px_s"],
-                color=colors,
-                edgecolor=colors,
-                linewidth=2,
-                capsize=3,
-                alpha=0.82,
-            )
-            for i, row in by_stiffness.reset_index(drop=True).iterrows():
-                ax.text(
-                    i,
-                    row["mean_speed_px_s"],
-                    f"{row['stiffness_value']:g}\nn={int(row['n_observations'])}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                )
-            ax.set_xlabel("Stiffness value")
-            ax.set_ylabel("Average velocity / speed (px/s)")
-            ax.set_title("Influence of stiffness on average velocity")
-            ax.grid(axis="y", alpha=0.25)
-            fig.tight_layout()
-            out = fig_dir / "average_velocity_vs_stiffness.png"
-            fig.savefig(out, dpi=fig_dpi)
-            plt.close(fig)
-            paths.append(out)
-
-            fingers = _ordered_fingers(all_profile["finger_condition"].dropna().unique())
             if fingers:
-                fig, axes = plt.subplots(
-                    1,
-                    len(fingers),
-                    figsize=(4.6 * len(fingers), 4.8),
-                    squeeze=False,
-                    sharey=True,
+                fig, ax = plt.subplots(figsize=(10.5, 5.8))
+                stiffness_axis = sorted(
+                    pd.to_numeric(
+                        by_stiffness_finger_speed["stiffness_value"],
+                        errors="coerce",
+                    )
+                    .dropna()
+                    .unique()
                 )
-                subject_colors = _figure_colors(
-                    sorted(all_profile["subject_id"].dropna().unique(), key=lambda x: str(x))
+                x = np.arange(len(stiffness_axis), dtype=float)
+                width = min(0.18, 0.78 / max(1, len(fingers)))
+                offsets = (np.arange(len(fingers)) - (len(fingers) - 1) / 2) * width
+                subject_finger_speed = (
+                    all_profile.groupby(
+                        ["subject_id", "stiffness_value", "finger_condition"],
+                        as_index=False,
+                        dropna=False,
+                    )
+                    .agg(mean_speed_px_s=("speed_px_s", "median"))
+                    .sort_values(["stiffness_value", "finger_condition"])
                 )
-                for ax, finger in zip(axes.ravel(), fingers):
-                    finger_profile = all_profile[all_profile["finger_condition"] == finger]
-                    subject_finger = (
-                        finger_profile.groupby(
-                            ["subject_id", "stiffness_value"], as_index=False, dropna=False
+                for f_idx, finger in enumerate(fingers):
+                    heights: list[float] = []
+                    errors: list[float] = []
+                    counts: list[int] = []
+                    for stiffness in stiffness_axis:
+                        row = by_stiffness_finger_speed[
+                            (
+                                pd.to_numeric(
+                                    by_stiffness_finger_speed["stiffness_value"],
+                                    errors="coerce",
+                                )
+                                == stiffness
+                            )
+                            & (
+                                by_stiffness_finger_speed["finger_condition"].astype(str)
+                                == str(finger)
+                            )
+                        ]
+                        heights.append(
+                            float(row["median_speed_px_s"].iloc[0])
+                            if not row.empty
+                            else np.nan
                         )
-                        .agg(mean_speed_px_s=("speed_px_s", "mean"))
-                        .sort_values("stiffness_value")
-                    )
-                    for subject, g_sub in subject_finger.groupby(
-                        "subject_id", dropna=False
-                    ):
-                        ax.plot(
-                            g_sub["stiffness_value"],
-                            g_sub["mean_speed_px_s"],
-                            color=subject_colors.get(subject, "0.45"),
-                            linewidth=1.2,
-                            alpha=0.45,
-                            marker="o",
-                            markersize=3,
+                        errors.append(
+                            float(row["sem_speed_px_s"].iloc[0])
+                            if not row.empty
+                            and pd.notna(row["sem_speed_px_s"].iloc[0])
+                            else 0.0
                         )
-                    group_mean = (
-                        subject_finger.groupby("stiffness_value", as_index=False)
-                        .agg(mean_speed_px_s=("mean_speed_px_s", "mean"))
-                        .sort_values("stiffness_value")
+                        counts.append(int(row["n_observations"].iloc[0]) if not row.empty else 0)
+                    xpos = x + offsets[f_idx]
+                    color = FINGER_TO_COLOR.get(str(finger), "0.45")
+                    ax.bar(
+                        xpos,
+                        heights,
+                        width=width * 0.92,
+                        yerr=errors,
+                        color=color,
+                        edgecolor=color,
+                        alpha=0.82,
+                        capsize=3,
+                        label=FINGER_LABELS.get(str(finger), str(finger)),
                     )
-                    ax.plot(
-                        group_mean["stiffness_value"],
-                        group_mean["mean_speed_px_s"],
-                        color=FINGER_TO_COLOR.get(str(finger), "black"),
-                        linewidth=3.0,
-                        marker="o",
-                        label="Group mean",
-                    )
-                    ax.set_title(FINGER_LABELS.get(str(finger), str(finger)))
-                    ax.set_xlabel("Stiffness value")
-                    ax.grid(alpha=0.25)
-                axes[0, 0].set_ylabel("Average velocity / speed (px/s)")
-                axes[0, -1].legend(fontsize=8)
-                fig.suptitle(
-                    "Average velocity vs stiffness per finger and per subject\n"
-                    "thin=subject traces, thick=mean across subjects"
+                    for xi, h, n_obs in zip(xpos, heights, counts):
+                        if np.isfinite(h):
+                            ax.text(
+                                xi,
+                                h,
+                                f"n={n_obs}",
+                                ha="center",
+                                va="bottom",
+                                fontsize=7,
+                                rotation=90,
+                            )
+                    for stiffness_index, stiffness in enumerate(stiffness_axis):
+                        dots = subject_finger_speed[
+                            (
+                                pd.to_numeric(
+                                    subject_finger_speed["stiffness_value"],
+                                    errors="coerce",
+                                )
+                                == stiffness
+                            )
+                            & (subject_finger_speed["finger_condition"].astype(str) == str(finger))
+                        ]
+                        if dots.empty:
+                            continue
+                        dot_x = np.full(len(dots), x[stiffness_index] + offsets[f_idx])
+                        ax.scatter(
+                            dot_x,
+                            dots["mean_speed_px_s"],
+                            color="black",
+                            s=10,
+                            alpha=0.35,
+                            zorder=3,
+                        )
+                ax.set_xticks(x)
+                ax.set_xticklabels([f"{v:g}" for v in stiffness_axis])
+                ax.set_xlabel("Stiffness value")
+                ax.set_ylabel("Median velocity magnitude (px/s)")
+                ax.set_title(
+                    "Median velocity vs stiffness by finger\n"
+                    "bars=median speed per finger, error=SEM, dots=subject medians"
                 )
+                ax.legend(fontsize=8, title="Finger")
+                ax.grid(axis="y", alpha=0.25)
                 fig.tight_layout()
-                out = fig_dir / "average_velocity_vs_stiffness_by_finger_subject.png"
+                out = fig_dir / "average_velocity_vs_stiffness.png"
                 fig.savefig(out, dpi=fig_dpi)
                 plt.close(fig)
                 paths.append(out)
+
+            if (
+                include_average_acceleration_stiffness_figure
+                and "acceleration_px_s2" in all_profile.columns
+                and all_profile["acceleration_px_s2"].notna().any()
+            ):
+                fingers = _ordered_fingers(all_profile["finger_condition"].dropna().unique())
+                by_stiffness_finger_acc = (
+                    all_profile.groupby(
+                        ["stiffness_value", "finger_condition"],
+                        as_index=False,
+                        dropna=False,
+                    )
+                    .agg(
+                        mean_acceleration_px_s2=("acceleration_px_s2", "median"),
+                        sem_acceleration_px_s2=("acceleration_px_s2", _sem),
+                        n_observations=("acceleration_px_s2", "count"),
+                    )
+                    .sort_values(["stiffness_value", "finger_condition"])
+                )
+                if fingers:
+                    fig, ax = plt.subplots(figsize=(10.5, 5.8))
+                    stiffness_axis = sorted(
+                        pd.to_numeric(
+                            by_stiffness_finger_acc["stiffness_value"],
+                            errors="coerce",
+                        )
+                        .dropna()
+                        .unique()
+                    )
+                    x = np.arange(len(stiffness_axis), dtype=float)
+                    width = min(0.18, 0.78 / max(1, len(fingers)))
+                    offsets = (np.arange(len(fingers)) - (len(fingers) - 1) / 2) * width
+                    subject_finger = (
+                        all_profile.groupby(
+                            ["subject_id", "stiffness_value", "finger_condition"],
+                            as_index=False,
+                            dropna=False,
+                        )
+                        .agg(mean_acceleration_px_s2=("acceleration_px_s2", "median"))
+                        .sort_values(["stiffness_value", "finger_condition"])
+                    )
+                    for f_idx, finger in enumerate(fingers):
+                        heights: list[float] = []
+                        errors: list[float] = []
+                        counts: list[int] = []
+                        for stiffness in stiffness_axis:
+                            row = by_stiffness_finger_acc[
+                                (
+                                    pd.to_numeric(
+                                        by_stiffness_finger_acc["stiffness_value"],
+                                        errors="coerce",
+                                    )
+                                    == stiffness
+                                )
+                                & (
+                                    by_stiffness_finger_acc["finger_condition"].astype(str)
+                                    == str(finger)
+                                )
+                            ]
+                            heights.append(
+                                float(row["mean_acceleration_px_s2"].iloc[0])
+                                if not row.empty
+                                else np.nan
+                            )
+                            errors.append(
+                                float(row["sem_acceleration_px_s2"].iloc[0])
+                                if not row.empty
+                                and pd.notna(row["sem_acceleration_px_s2"].iloc[0])
+                                else 0.0
+                            )
+                            counts.append(
+                                int(row["n_observations"].iloc[0]) if not row.empty else 0
+                            )
+                        xpos = x + offsets[f_idx]
+                        color = FINGER_TO_COLOR.get(str(finger), "0.45")
+                        ax.bar(
+                            xpos,
+                            heights,
+                            width=width * 0.92,
+                            yerr=errors,
+                            color=color,
+                            edgecolor=color,
+                            alpha=0.82,
+                            capsize=3,
+                            label=FINGER_LABELS.get(str(finger), str(finger)),
+                        )
+                        for xi, h, n_obs in zip(xpos, heights, counts):
+                            if np.isfinite(h):
+                                ax.text(
+                                    xi,
+                                    h,
+                                    f"n={n_obs}",
+                                    ha="center",
+                                    va="bottom",
+                                    fontsize=7,
+                                    rotation=90,
+                                )
+                        # Group runs: show individual participants as small dots on
+                        # the same grouped-bar axis. Single-subject runs simply get
+                        # one dot per bar, reinforcing that no separate individual
+                        # panel is needed.
+                        for stiffness_index, stiffness in enumerate(stiffness_axis):
+                            dots = subject_finger[
+                                (
+                                    pd.to_numeric(
+                                        subject_finger["stiffness_value"],
+                                        errors="coerce",
+                                    )
+                                    == stiffness
+                                )
+                                & (subject_finger["finger_condition"].astype(str) == str(finger))
+                            ]
+                            if dots.empty:
+                                continue
+                            dot_x = np.full(len(dots), x[stiffness_index] + offsets[f_idx])
+                            ax.scatter(
+                                dot_x,
+                                dots["mean_acceleration_px_s2"],
+                                color="black",
+                                s=10,
+                                alpha=0.35,
+                                zorder=3,
+                            )
+                    ax.set_xticks(x)
+                    ax.set_xticklabels([f"{v:g}" for v in stiffness_axis])
+                    ax.set_xlabel("Stiffness value")
+                    ax.set_ylabel("Median acceleration magnitude (px/s²)")
+                    ax.set_title(
+                        "Median acceleration vs stiffness by finger\n"
+                        "bars=median per finger, error=SEM, dots=subject medians"
+                    )
+                    ax.legend(fontsize=8, title="Finger")
+                    ax.grid(axis="y", alpha=0.25)
+                    fig.tight_layout()
+                    out = fig_dir / "average_acceleration_vs_stiffness.png"
+                    fig.savefig(out, dpi=fig_dpi)
+                    plt.close(fig)
+                    paths.append(out)
 
     save_csv(
         pd.DataFrame({"figure": [str(p) for p in paths]}),
         output_root,
         "subject_velocity_acceleration_figure_manifest.csv",
+    )
+    return paths
+
+
+STANDARD_VS_COMPARISON_METRICS = [
+    ("Vx", "vx_px_s", "px/s"),
+    ("Vy", "vy_px_s", "px/s"),
+    ("Vz", "vz_px_s", "px/s"),
+    ("Ax", "ax_px_s2", "px/s^2"),
+    ("Ay", "ay_px_s2", "px/s^2"),
+    ("Az", "az_px_s2", "px/s^2"),
+    ("Magnitude", "speed_px_s", "px/s"),
+    ("AccelMag", "acceleration_px_s2", "px/s^2"),
+]
+
+STANDARD_VS_COMPARISON_VELOCITY_FAMILIES: dict[str, list[tuple[str, str, str]]] = {
+    "magnitude": [
+        ("Vx", "vx_px_s", "px/s"),
+        ("Vy", "vy_px_s", "px/s"),
+        ("Vz", "vz_px_s", "px/s"),
+        ("Magnitude", "speed_px_s", "px/s"),
+    ],
+    "radial": [
+        ("RadialX", "radial_velocity_x_3d_proxy_px_s", "px/s"),
+        ("RadialY", "radial_velocity_y_3d_proxy_px_s", "px/s"),
+        ("RadialZ", "radial_velocity_z_3d_proxy_px_s", "px/s"),
+        ("Radial", "radial_velocity_3d_proxy_px_s", "px/s"),
+    ],
+    "tangential": [
+        ("TangentialX", "tangential_velocity_x_3d_proxy_px_s", "px/s"),
+        ("TangentialY", "tangential_velocity_y_3d_proxy_px_s", "px/s"),
+        ("TangentialZ", "tangential_velocity_z_3d_proxy_px_s", "px/s"),
+        ("Tangential", "tangential_speed_3d_proxy_px_s", "px/s"),
+    ],
+}
+
+
+def _standard_vs_comparison_grid_figure(
+    panel_df: pd.DataFrame,
+    *,
+    title: str,
+    metric_label: str,
+    metric_col: str,
+    unit: str,
+    standard_value: float,
+    out_path: Path,
+    fig_dpi: int,
+    circular: bool = False,
+) -> Optional[Path]:
+    """Render one finger(rows) x comparison-stiffness(cols) grid for a metric.
+
+    Each cell overlays the comparison-stiffness mean profile against the standard
+    (e.g. 85) mean profile across the normalized movement cycle. When ``circular``
+    is set the per-bin collapse uses a circular mean (for angular metrics such as
+    movement direction) instead of an arithmetic mean.
+    """
+
+    def _bin_curve(frame: pd.DataFrame) -> pd.Series:
+        grp = frame.groupby("trajectory_time_bin")[metric_col]
+        if circular:
+            return grp.agg(_circ_mean_deg).sort_index()
+        return grp.mean().sort_index()
+
+    fingers = [f for f in ["I", "M", "R", "P"] if f in set(panel_df["finger_condition"].dropna())]
+    fingers += sorted(
+        str(f)
+        for f in panel_df["finger_condition"].dropna().unique()
+        if str(f) not in {"I", "M", "R", "P"} and str(f) not in fingers
+    )
+    comps = sorted(
+        v
+        for v in pd.to_numeric(panel_df["stiffness_value"], errors="coerce").dropna().unique()
+        if not np.isclose(v, standard_value)
+    )
+    if not fingers or not comps:
+        return None
+    # Colour both curves by their stiffness using the shared viridis convention
+    # (25=dark purple ... 145=bright yellow); the standard is distinguished by a
+    # dashed line rather than a flat reference colour.
+    stiffness_colors = _stiffness_viridis_colors(list(comps) + [standard_value])
+    standard_color = stiffness_colors.get(standard_value, "0.35")
+    std_df = panel_df[
+        np.isclose(pd.to_numeric(panel_df["stiffness_value"], errors="coerce"), standard_value)
+    ]
+    nrows, ncols = len(fingers), len(comps)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(max(1.9 * ncols, 4.0), max(1.9 * nrows, 3.0)),
+        squeeze=False,
+        sharex=True,
+    )
+    for r, finger in enumerate(fingers):
+        std_curve = _bin_curve(std_df[std_df["finger_condition"] == finger])
+        for c, comp in enumerate(comps):
+            ax = axes[r][c]
+            cmp_curve = _bin_curve(
+                panel_df[
+                    (panel_df["finger_condition"] == finger)
+                    & np.isclose(
+                        pd.to_numeric(panel_df["stiffness_value"], errors="coerce"), comp
+                    )
+                ]
+            )
+            if not std_curve.empty:
+                ax.plot(
+                    std_curve.index,
+                    std_curve.values,
+                    color=standard_color,
+                    lw=1.3,
+                    ls="--",
+                    label=f"standard {standard_value:g}",
+                )
+            if cmp_curve.notna().any():
+                ax.plot(
+                    cmp_curve.index,
+                    cmp_curve.values,
+                    color=stiffness_colors.get(comp, "0.35"),
+                    lw=1.7,
+                    label=f"comparison {comp:g}",
+                )
+            ax.axhline(0.0, color="0.85", lw=0.6, zorder=0)
+            if r == 0:
+                ax.set_title(f"{comp:g}", fontsize=8)
+            if c == 0:
+                ax.set_ylabel(f"{finger}\n{metric_label}", fontsize=8)
+            ax.tick_params(labelsize=6)
+    # Colour already encodes stiffness (viridis); the legend only needs to explain
+    # the solid-vs-dashed convention so it is not tied to any single column's hue.
+    from matplotlib.lines import Line2D
+
+    legend_handles = [
+        Line2D([0], [0], color="0.3", lw=1.7, ls="-", label="comparison (colour = stiffness)"),
+        Line2D(
+            [0], [0], color="0.3", lw=1.3, ls="--",
+            label=f"standard {standard_value:g} (colour = stiffness)",
+        ),
+    ]
+    fig.legend(handles=legend_handles, loc="upper right", fontsize=8)
+    fig.suptitle(title, fontsize=11)
+    fig.supxlabel("normalized movement-cycle bin   (columns = comparison stiffness)", fontsize=9)
+    fig.supylabel(f"{metric_label} ({unit})   (rows = finger)", fontsize=9)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=fig_dpi, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def _standard_vs_comparison_axis_stack_figure(
+    panel_df: pd.DataFrame,
+    *,
+    title: str,
+    component_metrics: list[tuple[str, str, str]],
+    standard_value: float,
+    out_path: Path,
+    fig_dpi: int,
+) -> Optional[Path]:
+    """Render X/Y/Z component standard-vs-comparison grids in one figure."""
+
+    fingers = [
+        f
+        for f in ["I", "M", "R", "P"]
+        if f in set(panel_df["finger_condition"].dropna())
+    ]
+    fingers += sorted(
+        str(f)
+        for f in panel_df["finger_condition"].dropna().unique()
+        if str(f) not in {"I", "M", "R", "P"} and str(f) not in fingers
+    )
+    comps = sorted(
+        v
+        for v in pd.to_numeric(panel_df["stiffness_value"], errors="coerce")
+        .dropna()
+        .unique()
+        if not np.isclose(v, standard_value)
+    )
+    if not fingers or not comps or not component_metrics:
+        return None
+    if not any(
+        col in panel_df.columns and panel_df[col].notna().any()
+        for _, col, _ in component_metrics
+    ):
+        return None
+
+    stiffness_colors = _stiffness_viridis_colors(list(comps) + [standard_value])
+    standard_color = stiffness_colors.get(standard_value, "0.35")
+    std_df = panel_df[
+        np.isclose(pd.to_numeric(panel_df["stiffness_value"], errors="coerce"), standard_value)
+    ]
+    nrows = len(component_metrics) * len(fingers)
+    ncols = len(comps)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(max(2.0 * ncols, 4.5), max(1.6 * nrows, 4.0)),
+        squeeze=False,
+        sharex=True,
+    )
+    plotted_any = False
+
+    for metric_idx, (metric_label, metric_col, unit) in enumerate(component_metrics):
+        for finger_idx, finger in enumerate(fingers):
+            row = metric_idx * len(fingers) + finger_idx
+            std_curve = (
+                std_df[std_df["finger_condition"] == finger]
+                .groupby("trajectory_time_bin")[metric_col]
+                .mean()
+                .sort_index()
+                if metric_col in std_df.columns
+                else pd.Series(dtype=float)
+            )
+            for c, comp in enumerate(comps):
+                ax = axes[row][c]
+                if metric_col in panel_df.columns:
+                    cmp_curve = (
+                        panel_df[
+                            (panel_df["finger_condition"] == finger)
+                            & np.isclose(
+                                pd.to_numeric(
+                                    panel_df["stiffness_value"], errors="coerce"
+                                ),
+                                comp,
+                            )
+                        ]
+                        .groupby("trajectory_time_bin")[metric_col]
+                        .mean()
+                        .sort_index()
+                    )
+                else:
+                    cmp_curve = pd.Series(dtype=float)
+                if not std_curve.empty:
+                    ax.plot(
+                        std_curve.index,
+                        std_curve.values,
+                        color=standard_color,
+                        lw=1.2,
+                        ls="--",
+                    )
+                    plotted_any = True
+                if cmp_curve.notna().any():
+                    ax.plot(
+                        cmp_curve.index,
+                        cmp_curve.values,
+                        color=stiffness_colors.get(comp, "0.35"),
+                        lw=1.7,
+                    )
+                    plotted_any = True
+                if metric_col not in panel_df.columns or not panel_df[metric_col].notna().any():
+                    ax.text(
+                        0.5,
+                        0.5,
+                        "no data",
+                        ha="center",
+                        va="center",
+                        transform=ax.transAxes,
+                        fontsize=7,
+                        color="0.55",
+                    )
+                ax.axhline(0.0, color="0.85", lw=0.6, zorder=0)
+                if row == 0:
+                    ax.set_title(f"{comp:g}", fontsize=8)
+                if c == 0:
+                    ax.set_ylabel(f"{metric_label}\n{finger}\n({unit})", fontsize=8)
+                ax.tick_params(labelsize=6)
+
+    if not plotted_any:
+        plt.close(fig)
+        return None
+
+    from matplotlib.lines import Line2D
+
+    legend_handles = [
+        Line2D([0], [0], color="0.3", lw=1.7, ls="-", label="comparison"),
+        Line2D([0], [0], color="0.3", lw=1.2, ls="--", label=f"standard {standard_value:g}"),
+    ]
+    fig.legend(handles=legend_handles, loc="upper right", fontsize=8)
+    fig.suptitle(title, fontsize=11)
+    fig.supxlabel("normalized movement-cycle bin   (columns = comparison stiffness)", fontsize=9)
+    fig.supylabel("rows = axis component within each finger", fontsize=9)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=fig_dpi, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_standard_vs_comparison_velocity_figures(
+    output_root: Path,
+    subject_velocity_acceleration_profile: pd.DataFrame,
+    *,
+    levels: tuple[str, ...] = ("subject", "group"),
+    standard_value: Optional[float] = None,
+    max_subjects: Optional[int] = None,
+    fig_dpi: int = 160,
+) -> list[Path]:
+    """Save per-finger x per-comparison-stiffness figures, each comparison vs its
+    own standard, side by side in one figure.
+
+    One figure per metric (Vx, Vy, Vz, Ax, Ay, Az, speed, |accel|) at the subject
+    level (routed to ``<group>/<subject>/``) and/or the group level. Complements,
+    and does not replace, :func:`save_subject_velocity_acceleration_figures`.
+    """
+    fig_dir = _figures_base(output_root) / "standard_vs_comparison_velocity"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    profile = subject_velocity_acceleration_profile
+    manifest_name = "standard_vs_comparison_velocity_figure_manifest.csv"
+    if profile is None or profile.empty or "stiffness_value" not in profile.columns:
+        save_csv(pd.DataFrame({"figure": []}), output_root, manifest_name)
+        return paths
+
+    df = add_velocity_decomposition_columns(profile.copy())
+    df["finger_condition"] = df["finger_condition"].map(normalize_finger_condition)
+    family_metric_cols = [
+        col
+        for family_metrics in STANDARD_VS_COMPARISON_VELOCITY_FAMILIES.values()
+        for _, col, _ in family_metrics
+    ]
+    numeric = (
+        ["stiffness_value", "trajectory_time_bin", "standard_value"]
+        + [m[1] for m in STANDARD_VS_COMPARISON_METRICS]
+        + family_metric_cols
+    )
+    for col in numeric:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if standard_value is None:
+        if "standard_value" in df.columns and df["standard_value"].notna().any():
+            standard_value = float(df["standard_value"].dropna().mode().iloc[0])
+        else:
+            save_csv(pd.DataFrame({"figure": []}), output_root, manifest_name)
+            return paths
+
+    acceleration_metrics = [
+        m
+        for m in STANDARD_VS_COMPARISON_METRICS
+        if m[0] in {"Ax", "Ay", "Az", "AccelMag"} and m[1] in df.columns
+    ]
+    velocity_family_metrics = {
+        family: [m for m in metrics if m[1] in df.columns]
+        for family, metrics in STANDARD_VS_COMPARISON_VELOCITY_FAMILIES.items()
+    }
+    acceleration_axis_metrics = [
+        m for m in STANDARD_VS_COMPARISON_METRICS if m[0] in {"Ax", "Ay", "Az"}
+    ]
+    velocity_axis_metric_sets = {
+        "Vxyz": STANDARD_VS_COMPARISON_VELOCITY_FAMILIES["magnitude"][:3],
+        "RadialXYZ": STANDARD_VS_COMPARISON_VELOCITY_FAMILIES["radial"][:3],
+        "TangentialXYZ": STANDARD_VS_COMPARISON_VELOCITY_FAMILIES["tangential"][:3],
+    }
+
+    def _save_metric_set(
+        frame: pd.DataFrame,
+        *,
+        owner: Any,
+        level: str,
+        metrics: list[tuple[str, str, str]],
+        title_prefix: str,
+    ) -> None:
+        for label, col, unit in metrics:
+            if not frame[col].notna().any():
+                continue
+            filename = (
+                f"standard_vs_comparison_{label}_{level}_{sanitize_name(owner)}.png"
+            )
+            out = (
+                subject_figure_path(fig_dir, owner, filename)
+                if level == "subject"
+                else group_figure_path(fig_dir, owner, filename)
+            )
+            p = _standard_vs_comparison_grid_figure(
+                frame,
+                title=(
+                    f"{title_prefix} - {label}: "
+                    f"each comparison vs standard {standard_value:g}"
+                ),
+                metric_label=label,
+                metric_col=col,
+                unit=unit,
+                standard_value=standard_value,
+                out_path=out,
+                fig_dpi=fig_dpi,
+            )
+            if p is not None:
+                paths.append(p)
+
+    def _save_axis_stack(
+        frame: pd.DataFrame,
+        *,
+        owner: Any,
+        level: str,
+        label: str,
+        metrics: list[tuple[str, str, str]],
+        title_prefix: str,
+    ) -> None:
+        filename = f"standard_vs_comparison_{label}_{level}_{sanitize_name(owner)}.png"
+        out = (
+            subject_figure_path(fig_dir, owner, filename)
+            if level == "subject"
+            else group_figure_path(fig_dir, owner, filename)
+        )
+        p = _standard_vs_comparison_axis_stack_figure(
+            frame,
+            title=(
+                f"{title_prefix} - {label}: X/Y/Z components, "
+                f"each comparison vs standard {standard_value:g}"
+            ),
+            component_metrics=metrics,
+            standard_value=standard_value,
+            out_path=out,
+            fig_dpi=fig_dpi,
+        )
+        if p is not None:
+            paths.append(p)
+
+    if "subject" in levels:
+        subjects = sorted(df["subject_id"].dropna().unique(), key=str)
+        if max_subjects is not None:
+            subjects = subjects[:max_subjects]
+        for subject in subjects:
+            s = df[df["subject_id"] == subject]
+            _save_metric_set(
+                s,
+                owner=subject,
+                level="subject",
+                metrics=acceleration_metrics,
+                title_prefix=str(subject),
+            )
+            _save_axis_stack(
+                s,
+                owner=subject,
+                level="subject",
+                label="Axyz",
+                metrics=acceleration_axis_metrics,
+                title_prefix=str(subject),
+            )
+            for family, metrics in velocity_family_metrics.items():
+                _save_metric_set(
+                    s,
+                    owner=subject,
+                    level="subject",
+                    metrics=metrics,
+                    title_prefix=f"{subject} - {family}",
+                )
+            for label, metrics in velocity_axis_metric_sets.items():
+                _save_axis_stack(
+                    s,
+                    owner=subject,
+                    level="subject",
+                    label=label,
+                    metrics=metrics,
+                    title_prefix=str(subject),
+                )
+
+    if "group" in levels and _has_multiple_subjects(df):
+        group_frames = _aggregate_group_frames_for_output(fig_dir, df)
+        for group, g in group_frames:
+            _save_metric_set(
+                g,
+                owner=group,
+                level="group",
+                metrics=acceleration_metrics,
+                title_prefix=f"group {group}",
+            )
+            _save_axis_stack(
+                g,
+                owner=group,
+                level="group",
+                label="Axyz",
+                metrics=acceleration_axis_metrics,
+                title_prefix=f"group {group}",
+            )
+            for family, metrics in velocity_family_metrics.items():
+                _save_metric_set(
+                    g,
+                    owner=group,
+                    level="group",
+                    metrics=metrics,
+                    title_prefix=f"group {group} - {family}",
+                )
+            for label, metrics in velocity_axis_metric_sets.items():
+                _save_axis_stack(
+                    g,
+                    owner=group,
+                    level="group",
+                    label=label,
+                    metrics=metrics,
+                    title_prefix=f"group {group}",
+                )
+
+    save_csv(
+        pd.DataFrame({"figure": [str(p) for p in paths]}), output_root, manifest_name
+    )
+    return paths
+
+
+# Position / direction analogue of STANDARD_VS_COMPARISON_METRICS. Each entry is
+# (label, profile column, unit, circular?). Position metrics use signed centered
+# axes so left/right, up/down, and lift/drop direction remain visible.
+STANDARD_VS_COMPARISON_POSITION_METRICS = [
+    ("PosZ", "z_lift_px", "px", False),
+    ("PosY", "y_centered_px", "px", False),
+    ("PosX", "x_centered_px", "px", False),
+    ("MovementDirection", "movement_angle_deg", "deg", True),
+]
+
+
+def save_standard_vs_comparison_position_figures(
+    output_root: Path,
+    subject_velocity_acceleration_profile: pd.DataFrame,
+    *,
+    levels: tuple[str, ...] = ("subject", "group"),
+    standard_value: Optional[float] = None,
+    max_subjects: Optional[int] = None,
+    fig_dpi: int = 160,
+) -> list[Path]:
+    """Save standard-vs-comparison position/direction figures over the cycle.
+
+    Mirrors :func:`save_standard_vs_comparison_velocity_figures` but plots the
+    signed centered position/lift axes (``Z``, ``Y``, then ``X``) and, finally,
+    the movement direction (collapsed with a circular
+    mean, like the movement_cycle direction figures). The X axis is the
+    normalized movement-cycle bin (time); each finger(row) x comparison(col)
+    cell overlays the comparison-stiffness curve against the single standard.
+    One figure per metric at the subject level (routed to ``<group>/<subject>/``)
+    and/or the group level. Complements, and does not replace, the velocity
+    figures.
+    """
+    fig_dir = _figures_base(output_root) / "standard_vs_comparison_position"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    profile = subject_velocity_acceleration_profile
+    manifest_name = "standard_vs_comparison_position_figure_manifest.csv"
+    if profile is None or profile.empty or "stiffness_value" not in profile.columns:
+        save_csv(pd.DataFrame({"figure": []}), output_root, manifest_name)
+        return paths
+
+    df = profile.copy()
+    df["finger_condition"] = df["finger_condition"].map(normalize_finger_condition)
+    numeric = ["stiffness_value", "trajectory_time_bin", "standard_value"] + [
+        m[1] for m in STANDARD_VS_COMPARISON_POSITION_METRICS
+    ]
+    for col in numeric:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if standard_value is None:
+        if "standard_value" in df.columns and df["standard_value"].notna().any():
+            standard_value = float(df["standard_value"].dropna().mode().iloc[0])
+        else:
+            save_csv(pd.DataFrame({"figure": []}), output_root, manifest_name)
+            return paths
+
+    metrics = [m for m in STANDARD_VS_COMPARISON_POSITION_METRICS if m[1] in df.columns]
+    position_metric_by_label = {
+        label: (label, col, unit)
+        for label, col, unit, circular in STANDARD_VS_COMPARISON_POSITION_METRICS
+        if col in df.columns
+    }
+    position_axis_metrics = [
+        position_metric_by_label[label]
+        for label in ("PosX", "PosY", "PosZ")
+        if label in position_metric_by_label
+    ]
+
+    def _save_position_axis_stack(
+        frame: pd.DataFrame,
+        *,
+        owner: Any,
+        level: str,
+        title_prefix: str,
+    ) -> None:
+        filename = f"standard_vs_comparison_PosXYZ_{level}_{sanitize_name(owner)}.png"
+        out = (
+            subject_figure_path(fig_dir, owner, filename)
+            if level == "subject"
+            else group_figure_path(fig_dir, owner, filename)
+        )
+        p = _standard_vs_comparison_axis_stack_figure(
+            frame,
+            title=(
+                f"{title_prefix} - PosXYZ: signed X/Y/Z positions, "
+                f"each comparison vs standard {standard_value:g}"
+            ),
+            component_metrics=position_axis_metrics,
+            standard_value=standard_value,
+            out_path=out,
+            fig_dpi=fig_dpi,
+        )
+        if p is not None:
+            paths.append(p)
+
+    if "subject" in levels:
+        subjects = sorted(df["subject_id"].dropna().unique(), key=str)
+        if max_subjects is not None:
+            subjects = subjects[:max_subjects]
+        for subject in subjects:
+            s = df[df["subject_id"] == subject]
+            for label, col, unit, circular in metrics:
+                if not s[col].notna().any():
+                    continue
+                out = subject_figure_path(
+                    fig_dir,
+                    subject,
+                    f"standard_vs_comparison_{label}_subject_{sanitize_name(subject)}.png",
+                )
+                p = _standard_vs_comparison_grid_figure(
+                    s,
+                    title=f"{subject} - {label}: each comparison vs standard {standard_value:g}",
+                    metric_label=label,
+                    metric_col=col,
+                    unit=unit,
+                    standard_value=standard_value,
+                    out_path=out,
+                    fig_dpi=fig_dpi,
+                    circular=circular,
+                )
+                if p is not None:
+                    paths.append(p)
+            _save_position_axis_stack(
+                s,
+                owner=subject,
+                level="subject",
+                title_prefix=str(subject),
+            )
+
+    if "group" in levels and _has_multiple_subjects(df):
+        group_frames = _aggregate_group_frames_for_output(fig_dir, df)
+        for group, g in group_frames:
+            for label, col, unit, circular in metrics:
+                if not g[col].notna().any():
+                    continue
+                out = group_figure_path(
+                    fig_dir,
+                    group,
+                    f"standard_vs_comparison_{label}_group_{sanitize_name(group)}.png",
+                )
+                p = _standard_vs_comparison_grid_figure(
+                    g,
+                    title=f"group {group} - {label}: each comparison vs standard {standard_value:g}",
+                    metric_label=label,
+                    metric_col=col,
+                    unit=unit,
+                    standard_value=standard_value,
+                    out_path=out,
+                    fig_dpi=fig_dpi,
+                    circular=circular,
+                )
+                if p is not None:
+                    paths.append(p)
+            _save_position_axis_stack(
+                g,
+                owner=group,
+                level="group",
+                title_prefix=f"group {group}",
+            )
+
+    save_csv(
+        pd.DataFrame({"figure": [str(p) for p in paths]}), output_root, manifest_name
     )
     return paths
 
@@ -5681,7 +9452,7 @@ def compute_3d_proxy_kinematics(
         g["r_3d_from_center_px"] = np.sqrt(
             g["x_3d_px"] ** 2 + g["y_3d_px"] ** 2 + g["z_3d_proxy_px"] ** 2
         )
-        dt = pd.to_numeric(g["time_s"], errors="coerce").diff().replace(0, np.nan)
+        dt = _stable_derivative_dt(g["time_s"], min_fraction_of_median=0.25)
         g["vx_3d_px_s"] = g["x_3d_px"].diff() / dt
         g["vy_3d_px_s"] = g["y_3d_px"].diff() / dt
         g["vz_3d_proxy_px_s"] = g["z_3d_proxy_px"].diff() / dt
@@ -5819,11 +9590,12 @@ def compute_3d_proxy_kinematics(
                 ),
                 max_radius_3d_from_center_px=("max_radius_3d_from_center_px", "mean"),
                 peak_velocity_3d_proxy_px_s=("peak_velocity_3d_proxy_px_s", "mean"),
+                mean_velocity_3d_proxy_px_s=("mean_velocity_3d_proxy_px_s", "median"),
                 peak_acceleration_3d_proxy_px_s2=(
                     "peak_acceleration_3d_proxy_px_s2",
                     "mean",
                 ),
-                mean_z_lift_px=("mean_z_lift_px", "mean"),
+                mean_z_lift_px=("mean_z_lift_px", "median"),
                 max_z_lift_px=("max_z_lift_px", "mean"),
                 mean_side_lateral_camera_corrected_px=(
                     "mean_side_lateral_camera_corrected_px",
@@ -6020,7 +9792,7 @@ def save_3d_proxy_figures(
     fig_dpi: int = 160,
 ) -> list[Path]:
     """Save per-subject 3D proxy trajectory figures and stiffness-bin plots."""
-    fig_dir = output_root / "figures" / "subject_3d_proxy_trajectories"
+    fig_dir = _figures_base(output_root) / "subject_3d_proxy_trajectories"
     fig_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     if not samples_3d.empty:
@@ -6158,20 +9930,25 @@ def save_3d_proxy_figures(
     if not trial_3d_summary.empty and {
         "dominant_movement_direction",
         "stiffness_value",
+        "finger_condition",
         "max_excursion_3d_from_start_px",
     }.issubset(trial_3d_summary.columns):
         d = trial_3d_summary.dropna(
-            subset=["stiffness_value", "max_excursion_3d_from_start_px"]
+            subset=[
+                "dominant_movement_direction",
+                "stiffness_value",
+                "finger_condition",
+                "max_excursion_3d_from_start_px",
+            ]
         ).copy()
         if not d.empty:
-            d["stiffness_bin"] = pd.qcut(
-                d["stiffness_value"].rank(method="first"),
-                q=min(3, d["stiffness_value"].nunique()),
-                labels=["Low", "Medium", "High"][
-                    : min(3, d["stiffness_value"].nunique())
-                ],
+            d["finger_condition"] = d["finger_condition"].map(normalize_finger_condition)
+            d["stiffness_value"] = pd.to_numeric(d["stiffness_value"], errors="coerce")
+            d["max_excursion_3d_from_start_px"] = pd.to_numeric(
+                d["max_excursion_3d_from_start_px"], errors="coerce"
             )
-            fig, ax = plt.subplots(figsize=(11, 5))
+            d = d.dropna(subset=["stiffness_value", "max_excursion_3d_from_start_px"])
+        if not d.empty:
             directions = [
                 x
                 for x in DIRECTION_LABELS
@@ -6182,72 +9959,100 @@ def save_3d_proxy_figures(
                     x
                     for x in d["dominant_movement_direction"].dropna().unique()
                     if x not in DIRECTION_LABELS
-                ]
+                ],
+                key=str,
             )
-            bins = [
-                b
-                for b in ["Low", "Medium", "High"]
-                if b in set(d["stiffness_bin"].astype(str))
-            ]
-            width = 0.25
-            x = np.arange(len(directions))
+            stiffness_values = sorted(d["stiffness_value"].dropna().unique())
+            finger_values = _ordered_fingers(d["finger_condition"].dropna().unique())
+            stiffness_colors = _stiffness_viridis_colors(stiffness_values)
             rng = np.random.default_rng(20260513)
-            for i, b in enumerate(bins):
-                sub = d[d["stiffness_bin"].astype(str) == b]
-                offset = (i - (len(bins) - 1) / 2) * width
-                grouped = sub.groupby("dominant_movement_direction")[
-                    "max_excursion_3d_from_start_px"
-                ]
-                med = grouped.median().reindex(directions)
-                ci_low = grouped.apply(lambda s: _ci95_median_bootstrap(s)[0]).reindex(
-                    directions
-                )
-                ci_high = grouped.apply(lambda s: _ci95_median_bootstrap(s)[1]).reindex(
-                    directions
-                )
-                yerr = np.vstack(
-                    [(med - ci_low).clip(lower=0), (ci_high - med).clip(lower=0)]
-                )
-                ax.errorbar(
-                    x + offset,
-                    med,
-                    yerr=yerr,
-                    fmt="o",
-                    capsize=3,
-                    label=f"{b} median + 95% CI",
-                )
-                for j, direction in enumerate(directions):
-                    vals = pd.to_numeric(
-                        sub.loc[
-                            sub["dominant_movement_direction"] == direction,
-                            "max_excursion_3d_from_start_px",
-                        ],
-                        errors="coerce",
-                    ).dropna()
-                    if vals.empty:
-                        continue
-                    jitter = rng.normal(0, width * 0.12, size=len(vals))
-                    ax.scatter(
-                        np.full(len(vals), x[j] + offset) + jitter,
-                        vals,
-                        s=12,
-                        alpha=0.20,
+
+            def _draw_grouped_excursion(
+                ax: plt.Axes,
+                *,
+                group_col: str,
+                group_values: list[Any],
+                colors: dict[Any, Any],
+                title: str,
+                legend_title: str,
+            ) -> None:
+                x = np.arange(len(directions))
+                width = min(0.82 / max(1, len(group_values)), 0.18)
+                for i, value in enumerate(group_values):
+                    sub = d[d[group_col].astype(str) == str(value)]
+                    offset = (i - (len(group_values) - 1) / 2) * width
+                    grouped = sub.groupby("dominant_movement_direction")[
+                        "max_excursion_3d_from_start_px"
+                    ]
+                    med = grouped.median().reindex(directions)
+                    ci = {name: _ci95_median_bootstrap(s) for name, s in grouped}
+                    ci_low = pd.Series({k: v[0] for k, v in ci.items()}, dtype=float).reindex(directions)
+                    ci_high = pd.Series({k: v[1] for k, v in ci.items()}, dtype=float).reindex(directions)
+                    yerr = np.vstack(
+                        [(med - ci_low).clip(lower=0), (ci_high - med).clip(lower=0)]
                     )
-            ax.set_xticks(x)
-            ax.set_xticklabels(directions, rotation=45, ha="right")
-            ax.set_ylabel("Max 3D excursion from start (px)")
-            ax.set_xlabel("Movement direction proxy")
-            ax.set_title(
-                "3D far movement by direction and stiffness bin\npoints=trials, markers=median, bars=95% bootstrap CI"
+                    color = colors.get(value, "#777777")
+                    ax.errorbar(
+                        x + offset,
+                        med,
+                        yerr=yerr,
+                        fmt="o",
+                        capsize=2.5,
+                        color=color,
+                        ecolor=color,
+                        markersize=5,
+                        label=str(value),
+                    )
+                    for j, direction in enumerate(directions):
+                        vals = pd.to_numeric(
+                            sub.loc[
+                                sub["dominant_movement_direction"] == direction,
+                                "max_excursion_3d_from_start_px",
+                            ],
+                            errors="coerce",
+                        ).dropna()
+                        if vals.empty:
+                            continue
+                        jitter = rng.normal(0, width * 0.16, size=len(vals))
+                        ax.scatter(
+                            np.full(len(vals), x[j] + offset) + jitter,
+                            vals,
+                            s=10,
+                            alpha=0.14,
+                            color=color,
+                            linewidths=0,
+                        )
+                ax.set_xticks(x)
+                ax.set_xticklabels(directions, rotation=45, ha="right")
+                ax.set_ylabel("Max 3D excursion from start (px)")
+                ax.set_title(title)
+                ax.grid(axis="y", alpha=0.25)
+                ax.legend(title=legend_title, fontsize=7, ncol=min(6, max(1, len(group_values))))
+
+            fig, axes = plt.subplots(2, 1, figsize=(13, 10), sharex=False)
+            _draw_grouped_excursion(
+                axes[0],
+                group_col="stiffness_value",
+                group_values=stiffness_values,
+                colors=stiffness_colors,
+                title="3D far movement by direction and stiffness",
+                legend_title="Stiffness",
             )
-            ax.legend(title="Stiffness")
-            ax.grid(axis="y", alpha=0.25)
-            fig.tight_layout()
-            out = (
-                output_root
-                / "figures"
-                / "max_3d_excursion_by_direction_stiffness_bin.png"
+            _draw_grouped_excursion(
+                axes[1],
+                group_col="finger_condition",
+                group_values=finger_values,
+                colors={f: FINGER_TO_COLOR.get(str(f), "#777777") for f in finger_values},
+                title="3D far movement by direction and finger",
+                legend_title="Finger",
             )
+            fig.suptitle(
+                "Max 3D proxy excursion by movement direction\n"
+                "points=trials, markers=median, bars=95% bootstrap CI",
+                y=0.995,
+            )
+            fig.tight_layout(rect=[0, 0, 1, 0.96])
+            out = _figures_base(output_root) / "max_3d_excursion_by_direction_stiffness_bin.png"
             fig.savefig(out, dpi=fig_dpi)
             plt.close(fig)
             paths.append(out)
@@ -6458,6 +10263,7 @@ def _prepare_hand_orientation_xy_vector_trials(
 
 def _hand_orientation_matrix_scopes(
     trials: pd.DataFrame,
+    aggregate_frames: Optional[list[tuple[str, pd.DataFrame]]] = None,
 ) -> list[tuple[str, str, pd.DataFrame]]:
     trials = trials.copy()
     scopes: list[tuple[str, str, pd.DataFrame]] = []
@@ -6476,7 +10282,17 @@ def _hand_orientation_matrix_scopes(
                 f"Subject {subject}",
                 trials[trials["subject_id"].astype(str) == str(subject)],
             )
-    if EXPERIMENT_GROUP_COLUMN in trials.columns or "subject_id" in trials.columns:
+    if aggregate_frames is not None:
+        for group, subset in aggregate_frames:
+            add_scope(
+                f"group_{sanitize_name(group)}",
+                f"Group {group}",
+                subset,
+            )
+        return scopes
+    if (
+        EXPERIMENT_GROUP_COLUMN in trials.columns or "subject_id" in trials.columns
+    ) and _has_multiple_subjects(trials):
         group_series = (
             trials[EXPERIMENT_GROUP_COLUMN].copy()
             if EXPERIMENT_GROUP_COLUMN in trials.columns
@@ -6507,6 +10323,14 @@ def _hand_orientation_matrix_scopes(
                     trials["_hand_orientation_experiment_group"].astype(str) == group
                 ],
             )
+        for cname, members in COMBINED_EXPERIMENT_GROUPS.items():
+            add_scope(
+                f"group_{cname}",
+                f"Combined {cname}",
+                trials[
+                    trials["_hand_orientation_experiment_group"].astype(str).isin(members)
+                ],
+            )
     return scopes
 
 
@@ -6519,7 +10343,7 @@ def save_hand_orientation_plane_figures(
 ) -> list[Path]:
     """Save thumb-to-active-finger XY orientation matrices by participant/group."""
 
-    fig_dir = output_root / "figures" / "hand_orientation_planes"
+    fig_dir = _figures_base(output_root) / "hand_orientation_planes"
     fig_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     if hand_orientation_plane_trials is None or hand_orientation_plane_trials.empty:
@@ -6555,7 +10379,10 @@ def save_hand_orientation_plane_figures(
     )
     finger_values.extend(other_fingers)
 
-    for scope_name, scope_label, scope_df in _hand_orientation_matrix_scopes(trials):
+    aggregate_frames = _aggregate_group_frames_for_output(fig_dir, trials)
+    for scope_name, scope_label, scope_df in _hand_orientation_matrix_scopes(
+        trials, aggregate_frames
+    ):
         scope_values = scope_df[["_vector_dx", "_vector_dy"]].to_numpy(dtype=float)
         scope_vector_extent = (
             np.nanmax(np.abs(scope_values)) if np.isfinite(scope_values).any() else 1.0
@@ -6690,7 +10517,7 @@ def save_hand_orientation_axis_matrix_figures(
     that top-camera vector with the side-camera Z/lift proxy.
     """
 
-    fig_dir = output_root / "figures" / "hand_orientation_axis_matrices"
+    fig_dir = _figures_base(output_root) / "hand_orientation_axis_matrices"
     fig_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
 
@@ -6745,7 +10572,10 @@ def save_hand_orientation_axis_matrix_figures(
     )
     finger_values.extend(other_fingers)
 
-    for scope_name, scope_label, scope_df in _hand_orientation_matrix_scopes(trials):
+    aggregate_frames = _aggregate_group_frames_for_output(fig_dir, trials)
+    for scope_name, scope_label, scope_df in _hand_orientation_matrix_scopes(
+        trials, aggregate_frames
+    ):
         scope_fingers = [
             finger
             for finger in finger_values
@@ -6920,6 +10750,7 @@ def _movement_cycle_time_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, str, s
 
 def _movement_cycle_scope_variants(
     df: pd.DataFrame,
+    aggregate_frames: Optional[list[tuple[str, pd.DataFrame]]] = None,
 ) -> list[tuple[str, str, pd.DataFrame]]:
     scopes: list[tuple[str, str, pd.DataFrame]] = []
     seen: set[str] = set()
@@ -6937,19 +10768,30 @@ def _movement_cycle_scope_variants(
                 f"Subject {subject}",
                 df[df["subject_id"].astype(str) == str(subject)],
             )
-    if "subject_group" in df.columns:
-        for group in sorted(df["subject_group"].dropna().unique(), key=str):
+    if aggregate_frames is not None:
+        for group, subset in aggregate_frames:
             add_scope(
-                f"group_{sanitize_name(group)}",
-                f"Group {group}",
-                df[df["subject_group"].astype(str) == str(group)],
+                f"experiment_group_{sanitize_name(group)}",
+                f"Experiment group {group}",
+                subset,
             )
-    if EXPERIMENT_GROUP_COLUMN in df.columns:
+        return scopes
+    # Coarse subject_group (L/N) scopes are intentionally omitted: the reported
+    # groups are the full experiment groups L_E/L_P/N_E/N_P (plus combined), which
+    # are added below, so no separate group_L/group_N figures are produced.
+    # Group/combined scopes are skipped for a single-subject selection.
+    if EXPERIMENT_GROUP_COLUMN in df.columns and _has_multiple_subjects(df):
         for group in sorted(df[EXPERIMENT_GROUP_COLUMN].dropna().unique(), key=str):
             add_scope(
                 f"experiment_group_{sanitize_name(group)}",
                 f"Experiment group {group}",
                 df[df[EXPERIMENT_GROUP_COLUMN].astype(str) == str(group)],
+            )
+        for cname, members in COMBINED_EXPERIMENT_GROUPS.items():
+            add_scope(
+                f"experiment_group_{cname}",
+                f"Experiment group {cname}",
+                df[df[EXPERIMENT_GROUP_COLUMN].astype(str).isin(members)],
             )
     return scopes
 
@@ -6969,28 +10811,23 @@ def _trial_group_columns(df: pd.DataFrame) -> list[str]:
 def save_movement_cycle_hand_angle_figures(
     output_root: Path,
     trajectory_time_bins: pd.DataFrame,
+    side_z_samples: Optional[pd.DataFrame] = None,
     fig_dpi: int = 160,
 ) -> list[Path]:
-    """Plot movement direction and hand angle over each stiffness cycle.
+    """Plot XY movement direction and YZ hand orientation in one cycle figure.
 
-    Each figure overlays all trials as faint per-trial trajectories and adds
-    thick circular mean/median angle trajectories per stiffness value.
+    Rows are angle families (movement direction in the XY plane, then
+    thumb-to-active-finger orientation in the YZ plane); columns are stiffness
+    values. Thin lines are trials, solid lines are circular means, dashed lines
+    are circular medians, and shaded/dotted bands show P5-P95.
     """
-    fig_dir = output_root / "figures" / "movement_cycle_hand_angles"
+    fig_dir = _figures_base(output_root) / "movement_cycle_hand_angles"
     fig_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
-    required = {
-        "stiffness_value",
-        "trajectory_time_bin",
-        "movement_angle_deg",
-        "hand_orientation_xy_deg",
-    }
+    manifest_name = "movement_cycle_hand_angle_figure_manifest.csv"
+    required = {"stiffness_value", "trajectory_time_bin", "movement_angle_deg"}
     if trajectory_time_bins.empty or not required.issubset(trajectory_time_bins.columns):
-        save_csv(
-            pd.DataFrame({"figure": [str(p) for p in paths]}),
-            output_root,
-            "movement_cycle_hand_angle_figure_manifest.csv",
-        )
+        save_csv(pd.DataFrame({"figure": [str(p) for p in paths]}), output_root, manifest_name)
         return paths
 
     d = add_protocol_demographic_factors(
@@ -7002,29 +10839,91 @@ def save_movement_cycle_hand_angle_figures(
     if "finger_condition" in d.columns:
         d["finger_condition"] = d["finger_condition"].map(normalize_finger_condition)
     d, time_col, _time_label = _movement_cycle_time_columns(d)
+
+    if (
+        "hand_orientation_yz_deg" not in d.columns
+        and side_z_samples is not None
+        and not side_z_samples.empty
+    ):
+        keys = ["subject_id", "trial_index_raw", "stiffness_segment_id"]
+        if set(keys).issubset(d.columns) and set(keys + ["side_time_fraction", "side_z_lift_px"]).issubset(
+            side_z_samples.columns
+        ):
+            side = side_z_samples.copy()
+            for col in ["trial_index_raw", "stiffness_segment_id", "side_time_fraction", "side_z_lift_px"]:
+                side[col] = pd.to_numeric(side[col], errors="coerce")
+            side_groups = {
+                k: g.sort_values("side_time_fraction")
+                for k, g in side.dropna(subset=["side_time_fraction", "side_z_lift_px"]).groupby(
+                    keys, dropna=False
+                )
+            }
+            d["z_lift_px"] = np.nan
+            time_fraction_col = (
+                "stiffness_time_fraction"
+                if "stiffness_time_fraction" in d.columns
+                else "time_fraction"
+            )
+            for key, idx in d.groupby(keys, dropna=False).groups.items():
+                z_group = side_groups.get(key)
+                if z_group is None or z_group.empty or time_fraction_col not in d.columns:
+                    continue
+                x_old = pd.to_numeric(z_group["side_time_fraction"], errors="coerce").to_numpy(dtype=float)
+                z_old = pd.to_numeric(z_group["side_z_lift_px"], errors="coerce").to_numpy(dtype=float)
+                valid = np.isfinite(x_old) & np.isfinite(z_old)
+                x_old = x_old[valid]
+                z_old = z_old[valid]
+                if x_old.size == 0:
+                    continue
+                order = np.argsort(x_old)
+                x_old = x_old[order]
+                z_old = z_old[order]
+                unique_x, unique_idx = np.unique(x_old, return_index=True)
+                unique_z = z_old[unique_idx]
+                sample_fraction = (
+                    pd.to_numeric(d.loc[idx, time_fraction_col], errors="coerce")
+                    .fillna(0)
+                    .clip(0, 1)
+                )
+                if unique_x.size == 1:
+                    d.loc[idx, "z_lift_px"] = unique_z[0]
+                else:
+                    d.loc[idx, "z_lift_px"] = np.interp(sample_fraction, unique_x, unique_z)
+
+    if "hand_orientation_yz_deg" not in d.columns:
+        y_col = _first_existing_column(d, ["thumb_active_dy_px", "hand_orientation_dy_px"])
+        z_col = _first_existing_column(
+            d,
+            ["z_lift_px", "side_z_lift_px", "mean_side_z_lift_px", "max_side_z_lift_px", "z_3d_proxy_px"],
+        )
+        if y_col is not None and z_col is not None:
+            d["hand_orientation_yz_deg"] = np.degrees(
+                np.arctan2(
+                    pd.to_numeric(d[z_col], errors="coerce"),
+                    pd.to_numeric(d[y_col], errors="coerce"),
+                )
+            )
+    if "hand_orientation_yz_deg" not in d.columns:
+        save_csv(pd.DataFrame({"figure": [str(p) for p in paths]}), output_root, manifest_name)
+        return paths
+
     numeric_cols = [
         "stiffness_value",
         "trajectory_time_bin",
         time_col,
         "movement_angle_deg",
-        "hand_orientation_xy_deg",
+        "hand_orientation_yz_deg",
     ]
     for col in numeric_cols:
         if col in d.columns:
             d[col] = pd.to_numeric(d[col], errors="coerce")
     d["movement_angle_rad"] = _wrap_radians(np.deg2rad(d["movement_angle_deg"]))
-    d["hand_orientation_xy_rad"] = _wrap_radians(
-        np.deg2rad(d["hand_orientation_xy_deg"])
-    )
+    d["hand_orientation_yz_rad"] = _wrap_radians(np.deg2rad(d["hand_orientation_yz_deg"]))
     d = d.dropna(subset=["stiffness_value", "trajectory_time_bin", time_col])
     d["duration_ms"] = pd.to_numeric(d[time_col], errors="coerce") * 1000.0
     d = d.dropna(subset=["duration_ms"])
     if d.empty:
-        save_csv(
-            pd.DataFrame({"figure": [str(p) for p in paths]}),
-            output_root,
-            "movement_cycle_hand_angle_figure_manifest.csv",
-        )
+        save_csv(pd.DataFrame({"figure": [str(p) for p in paths]}), output_root, manifest_name)
         return paths
 
     duration_p5 = float(d["duration_ms"].quantile(0.05))
@@ -7035,25 +10934,19 @@ def save_movement_cycle_hand_angle_figures(
         duration_p95 = float(d["duration_ms"].max())
     d = d[d["duration_ms"].between(duration_p5, duration_p95, inclusive="both")]
     if d.empty:
-        save_csv(
-            pd.DataFrame({"figure": [str(p) for p in paths]}),
-            output_root,
-            "movement_cycle_hand_angle_figure_manifest.csv",
-        )
+        save_csv(pd.DataFrame({"figure": [str(p) for p in paths]}), output_root, manifest_name)
         return paths
 
     angle_specs = [
-        ("movement_angle_rad", "Movement direction (rad)"),
-        (
-            "hand_orientation_xy_rad",
-            "Thumb-to-active-finger XY angle (rad)",
-        ),
+        ("movement_angle_rad", "Movement direction, XY plane (rad)"),
+        ("hand_orientation_yz_rad", "Thumb-to-active-finger orientation, YZ plane (rad)"),
     ]
     stiffness_values = sorted(d["stiffness_value"].dropna().unique())
     stiffness_colors = _stiffness_viridis_colors(stiffness_values)
     trial_cols = _trial_group_columns(d)
 
-    for prefix, label, scope_df in _movement_cycle_scope_variants(d):
+    aggregate_frames = _aggregate_group_frames_for_output(fig_dir, d)
+    for prefix, label, scope_df in _movement_cycle_scope_variants(d, aggregate_frames):
         scope_df = scope_df.dropna(subset=["stiffness_value", "duration_ms"])
         if scope_df.empty:
             continue
@@ -7064,29 +10957,21 @@ def save_movement_cycle_hand_angle_figures(
         ]
         if not scope_stiffness_values:
             continue
-        # Keep every stiffness panel in one horizontal row so the movement-cycle
-        # sequence can be scanned left-to-right without wrapping.
         ncols = max(1, len(scope_stiffness_values))
-        nrows = 1
-        for angle_col, angle_label in angle_specs:
-            safe_angle = (
-                "movement_direction"
-                if angle_col == "movement_angle_rad"
-                else "thumb_to_active_finger_xy_angle"
-            )
-            fig, axes = plt.subplots(
-                nrows,
-                ncols,
-                figsize=(3.4 * ncols, 2.7 * nrows),
-                sharex=True,
-                squeeze=False,
-            )
-            for ax in axes.ravel():
-                ax.set_visible(False)
+        nrows = len(angle_specs)
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(3.4 * ncols, 2.8 * nrows),
+            sharex=True,
+            squeeze=False,
+        )
+        plotted = False
+        for ax in axes.ravel():
+            ax.set_visible(False)
+        for row_idx, (angle_col, angle_label) in enumerate(angle_specs):
             for stiffness_idx, stiffness in enumerate(scope_stiffness_values):
-                row = 0
-                col = stiffness_idx
-                ax = axes[row, col]
+                ax = axes[row_idx, stiffness_idx]
                 ax.set_visible(True)
                 ax.axhline(0, color="0.55", linewidth=0.8, alpha=0.7)
                 stiff_df = scope_df[scope_df["stiffness_value"] == stiffness]
@@ -7113,13 +10998,7 @@ def save_movement_cycle_hand_angle_figures(
                         )
                         .sort_values("t")
                     )
-                    ax.plot(
-                        summary["t"],
-                        summary["mean_angle"],
-                        color=color,
-                        linewidth=3.4,
-                        zorder=5,
-                    )
+                    ax.plot(summary["t"], summary["mean_angle"], color=color, linewidth=3.4, zorder=5)
                     ax.plot(
                         summary["t"],
                         summary["median_angle"],
@@ -7143,60 +11022,61 @@ def save_movement_cycle_hand_angle_figures(
                             linewidth=0,
                             zorder=2,
                         )
-                    ax.plot(
-                        summary["t"],
-                        lower,
-                        color=color,
-                        linewidth=0.8,
-                        linestyle=":",
-                        alpha=0.45,
-                        zorder=3,
-                    )
-                    ax.plot(
-                        summary["t"],
-                        upper,
-                        color=color,
-                        linewidth=0.8,
-                        linestyle=":",
-                        alpha=0.45,
-                        zorder=3,
-                    )
-                ax.set_title(f"Stiffness {stiffness:g}", fontsize=9)
-                if col == 0:
+                    ax.plot(summary["t"], lower, color=color, linewidth=0.8, linestyle=":", alpha=0.45, zorder=3)
+                    ax.plot(summary["t"], upper, color=color, linewidth=0.8, linestyle=":", alpha=0.45, zorder=3)
+                    plotted = True
+                if row_idx == 0:
+                    ax.set_title(f"Stiffness {stiffness:g}", fontsize=9)
+                if stiffness_idx == 0:
                     ax.set_ylabel(angle_label)
-                ax.set_xlabel("Duration (ms)")
+                if row_idx == nrows - 1:
+                    ax.set_xlabel("Duration (ms)")
                 _set_pi_axis(ax)
                 ax.set_xlim(duration_p5, duration_p95)
                 ax.grid(alpha=0.18)
-            fig.suptitle(
-                f"{label}: {angle_label} by stiffness\n"
-                "thin=trial traces; solid=mean; dashed=median; shaded/dotted=P5-P95; "
-                "duration axis uses the global P5-P95 millisecond window; "
-                "subjects with _P_ are excluded",
-                y=0.99,
-            )
-            fig.tight_layout(rect=[0, 0.02, 1, 0.92])
-            out = subject_figure_path_for_scope(
-                fig_dir,
-                prefix,
-                f"movement_cycle_{safe_angle}_{prefix}.png",
-            )
-            fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
+        if not plotted:
             plt.close(fig)
-            paths.append(out)
+            continue
+        fig.suptitle(
+            f"{label}: XY movement direction and YZ hand orientation by stiffness\n"
+            "thin=trial traces; solid=mean; dashed=median; shaded/dotted=P5-P95; "
+            "duration axis uses the global P5-P95 millisecond window; subjects with _P_ are excluded",
+            y=0.995,
+        )
+        fig.tight_layout(rect=[0, 0.02, 1, 0.93])
+        out = subject_figure_path_for_scope(
+            fig_dir,
+            prefix,
+            f"movement_cycle_xy_direction_yz_hand_orientation_{prefix}.png",
+        )
+        fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
+        plt.close(fig)
+        paths.append(out)
 
-    save_csv(
-        pd.DataFrame({"figure": [str(p) for p in paths]}),
-        output_root,
-        "movement_cycle_hand_angle_figure_manifest.csv",
-    )
+    save_csv(pd.DataFrame({"figure": [str(p) for p in paths]}), output_root, manifest_name)
     return paths
+
+def _has_multiple_subjects(*frames: Any) -> bool:
+    """True only when more than one distinct subject_id appears across frames.
+
+    Group- and combined-group aggregates are meaningless for a single-subject
+    selection (the "group" would contain just that one person), so every
+    group/combined figure block is gated on this. A single-subject
+    ``DATA_SELECTION`` yields exactly one subject_id, so those blocks are skipped
+    and only that subject's own outputs are produced.
+    """
+    ids: set[str] = set()
+    for frame in frames:
+        if isinstance(frame, pd.DataFrame) and "subject_id" in frame.columns:
+            ids.update(frame["subject_id"].dropna().astype(str).unique())
+    return len(ids) > 1
 
 
 def _group_variants(df: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
     d = add_success_label_column(
         add_protocol_demographic_factors(add_workspace_normalization_columns(df))
     )
+    multi = _has_multiple_subjects(d)
     out = [("all", d)]
     scope_columns = [
         ("experiment_group", EXPERIMENT_GROUP_COLUMN),
@@ -7213,6 +11093,9 @@ def _group_variants(df: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
     for scope, col in scope_columns:
         if col not in d.columns:
             continue
+        # Group aggregates only make sense across multiple subjects.
+        if scope == "experiment_group" and not multi:
+            continue
         values = [v for v in d[col].dropna().unique()]
         for value in sorted(values, key=lambda x: str(x)):
             sub = d[d[col].astype(str) == str(value)]
@@ -7226,6 +11109,106 @@ def _group_variants(df: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
     return out
 
 
+def _save_time_acceleration_xyz_matrix(
+    group_time: pd.DataFrame,
+    fig_dir: Path,
+    *,
+    side_z_samples: Optional[pd.DataFrame] = None,
+    fig_dpi: int = 160,
+) -> Optional[Path]:
+    """Save acceleration-by-finger as X/Y/Z median profiles.
+
+    This is a run/group-time summary. It is not the same as
+    ``subject_<id>_acceleration_by_stiffness.png`` because this table can already
+    be collapsed across the run/group scope before plotting.
+    """
+    if group_time.empty:
+        return None
+    plot_time = group_time.copy()
+    if side_z_samples is not None and not side_z_samples.empty:
+        max_bin = pd.to_numeric(
+            plot_time.get("trajectory_time_bin", pd.Series(dtype=float)),
+            errors="coerce",
+        ).max()
+        n_time_bins = int(max_bin) if np.isfinite(max_bin) and max_bin > 0 else 50
+        augmented = add_side_z_velocity_acceleration_to_time_bins(
+            plot_time,
+            side_z_samples,
+            n_time_bins=n_time_bins,
+        )
+        if "az_px_s2" in augmented.columns:
+            plot_time["mean_az_px_s2"] = pd.to_numeric(
+                augmented["az_px_s2"], errors="coerce"
+            )
+    axis_specs = [
+        ("X / Ax", "mean_ax_px_s2"),
+        ("Y / Ay", "mean_ay_px_s2"),
+        ("Z / Az", "mean_az_px_s2"),
+    ]
+    fig, axes = plt.subplots(3, 1, figsize=(9.5, 10.5), sharex=True)
+    axes = np.asarray(axes).reshape(3, 1)
+    plotted = False
+    for row_idx, (axis_label, value_col) in enumerate(axis_specs):
+        for col_idx, (stat_label, stat_func) in enumerate([("Median", "median")]):
+            ax = axes[row_idx, col_idx]
+            ax.axhline(0, color="0.75", linewidth=0.7)
+            ax.grid(alpha=0.22)
+            if value_col not in plot_time.columns or not plot_time[value_col].notna().any():
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No Z data" if axis_label.startswith("Z") else "No data",
+                    ha="center",
+                    va="center",
+                    color="0.55",
+                    transform=ax.transAxes,
+                )
+            else:
+                for finger in sorted(
+                    plot_time["finger_condition"].dropna().unique(),
+                    key=lambda x: FINGER_ORDER.index(x) if x in FINGER_ORDER else 99,
+                ):
+                    g = (
+                        plot_time[plot_time["finger_condition"] == finger]
+                        .groupby("trajectory_time_bin", as_index=False)
+                        .agg(
+                            time_fraction=("time_fraction", "mean"),
+                            y=(value_col, stat_func),
+                        )
+                    )
+                    if g["y"].notna().any():
+                        plotted = True
+                        ax.plot(
+                            g["time_fraction"],
+                            g["y"],
+                            label=FINGER_LABELS.get(str(finger), str(finger)),
+                            color=FINGER_TO_COLOR.get(str(finger)),
+                        )
+            if row_idx == 0:
+                ax.set_title(f"{stat_label} acceleration")
+            if col_idx == 0:
+                ax.set_ylabel(f"{axis_label}\n(px/s²)")
+            if row_idx == 2:
+                ax.set_xlabel("Normalized trial time")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        axes[0, 0].legend(handles, labels, fontsize=8)
+    fig.suptitle("Acceleration components over time: X/Y/Z median", y=0.995)
+    fig.tight_layout()
+    owner = sanitize_name(fig_dir.parent.name, fallback="selection")
+    if SUBJECT_FOLDER_RE.match(owner):
+        filename = f"subject_{owner}_acceleration_by_finger.png"
+    else:
+        filename = f"{owner}_acceleration_by_finger.png"
+    out = fig_dir / filename
+    if plotted:
+        fig.savefig(out, dpi=fig_dpi)
+        plt.close(fig)
+        return out
+    plt.close(fig)
+    return None
+
+
 def save_kinematic_figures(
     output_root: Path,
     trial_summary: pd.DataFrame,
@@ -7234,19 +11217,21 @@ def save_kinematic_figures(
     distance_success: pd.DataFrame,
     side_group_time: Optional[pd.DataFrame] = None,
     side_stiffness_summary: Optional[pd.DataFrame] = None,
+    side_z_samples: Optional[pd.DataFrame] = None,
+    include_time_acceleration_figure: bool = True,
     fig_dpi: int = 160,
 ) -> list[Path]:
-    fig_dir = output_root / "figures"
+    fig_dir = _figures_base(output_root)
     fig_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
+    scope_title_suffix = {
+        "standard": "\nScope: standard stiffness segments only",
+        "Comparison": "\nScope: comparison stiffness segments only",
+        "all": "\nScope: all stiffness segments",
+    }.get(Path(output_root).name, "")
     if not group_time.empty:
         for y_col, y_label, filename in [
-            (
-                "mean_r_center_px",
-                "Distance from center (px)",
-                "time_distance_from_center.png",
-            ),
-            ("mean_speed_px_s", "Speed (px/s)", "time_speed.png"),
+            ("mean_speed_px_s", "Velocity magnitude (px/s)", "time_magnitude.png"),
             (
                 "mean_acceleration_px_s2",
                 "Acceleration (px/s^2)",
@@ -7263,6 +11248,18 @@ def save_kinematic_figures(
                 "time_tangential_velocity.png",
             ),
         ]:
+            if filename == "time_acceleration.png":
+                if not include_time_acceleration_figure:
+                    continue
+                out = _save_time_acceleration_xyz_matrix(
+                    group_time,
+                    fig_dir,
+                    side_z_samples=side_z_samples,
+                    fig_dpi=fig_dpi,
+                )
+                if out is not None:
+                    paths.append(out)
+                continue
             fig, ax = plt.subplots(figsize=(8, 5))
             for finger in sorted(
                 group_time["finger_condition"].dropna().unique(),
@@ -7271,7 +11268,7 @@ def save_kinematic_figures(
                 g = (
                     group_time[group_time["finger_condition"] == finger]
                     .groupby("trajectory_time_bin", as_index=False)
-                    .agg(time_fraction=("time_fraction", "mean"), y=(y_col, "mean"))
+                    .agg(time_fraction=("time_fraction", "mean"), y=(y_col, "median"))
                 )
                 ax.plot(
                     g["time_fraction"],
@@ -7281,315 +11278,15 @@ def save_kinematic_figures(
                 )
             ax.set_xlabel("Normalized trial time")
             ax.set_ylabel(y_label)
-            ax.set_title(y_label + " over time")
+            ax.set_title(y_label + " over time" + scope_title_suffix)
             ax.legend(fontsize=8)
             fig.tight_layout()
             out = fig_dir / filename
             fig.savefig(out, dpi=fig_dpi)
             plt.close(fig)
             paths.append(out)
-        fig, ax = plt.subplots(figsize=(6.5, 6))
-        for finger in sorted(
-            group_time["finger_condition"].dropna().unique(),
-            key=lambda x: FINGER_ORDER.index(x) if x in FINGER_ORDER else 99,
-        ):
-            g = (
-                group_time[group_time["finger_condition"] == finger]
-                .groupby("trajectory_time_bin", as_index=False)
-                .agg(x=("mean_x_centered_px", "mean"), y=("mean_y_centered_px", "mean"))
-            )
-            ax.plot(
-                g["x"],
-                g["y"],
-                label=FINGER_LABELS.get(str(finger), str(finger)),
-                color=FINGER_TO_COLOR.get(str(finger)),
-            )
-            if not g.empty:
-                ax.scatter(
-                    g["x"].iloc[0],
-                    g["y"].iloc[0],
-                    marker="o",
-                    color=FINGER_TO_COLOR.get(str(finger)),
-                )
-                ax.scatter(
-                    g["x"].iloc[-1],
-                    g["y"].iloc[-1],
-                    marker="x",
-                    color=FINGER_TO_COLOR.get(str(finger)),
-                )
-        ax.axhline(0, color="0.7")
-        ax.axvline(0, color="0.7")
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel("X from center (px)")
-        ax.set_ylabel("Y from center (px)")
-        ax.set_title("Mean XY trajectory by finger")
-        ax.legend(fontsize=8)
-        fig.tight_layout()
-        out = fig_dir / "mean_xy_trajectory_by_finger.png"
-        fig.savefig(out, dpi=fig_dpi)
-        plt.close(fig)
-        paths.append(out)
-    if not trial_summary.empty:
-        polar_dir = fig_dir / "polar_radiation_patterns"
-        polar_dir.mkdir(exist_ok=True)
-        for name, sub in _group_variants(trial_summary):
-            angles = pd.to_numeric(
-                sub["dominant_movement_angle_deg"], errors="coerce"
-            ).dropna()
-            if angles.empty:
-                continue
-            bins = np.linspace(-180, 180, 73)
-            counts, edges = np.histogram(angles, bins=bins)
-            fig = plt.figure(figsize=(6, 6))
-            ax = fig.add_subplot(111, projection="polar")
-            ax.bar(
-                np.deg2rad(edges[:-1] + np.diff(edges) / 2),
-                counts,
-                width=np.deg2rad(np.diff(edges)) * 0.92,
-                bottom=0,
-                alpha=0.75,
-            )
-            ax.set_theta_zero_location("E")
-            ax.set_theta_direction(-1)
-            ax.set_title(f"Movement-orientation radiation pattern: {name}")
-            out = polar_dir / f"radiation_orientation_{sanitize_name(name)}.png"
-            fig.savefig(out, dpi=fig_dpi)
-            plt.close(fig)
-            paths.append(out)
-        for subject, sub in trial_summary.groupby("subject_id", dropna=False):
-            angles = pd.to_numeric(
-                sub["dominant_movement_angle_deg"], errors="coerce"
-            ).dropna()
-            if angles.empty:
-                continue
-            bins = np.linspace(-180, 180, 73)
-            counts, edges = np.histogram(angles, bins=bins)
-            fig = plt.figure(figsize=(5, 5))
-            ax = fig.add_subplot(111, projection="polar")
-            ax.bar(
-                np.deg2rad(edges[:-1] + np.diff(edges) / 2),
-                counts,
-                width=np.deg2rad(np.diff(edges)) * 0.92,
-                alpha=0.75,
-            )
-            ax.set_theta_zero_location("E")
-            ax.set_theta_direction(-1)
-            ax.set_title(f"Orientation pattern: {subject}")
-            out = subject_figure_path(
-                polar_dir,
-                subject,
-                f"radiation_orientation_subject_{sanitize_name(subject)}.png",
-            )
-            fig.savefig(out, dpi=fig_dpi)
-            plt.close(fig)
-            paths.append(out)
-        distance_polar_dir = fig_dir / "polar_distance_patterns"
-        distance_polar_dir.mkdir(exist_ok=True)
-        d_polar = add_success_label_column(
-            add_workspace_normalization_columns(trial_summary)
-        )
-        for name, sub in _group_variants(d_polar):
-            if "dominant_movement_angle_deg" not in sub.columns:
-                continue
-            success_values = ["success", "failure"]
-            fig, axes = plt.subplots(
-                1,
-                2,
-                subplot_kw={"projection": "polar"},
-                figsize=(12.5, 5.8),
-            )
-            plotted_distance = False
-            for ax, success_name in zip(axes, success_values):
-                success_sub = sub[sub["success_label"].astype(str) == success_name].copy()
-                if success_sub.empty:
-                    ax.set_title(f"{success_name}: no trials")
-                    ax.set_axis_off()
-                    continue
-                angles = pd.to_numeric(
-                    success_sub["dominant_movement_angle_deg"], errors="coerce"
-                )
-                radius = pd.to_numeric(
-                    success_sub.get(
-                        "max_r_center_px",
-                        success_sub.get("mean_max_r_center_px", np.nan),
-                    ),
-                    errors="coerce",
-                )
-                if "mean_r_workspace_normalized" in success_sub.columns:
-                    norm_radius = pd.to_numeric(
-                        success_sub["mean_r_workspace_normalized"], errors="coerce"
-                    )
-                else:
-                    norm_radius = pd.Series(np.nan, index=success_sub.index)
-                valid = angles.notna() & radius.notna()
-                if not valid.any():
-                    ax.set_title(f"{success_name}: no valid trials")
-                    ax.set_axis_off()
-                    continue
-                bins = np.linspace(-180, 180, 73)
-                bin_idx = pd.cut(
-                    angles[valid],
-                    bins=bins,
-                    include_lowest=True,
-                    labels=False,
-                )
-                plot_df = pd.DataFrame(
-                    {
-                        "bin": bin_idx,
-                        "radius_px": radius[valid].to_numpy(),
-                        "radius_norm": norm_radius[valid].to_numpy(),
-                    }
-                ).dropna(subset=["bin", "radius_px"])
-                if plot_df.empty:
-                    ax.set_title(f"{success_name}: no valid trials")
-                    ax.set_axis_off()
-                    continue
-                grouped = plot_df.groupby("bin", as_index=False).agg(
-                    radius_px=("radius_px", "median"),
-                    radius_norm=("radius_norm", "median"),
-                    n=("radius_px", "count"),
-                )
-                centers = bins[:-1] + np.diff(bins) / 2
-                heights = np.zeros(len(centers))
-                labels = np.zeros(len(centers))
-                for _, row in grouped.iterrows():
-                    idx = int(row["bin"])
-                    if 0 <= idx < len(heights):
-                        heights[idx] = row["radius_px"]
-                        labels[idx] = row["radius_norm"]
-                bars = ax.bar(
-                    np.deg2rad(centers),
-                    heights,
-                    width=np.deg2rad(np.diff(bins)) * 0.92,
-                    bottom=0,
-                    alpha=0.78,
-                    color="#4C78A8" if success_name == "success" else "#E45756",
-                )
-                for bar, norm_value in zip(bars, labels):
-                    if np.isfinite(norm_value) and norm_value > 0:
-                        bar.set_alpha(float(np.clip(0.25 + 0.6 * norm_value, 0.25, 0.9)))
-                ax.set_theta_zero_location("E")
-                ax.set_theta_direction(-1)
-                ax.set_title(f"{success_name}: median distance")
-                plotted_distance = True
-            if plotted_distance:
-                fig.suptitle(
-                    f"Direction distance pattern: {name}\n"
-                    "success and failure are side-by-side; bar radius=median original px distance; "
-                    "alpha=workspace-normalized distance",
-                    y=1.02,
-                )
-                fig.tight_layout()
-                out = (
-                    distance_polar_dir
-                    / f"polar_distance_success_failure_{sanitize_name(name)}.png"
-                )
-                fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
-                paths.append(out)
-            plt.close(fig)
-            if "success_label" not in sub.columns:
-                continue
-            if "duration_s" in sub.columns:
-                time_values = pd.to_numeric(sub["duration_s"], errors="coerce")
-            else:
-                time_values = pd.Series(1.0, index=sub.index)
-            valid_polar = (
-                pd.to_numeric(sub["dominant_movement_angle_deg"], errors="coerce").notna()
-                & time_values.notna()
-            )
-            if not valid_polar.any():
-                continue
-            bins = np.linspace(-180, 180, 73)
-            centers = bins[:-1] + np.diff(bins) / 2
-            stiffness_labels = (
-                sorted(sub["stiffness_value"].dropna().unique(), key=lambda x: float(x))
-                if "stiffness_value" in sub.columns
-                else ["all stiffness"]
-            )
-            cmap = plt.get_cmap(STIFFNESS_CMAP)
-            stiffness_colors = {
-                stiffness: cmap(i / max(1, len(stiffness_labels) - 1))
-                for i, stiffness in enumerate(stiffness_labels)
-            }
-            fig, axes = plt.subplots(
-                1,
-                2,
-                subplot_kw={"projection": "polar"},
-                figsize=(12.5, 5.8),
-            )
-            plotted_any = False
-            for ax, success_name in zip(axes, success_values):
-                success_sub = sub[sub["success_label"].astype(str) == success_name].copy()
-                if success_sub.empty:
-                    ax.set_title(f"{success_name}: no trials")
-                    ax.set_axis_off()
-                    continue
-                success_sub["_movement_time_s"] = pd.to_numeric(
-                    success_sub.get("duration_s", 1.0), errors="coerce"
-                ).fillna(1.0)
-                if "stiffness_value" not in success_sub.columns:
-                    success_sub["stiffness_value"] = "all stiffness"
-                for stiffness, stiff_df in success_sub.groupby("stiffness_value", dropna=False):
-                    angles = pd.to_numeric(
-                        stiff_df["dominant_movement_angle_deg"], errors="coerce"
-                    )
-                    bin_idx = pd.cut(
-                        angles,
-                        bins=bins,
-                        include_lowest=True,
-                        labels=False,
-                    )
-                    plot_df = pd.DataFrame(
-                        {
-                            "bin": bin_idx,
-                            "movement_time_s": stiff_df["_movement_time_s"].to_numpy(),
-                        }
-                    ).dropna(subset=["bin", "movement_time_s"])
-                    if plot_df.empty:
-                        continue
-                    grouped = plot_df.groupby("bin", as_index=False).agg(
-                        movement_time_s=("movement_time_s", "sum")
-                    )
-                    heights = np.zeros(len(centers))
-                    for _, row in grouped.iterrows():
-                        idx = int(row["bin"])
-                        if 0 <= idx < len(heights):
-                            heights[idx] = row["movement_time_s"]
-                    ax.bar(
-                        np.deg2rad(centers),
-                        heights,
-                        width=np.deg2rad(np.diff(bins)) * 0.92,
-                        bottom=0,
-                        alpha=0.46,
-                        color=stiffness_colors.get(stiffness, "#4C78A8"),
-                        edgecolor=stiffness_colors.get(stiffness, "#4C78A8"),
-                        linewidth=0.5,
-                        label=str(stiffness),
-                    )
-                    plotted_any = True
-                ax.set_theta_zero_location("E")
-                ax.set_theta_direction(-1)
-                ax.set_title(f"{success_name}: radius = movement time in area")
-            if plotted_any:
-                handles, labels = axes[-1].get_legend_handles_labels()
-                if handles:
-                    fig.legend(
-                        handles,
-                        labels,
-                        loc="lower center",
-                        ncol=min(6, len(labels)),
-                        title="Stiffness (semi-transparent colors)",
-                    )
-                fig.suptitle(
-                    f"Polar dwell-time pattern by stiffness: {name}\n"
-                    "success and failure are side-by-side; radial distance is summed movement time",
-                    y=1.02,
-                )
-                fig.tight_layout(rect=[0, 0.08, 1, 0.95])
-                out = distance_polar_dir / f"polar_dwell_time_success_failure_{sanitize_name(name)}.png"
-                fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
-                paths.append(out)
-            plt.close(fig)
+    # radiation_orientation_* polar plots were removed from the trajectory report;
+    # no histogram/binning calculations are performed here.
     if not direction_success.empty:
         fig, ax = plt.subplots(figsize=(10, 5))
         pivot = (
@@ -7644,8 +11341,10 @@ def save_kinematic_figures(
         plt.close(fig)
         paths.append(out)
     if side_group_time is not None and not side_group_time.empty:
-        side_dir = fig_dir / "side_z_by_group"
-        side_dir.mkdir(exist_ok=True)
+        # All side-camera Z/lift figures are general (all-participant) views ->
+        # results/<LABEL>/figures/all/.
+        side_dir = _selection_figures_root(fig_dir) / "all"
+        side_dir.mkdir(parents=True, exist_ok=True)
         side_plot = add_success_label_column(
             add_protocol_demographic_factors(add_workspace_normalization_columns(side_group_time))
         )
@@ -7662,6 +11361,13 @@ def save_kinematic_figures(
         ]:
             if col not in side_plot.columns or not side_plot[col].notna().any():
                 continue
+            stiffness_colors = (
+                _stiffness_viridis_colors(
+                    sorted(side_plot[col].dropna().unique(), key=float)
+                )
+                if col == "stiffness_value"
+                else {}
+            )
             fig, ax = plt.subplots(figsize=(8.5, 5.0))
             for group, g in side_plot.groupby(col, dropna=False):
                 gg = g.groupby("side_time_bin", as_index=False).agg(
@@ -7669,12 +11375,14 @@ def save_kinematic_figures(
                     z=("mean_side_z_lift_px", "mean"),
                     sem=("mean_side_z_lift_px", _sem),
                 )
-                ax.plot(gg["t"], gg["z"], marker="o", label=str(group))
+                color = stiffness_colors.get(group)
+                ax.plot(gg["t"], gg["z"], marker="o", label=str(group), color=color)
                 if gg["sem"].notna().any():
                     ax.fill_between(
                         gg["t"],
                         gg["z"] - gg["sem"],
                         gg["z"] + gg["sem"],
+                        color=color,
                         alpha=0.12,
                     )
             ax.set_xlabel("Normalized side-video time")
@@ -7685,10 +11393,6 @@ def save_kinematic_figures(
             fig.tight_layout()
             out = side_dir / f"side_z_lift_over_time_by_{scope}.png"
             fig.savefig(out, dpi=fig_dpi)
-            if scope == "subject_group":
-                legacy_out = fig_dir / "side_z_lift_over_time_by_group.png"
-                fig.savefig(legacy_out, dpi=fig_dpi)
-                paths.append(legacy_out)
             plt.close(fig)
             paths.append(out)
         if "subject_id" in side_plot.columns:
@@ -7730,14 +11434,28 @@ def save_kinematic_figures(
                     .sort_values(["subject_id", "stiffness_value"])
                 )
                 for subject, g in subject_stiffness.groupby("subject_id", dropna=False):
+                    stiffness_numeric = pd.to_numeric(g["stiffness_value"], errors="coerce")
+                    z_numeric = pd.to_numeric(g["z"], errors="coerce")
                     ax.plot(
-                        pd.to_numeric(g["stiffness_value"], errors="coerce"),
-                        pd.to_numeric(g["z"], errors="coerce"),
+                        stiffness_numeric,
+                        z_numeric,
                         marker="o",
                         linewidth=1.2,
                         alpha=0.58,
                         color=participant_colors.get(str(subject)),
                         label=str(subject),
+                    )
+                    point_colors = _stiffness_viridis_colors(
+                        sorted(stiffness_numeric.dropna().unique())
+                    )
+                    ax.scatter(
+                        stiffness_numeric,
+                        z_numeric,
+                        c=[point_colors.get(v, "0.5") for v in stiffness_numeric],
+                        s=28,
+                        edgecolors="black",
+                        linewidths=0.25,
+                        zorder=4,
                     )
                 ax.set_xlabel("Stiffness value (skin-stretch gain mm/m)")
                 ax.set_ylabel("Mean side-view Z/lift proxy (px)")
@@ -7763,13 +11481,26 @@ def save_kinematic_figures(
             groups = [("all participants", side_stiffness_summary)]
         for group, g in groups:
             g = g.sort_values(x_col)
+            x_numeric = pd.to_numeric(g[x_col], errors="coerce")
+            stiffness_colors = _stiffness_viridis_colors(sorted(x_numeric.dropna().unique()))
             ax.errorbar(
-                g[x_col],
+                x_numeric,
                 g["mean_side_z_lift_px"],
                 yerr=g.get("sem_side_z_lift_px"),
-                marker="o",
+                marker="",
                 capsize=3,
+                color="0.55",
+                alpha=0.75,
                 label=str(group),
+            )
+            ax.scatter(
+                x_numeric,
+                g["mean_side_z_lift_px"],
+                c=[stiffness_colors.get(v, "0.5") for v in x_numeric],
+                s=48,
+                edgecolors="black",
+                linewidths=0.35,
+                zorder=4,
             )
         ax.set_xlabel("Skin-stretch/stiffness value")
         ax.set_ylabel("Mean side-view Z/lift proxy (px)")
@@ -7788,11 +11519,201 @@ def save_kinematic_figures(
     return paths
 
 
+def save_individual_subject_reports(
+    results_root: Path,
+    *,
+    trial_kinematic_summary: pd.DataFrame,
+    trajectory_time_bins: pd.DataFrame,
+    kinematic_samples: Optional[pd.DataFrame] = None,
+    side_z_trial_summary: Optional[pd.DataFrame] = None,
+    side_z_samples: Optional[pd.DataFrame] = None,
+    side_z_group_time_summary: Optional[pd.DataFrame] = None,
+    subjects: Optional[list[str]] = None,
+    n_time_bins: int = 50,
+    fig_dpi: int = 160,
+) -> dict[str, list[Path]]:
+    """Give every subject in a group run the same FULL figure set a solo run does.
+
+    Many figure helpers emit, beyond their per-subject ``subject_<id>_*`` panels, a
+    batch of **aggregate** figures via ``_figures_base(output_root)`` -- e.g.
+    ``save_subject_velocity_acceleration_figures`` writes
+    ``velocity_vs_time_by_stiffness``, ``velocity_vs_time_by_stiffness_finger_*``,
+    ``average_velocity_vs_stiffness``, ``all_velocity_vs_time_by_stiffness*`` and the
+    ``*_acceleration_by_finger`` matrix; ``save_kinematic_figures`` writes
+    ``time_magnitude``/``time_speed``/``time_radial_velocity``/``time_tangential_velocity``,
+    ``success_by_dominant_direction``, ``success_vs_distance_from_center`` and the
+    ``side_z_lift_*`` (z-lift) panels; ``save_motor_control_figures`` and
+    ``save_advanced_kinematic_figures`` write their grids and contrasts. In a group
+    run all of those land once at the group level (``results/<GROUP>/figures/...``); in
+    a *single-subject* run the selection label IS the subject, so the same figures land
+    in ``results/<subject>/figures/...``. That asymmetry is why each individual looks
+    sparser inside a group run.
+
+    Rather than enumerate which figures are aggregate vs scoped (the split differs per
+    helper and drifts), this simply **re-runs the entire per-selection figure pipeline
+    once per subject**, restricted to that subject's rows, with ``output_root =
+    results/<subject>`` -- i.e. exactly what a standalone single-subject run does. It
+    reuses the already-computed sample/trial frames (which all carry ``subject_id``) and
+    only re-runs the cheap aggregations, so there is no tracking recompute or video
+    re-decode. Scoped figures the group run already wrote are simply overwritten
+    identically; the aggregate ones are what gets added.
+    ``organize_kinematic_results_tree`` (run afterwards) sorts everything into each
+    subject's ``figures/<category>/``.
+
+    No-op for a single-subject selection (that run already wrote the full suite into the
+    subject folder). Returns ``{subject_id: [figure paths]}``.
+    """
+    results_root = Path(results_root)
+    if (
+        trial_kinematic_summary is None
+        or trial_kinematic_summary.empty
+        or "subject_id" not in trial_kinematic_summary.columns
+    ):
+        return {}
+    present = sorted(
+        {str(s) for s in trial_kinematic_summary["subject_id"].dropna().unique()}
+    )
+    if subjects is not None:
+        wanted = {str(s) for s in subjects}
+        present = [s for s in present if s in wanted]
+    # The per-subject suite only "fills in" the individual folders of a
+    # multi-subject selection; a single-subject run already produced everything.
+    if len(present) <= 1:
+        return {}
+
+    def _by_subject(frame: Optional[pd.DataFrame], sid: str) -> pd.DataFrame:
+        if not isinstance(frame, pd.DataFrame) or "subject_id" not in frame.columns:
+            return pd.DataFrame()
+        return frame[frame["subject_id"].astype(str) == sid].copy()
+
+    reports: dict[str, list[Path]] = {}
+    for sid in present:
+        trial_s = _by_subject(trial_kinematic_summary, sid)
+        time_bins_s = _by_subject(trajectory_time_bins, sid)
+        if trial_s.empty or time_bins_s.empty:
+            continue
+        samples_s = _by_subject(kinematic_samples, sid)
+        side_trial_s = _by_subject(side_z_trial_summary, sid)
+        side_samples_s = _by_subject(side_z_samples, sid)
+        side_group_time_s = _by_subject(side_z_group_time_summary, sid)
+
+        subject_root = results_root / sanitize_name(sid)
+        paths: list[Path] = []
+
+        # Re-run the SAME per-selection figure pipeline the notebook runs, but on this
+        # subject's rows only and into results/<subject>/. All compute below is cheap
+        # aggregation -- the expensive tracking / side-video stages are not repeated.
+        # The call order mirrors the notebook's figure cells so the per-subject output
+        # is identical to a standalone single-subject run.
+        summaries = summarize_kinematics(trial_s, time_bins_s)
+
+        # 4. Motor-control grids.
+        motor_control = compute_motor_control_comparisons(summaries["subject_summary"])
+        paths.extend(
+            save_motor_control_figures(subject_root, motor_control, fig_dpi=fig_dpi)
+        )
+
+        # 6. Advanced success/Z + trajectory-distance contrasts.
+        success_kinematic_z = compute_success_kinematic_z_analysis(trial_s, side_trial_s)
+        trajectory_structure = compute_trajectory_similarity_analysis(time_bins_s)
+        paths.extend(
+            save_advanced_kinematic_figures(
+                subject_root, success_kinematic_z, trajectory_structure, fig_dpi=fig_dpi
+            )
+        )
+
+        # 7. Subject XY-in-space trajectories.
+        subject_spatial = compute_subject_spatial_trajectory_analysis(time_bins_s)
+        paths.extend(
+            save_subject_xy_trajectory_figures(
+                subject_root, subject_spatial["subject_xy_trajectory"], fig_dpi=fig_dpi
+            )
+        )
+
+        # 8. Velocity / acceleration (subject panels + the velocity_vs_time /
+        #    average_velocity_vs_stiffness / acceleration_by_finger aggregate figures).
+        subject_va = compute_subject_velocity_acceleration_analysis(
+            time_bins_s, side_z_samples=side_samples_s, n_time_bins=n_time_bins
+        )
+        velocity_profile = subject_va["subject_velocity_acceleration_profile"]
+        paths.extend(
+            save_subject_velocity_acceleration_figures(
+                subject_root, velocity_profile, fig_dpi=fig_dpi
+            )
+        )
+        paths.extend(
+            save_standard_vs_comparison_velocity_figures(
+                subject_root, velocity_profile, levels=("subject",), fig_dpi=fig_dpi
+            )
+        )
+        paths.extend(
+            save_standard_vs_comparison_position_figures(
+                subject_root, velocity_profile, levels=("subject",), fig_dpi=fig_dpi
+            )
+        )
+
+        # 9. 3D proxy kinematics.
+        proxy3d = compute_3d_proxy_kinematics(samples_s, side_samples_s)
+        paths.extend(
+            save_3d_proxy_figures(
+                subject_root,
+                proxy3d["kinematic_3d_proxy_samples"],
+                proxy3d["trial_3d_kinematic_summary"],
+                fig_dpi=fig_dpi,
+            )
+        )
+
+        # 10. Hand / active-finger orientation planes.
+        hand_orientation = compute_hand_orientation_plane_analysis(trial_s, side_trial_s)
+        paths.extend(
+            save_hand_orientation_plane_figures(
+                subject_root,
+                hand_orientation["hand_orientation_plane_summary"],
+                hand_orientation["hand_orientation_plane_trials"],
+                fig_dpi=fig_dpi,
+            )
+        )
+        paths.extend(
+            save_hand_orientation_axis_matrix_figures(
+                subject_root,
+                hand_orientation["hand_orientation_plane_trials"],
+                fig_dpi=fig_dpi,
+            )
+        )
+
+        # 11. Movement-cycle hand angle (single-subject convention: side_z_samples=None,
+        #     matching the notebook's is_single_subject_selection branch).
+        paths.extend(
+            save_movement_cycle_hand_angle_figures(
+                subject_root, time_bins_s, side_z_samples=None, fig_dpi=fig_dpi
+            )
+        )
+
+        # 11 (main figures). Run-level magnitude/success/z-lift suite.
+        side_stiffness_s = _summarize_side_z_by_stiffness(side_trial_s)
+        paths.extend(
+            save_kinematic_figures(
+                subject_root,
+                trial_s,
+                summaries["group_time"],
+                summaries["direction_success"],
+                summaries["distance_success"],
+                side_group_time_s,
+                side_stiffness_s,
+                side_z_samples=side_samples_s,
+                fig_dpi=fig_dpi,
+            )
+        )
+
+        reports[sid] = [p for p in paths if p is not None]
+    return reports
+
+
 def analysis_manifest(output_root: Path) -> pd.DataFrame:
     expected = [
         "trial_file_manifest.csv",
         "experiment_setup_context.csv",
-        "kinematic_samples.csv",
+        "kinematic_samples.parquet",
         "pair_kinematic_summary.csv",
         "trial_kinematic_summary.csv",
         "trajectory_time_bins.csv",
@@ -7802,7 +11723,7 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
         "subject_kinematic_summary.csv",
         "participant_stiffness_kinematic_summary.csv",
         "stiffness_kinematic_summary.csv",
-        "group_time_summary.csv",
+        "group_time_summary.parquet",
         "stiffness_time_summary.csv",
         "kinematic_group_metric_summary.csv",
         "kinematic_group_condition_metric_summary.csv",
@@ -7847,8 +11768,16 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
         "velocity_stiffness_influence_summary.csv",
         "velocity_finger_influence_summary.csv",
         "velocity_time_influence_summary.csv",
+        "velocity/components/velocity_xyz_components_normalized_time_median.csv",
+        "velocity/magnitude/velocity_magnitude_normalized_time_median.csv",
+        "velocity/radial/velocity_radial_normalized_time_median.csv",
+        "velocity/tangential/velocity_tangential_normalized_time_median.csv",
+        "velocity/others/velocity_decomposition_profile.csv",
+        "velocity/others/velocity_curviness_summary.csv",
+        "velocity/others/velocity_interpretation_notes.csv",
+        "velocity_suggestion_figure_manifest.csv",
         "subject_velocity_acceleration_figure_manifest.csv",
-        "kinematic_3d_proxy_samples.csv",
+        "kinematic_3d_proxy_samples.parquet",
         "trial_3d_kinematic_summary.csv",
         "subject_3d_kinematic_summary.csv",
         "subject_3d_metric_distribution.csv",
@@ -7857,14 +11786,14 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
         "mixedlm_status.csv",
         "mixedlm_coefficients.csv",
         "proxy_3d_figure_manifest.csv",
-        "hand_orientation_plane_trials.csv",
+        "hand_orientation_plane_trials.parquet",
         "hand_orientation_plane_summary.csv",
         "hand_orientation_plane_figure_manifest.csv",
         "hand_orientation_axis_matrix_figure_manifest.csv",
         "success_failure_trajectory_distance.csv",
         "success_failure_trajectory_distance_summary.csv",
         "advanced_kinematic_figure_manifest.csv",
-        "side_z_samples.csv",
+        "side_z_samples.parquet",
         "side_z_trial_summary.csv",
         "side_z_group_time_summary.csv",
         "side_z_subject_stiffness_summary.csv",
