@@ -19,10 +19,10 @@ from analysis import CIRCLE_SEGMENT, StudyConfig
 FIGURE_DIR = Path(__file__).resolve().parent / "figures"
 
 STRATEGY_STYLE: dict[str, dict[str, object]] = {
-    "cardinal": {"color": "#d7191c", "label": "Cardinal\n(4-way)"},
-    "cardinal_diagonal": {"color": "#fdae61", "label": "Cardinal-diagonal\n(8-way)"},
-    "free_form": {"color": "#2c7bb6", "label": "Free-form\n(continuous)"},
-    "ik": {"color": "#1a9641", "label": "IK\n(continuous)"},
+    "cardinal": {"color": "#d7191c", "label": "Cardinal\n4-way, planar solver"},
+    "cardinal_diagonal": {"color": "#fdae61", "label": "Cardinal-diagonal\n8-way, planar solver"},
+    "free_form": {"color": "#2c7bb6", "label": "Free-form\ncontinuous, planar solver"},
+    "ik": {"color": "#1a9641", "label": "IK\ncontinuous, 3-D mechanism solver"},
 }
 COMMANDED_STYLE = {"color": "0.45", "linestyle": "--", "linewidth": 2.0}
 
@@ -104,7 +104,7 @@ def plot_reconstructed_paths(
         axis.legend(loc="upper right", fontsize=8)
 
     fig.suptitle(
-        "The four movement strategies on the 3-D mechanism model, same commanded circle.\n"
+        "The four movement strategies, each with its own solver, on the same commanded circle.\n"
         "Every reconstructed point lands on the commanded radius, so shape metrics score all "
         "four as near-perfect circles;\nthe tie lines and the reachable-point count show the "
         "along-path error those metrics cannot see.",
@@ -197,8 +197,9 @@ def plot_motor_commands(
 
     np.atleast_1d(axes)[-1].set_xlabel("Path step")
     fig.suptitle(
-        "Motor commands on the 3-D mechanism model, one panel per movement strategy "
-        "(shared y axis).",
+        "Motor commands, one panel per movement strategy, each with its own solver "
+        "(shared y axis).\nIK commands are smaller because the 3-D mechanism moves less "
+        "cable per unit of tactor motion than the planar approximation assumes.",
         fontsize=11,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.94))

@@ -92,9 +92,11 @@ class StudyConfig:
     stiffness_value: float = 1.0
     hand_orientation: HandOrientation = HandOrientation.NOT_MIRRORED
 
-    #: Held fixed for every strategy, so the comparison is strategy against
-    #: strategy on one mechanism.
-    kinematic_model: KinematicModel = KinematicModel.IK
+    #: Leave as None so every strategy uses the solver it is actually defined
+    #: with (planar for cardinal / cardinal-diagonal / free-form, the 3-D
+    #: mechanism for IK). Setting it overrides that for all four, which is only
+    #: meaningful as a deliberate what-if - it is not how the device runs.
+    kinematic_model: KinematicModel | None = None
 
     # Commanded path: line out, one full circle, line back.
     outward_fraction_of_half_width: float = 0.5
@@ -355,7 +357,7 @@ def run_metrics(samples: pd.DataFrame, config: StudyConfig) -> pd.DataFrame:
 
 
 def run_study(config: StudyConfig | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run the four movement strategies on the configured kinematic model."""
+    """Run the four movement strategies, each with the solver it is defined with."""
     config = config or StudyConfig()
     path = build_commanded_path(config)
     samples = pd.concat(
@@ -378,6 +380,7 @@ def comparison_table(metrics: pd.DataFrame, config: StudyConfig) -> pd.DataFrame
     names = [strategy.value for strategy in config.strategies]
     columns = [
         "quantisation",
+        "kinematic_model",
         "total_rms",
         "total_max",
         "quantisation_rms",
@@ -397,7 +400,7 @@ if __name__ == "__main__":
     pd.set_option("display.max_columns", 50)
 
     print(
-        f"Four movement strategies on the {study_config.kinematic_model.value} model, "
-        f"radius {study_config.radius:.0f} controller units.\n"
+        "Four movement strategies, each with the solver it is defined with. "
+        f"Radius {study_config.radius:.0f} controller units.\n"
     )
     print(comparison_table(study_metrics, study_config).round(3).to_string())
