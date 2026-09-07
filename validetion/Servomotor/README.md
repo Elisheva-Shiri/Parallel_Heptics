@@ -22,11 +22,14 @@ validetion/Servomotor/
     analyze.py                      [entry] per-run plots and per-delta summary
     generate_report.py              [entry] verified PDF report for one/two runs
     generate_validation_summary.py  [entry] manuscript figures across all runs
+    motor_validation.py             [entry] review tables, figure and LaTeX -> results/
+    motor_validation_analysis.ipynb notebook that configures and runs motor_validation.py
 
     smoke_test.py                   offline self-test (no hardware, writes nothing)
     synthesize_log.py               fake run data for exercising analyze.py
 
     responses/                      run data (git-ignored, ~180 MB)
+    results/                        manuscript results from the notebook (git-ignored)
     output/                         generated reports and figures (git-ignored)
 ```
 
@@ -275,6 +278,36 @@ Produces `validation_summary_figure` (command scale vs measured motion, response
 direction, repeatability), `validation_protocol_vs_drift`,
 `validation_small_motion_zoom`, the backing CSVs, and
 `validation_summary_text.md` with a draft results paragraph.
+
+## 5. Manuscript results (notebook)
+
+`motor_validation_analysis.ipynb` pools every complete camera run and writes
+the numbers the paper quotes into `results/<SELECTION>/`, in the same
+`csv/` + `figures/` layout as the other analysis notebooks:
+
+```
+results/all_runs/
+    csv/response/     branch_table.csv           +delta / -delta per amplitude, mean +/- SD, error
+    csv/hysteresis/   hysteresis_table.csv       return-to-zero offset by approach direction
+    csv/resolution/   resolution_table.csv       tick -> deg -> mm at the spool
+    csv/summary/      motor_validation_table.csv one merged table, one row per amplitude
+                      motor_validation_table.tex the same as a booktabs tabular
+                      calibration.json           gain, R^2, repeatability, PWM step
+    figures/review/   motor_validation_review_figure.{png,svg} + panel_A / B / C alone
+```
+
+Set `SELECTION`, `SPOOL_RADIUS_MM` and (optionally) `RUN_DIRS` in the first
+cell, then run all. The same thing from the shell:
+
+```powershell
+uv run python motor_validation.py --spool-radius-mm 4
+```
+
+Conventions baked in: gain is fitted through the origin over 25-500 ticks; the
+1000-tick endpoint is a range check, not a calibration point; 5 and 10 ticks
+are below the PCA9685 quantisation floor (one PWM step = 5.4 ticks = 0.50 deg);
+hysteresis is the return-to-zero offset, since the protocol is not a monotonic
+sweep and a classical loop cannot be drawn from it.
 
 ## Offline checks
 
