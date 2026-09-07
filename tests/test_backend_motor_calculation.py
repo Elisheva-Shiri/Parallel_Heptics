@@ -22,19 +22,28 @@ def _make_controller(strategy: MovementStrategy, **overrides) -> MotorController
     return MotorController(**kwargs)
 
 
-def test_cardinal_strategy_uses_opposite_major_axis_destination():
+def test_cardinal_strategy_snaps_to_major_axis_preserving_radius():
+    """Cardinal keeps only the dominant axis, at the full commanded radius.
+
+    The expected point is computed here, independently of the controller, so
+    this fails if the quantiser flips a sign or drops magnitude.
+    """
     controller = _make_controller(MovementStrategy.CARDINAL)
+    obj_x, obj_y = -40.0, 10.0
 
     actual = controller.calculate_motor_movements(
         motor_set_id=MotorSetId.MOTORS_3_5,
-        obj_x=-40.0,
-        obj_y=10.0,
+        obj_x=obj_x,
+        obj_y=obj_y,
         motors_enabled=True,
     )
-    expected = controller._calculate_cardinal_motor_movements(
+    # Polarity flip is applied inside the controller, so the tactor target is
+    # the opposite point; |x| > |y| there too, so X stays the dominant axis.
+    expected_point = (math.hypot(obj_x, obj_y), 0.0)
+    expected = controller._calculate_planar_motor_movements(
         motor_set_id=MotorSetId.MOTORS_3_5,
-        direction="right",
-        distance=40.0,
+        obj_x=expected_point[0],
+        obj_y=expected_point[1],
     )
 
     assert _to_tuples(actual) == _to_tuples(expected)
@@ -50,13 +59,57 @@ def test_cardinal_diagonal_strategy_uses_diagonal_when_threshold_met():
         obj_y=obj_y,
         motors_enabled=True,
     )
-    expected = controller._calculate_diagonal_motor_movements(
+    # Ratio 0.9 >= 0.5, so the target snaps to the 45-degree diagonal opposite
+    # the object, keeping the full radius.
+    leg = math.hypot(obj_x, obj_y) / math.sqrt(2.0)
+    expected = controller._calculate_planar_motor_movements(
         motor_set_id=MotorSetId.MOTORS_3_5,
-        direction="up-left",
-        distance=math.hypot(obj_x, obj_y),
+        obj_x=-leg,
+        obj_y=-leg,
     )
 
     assert _to_tuples(actual) == _to_tuples(expected)
+
+
+@pytest.mark.parametrize(
+    "obj_x, obj_y",
+    [(0.0, 60.0), (0.0, -60.0), (60.0, 0.0), (-60.0, 0.0), (40.0, 55.0), (-55.0, -40.0)],
+)
+def test_all_strategies_agree_on_direction_for_the_same_input(obj_x, obj_y):
+    """Every strategy must aim into the same quadrant as free-form.
+
+    Strategies differ in how coarsely they quantise direction, never in which
+    way an axis points. This is the invariant the old direction-string mapping
+    violated on Y: cardinal/CD aimed opposite to free-form for the same input.
+
+    The check is on the quantised target point, not on motor command signs -
+    the anchor triangle is not axis-aligned, so zeroing an axis can legitimately
+    flip an individual cable's delta.
+    """
+    reference_x, reference_y = _make_controller(MovementStrategy.FREE_FORM)._quantize_target(
+        obj_x, obj_y
+    )
+    for strategy in (MovementStrategy.CARDINAL, MovementStrategy.CARDINAL_DIAGONAL):
+        target_x, target_y = _make_controller(strategy)._quantize_target(obj_x, obj_y)
+        # A coarser strategy may zero an axis, but must never invert one.
+        assert target_x * reference_x >= 0.0, f"{strategy} inverted X"
+        assert target_y * reference_y >= 0.0, f"{strategy} inverted Y"
+
+
+def test_quantiser_preserves_radius_and_never_inverts_an_axis():
+    """`_quantize_target` is a pure, radius-preserving direction snap."""
+    for strategy in (MovementStrategy.CARDINAL, MovementStrategy.CARDINAL_DIAGONAL):
+        controller = _make_controller(strategy)
+        for angle_deg in range(0, 360, 7):
+            radius = 137.0
+            x = radius * math.cos(math.radians(angle_deg))
+            y = radius * math.sin(math.radians(angle_deg))
+            qx, qy = controller._quantize_target(x, y)
+
+            assert math.isclose(math.hypot(qx, qy), radius, rel_tol=1e-9)
+            # No component may point against the input component.
+            assert qx * x >= 0.0
+            assert qy * y >= 0.0
 
 
 def test_zero_displacement_returns_no_motors():
@@ -84,7 +137,7 @@ def test_free_form_clamps_using_screen_radius():
         obj_y=0.0,
         motors_enabled=True,
     )
-    expected = controller._calculate_freeform_motor_movements(
+    expected = controller._calculate_planar_motor_movements(
         motor_set_id=MotorSetId.MOTORS_3_5,
         obj_x=-40.0,
         obj_y=0.0,

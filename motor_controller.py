@@ -32,12 +32,43 @@ class MotorSetId(Enum):
 
 
 class MovementStrategy(StrEnum):
-    """Available movement-to-motor mapping strategies."""
+    """Available movement-to-motor mapping strategies.
+
+    A strategy only decides how the commanded direction is quantised. It does
+    NOT decide which kinematic model converts the resulting target point into
+    cable deltas - that is `KinematicModel`, chosen independently.
+
+    `IK` is kept for backward compatibility and is equivalent to `FREE_FORM`
+    combined with `KinematicModel.IK`.
+    """
 
     CARDINAL = "cardinal"
     CARDINAL_DIAGONAL = "cardinal_diagonal"
     FREE_FORM = "free_form"
     IK = "ik"
+
+
+class KinematicModel(StrEnum):
+    """Model used to turn a target point into per-motor cable deltas.
+
+    `PLANAR` treats each cable as a straight line from its anchor to the tactor
+    in 2-D. `IK` solves the full 3-D leg mechanism and measures Bowden-cable
+    displacement. Holding this fixed is what makes a comparison across
+    `MovementStrategy` values attributable to the strategy alone.
+    """
+
+    PLANAR = "planar"
+    IK = "ik"
+
+
+#: Kinematic model each strategy uses when none is given explicitly. This keeps
+#: existing callers (backend.py) byte-identical after the strategy/model split.
+_DEFAULT_KINEMATIC_MODEL: dict[str, "KinematicModel"] = {
+    MovementStrategy.CARDINAL: KinematicModel.PLANAR,
+    MovementStrategy.CARDINAL_DIAGONAL: KinematicModel.PLANAR,
+    MovementStrategy.FREE_FORM: KinematicModel.PLANAR,
+    MovementStrategy.IK: KinematicModel.IK,
+}
 
 
 class HandOrientation(StrEnum):
@@ -78,11 +109,12 @@ class MotorController:
         move_factor: float = 1.0,
         diagonal_threshold: float = 0.5,
         hand_orientation: HandOrientation = HandOrientation.NOT_MIRRORED,
+        kinematic_model: "KinematicModel | None" = None,
     ):
         """Create a motor controller with geometry and movement parameters.
 
         Args:
-            movement_strategy: Strategy used to transform displacement to movement.
+            movement_strategy: Direction quantisation applied to the target point.
             top_width: Width of the active movement area.
             top_height: Height of the active movement area.
             edge_threshold: Margin near the boundary where free-form motion is clipped.
@@ -91,8 +123,17 @@ class MotorController:
             diagonal_threshold: Min axis-ratio needed to classify movement as diagonal
                 in `MovementStrategy.CARDINAL_DIAGONAL`.
             hand_orientation: Whether to mirror left/right motion on the X axis.
+            kinematic_model: Model used to convert the target point into cable
+                deltas. Defaults to the model historically paired with
+                `movement_strategy`. Pass explicitly to compare strategies on a
+                fixed mechanism.
         """
         self._movement_strategy = movement_strategy
+        self._kinematic_model = (
+            kinematic_model
+            if kinematic_model is not None
+            else _DEFAULT_KINEMATIC_MODEL[movement_strategy]
+        )
         self._hand_orientation = hand_orientation
         self._top_width = top_width
         self._top_height = top_height
@@ -150,22 +191,24 @@ class MotorController:
         obj_x, obj_y = self._apply_stiffness_value(obj_x, obj_y, stiffness_value)
         obj_x, obj_y = self._apply_actuator_destination_polarity(obj_x, obj_y)
 
-        match self._movement_strategy:
-            case MovementStrategy.FREE_FORM:
-                movements = self._calculate_freeform_motor_movements(motor_set_id, obj_x, obj_y)
-            case MovementStrategy.IK:
-                movements = self._calculate_ik_motor_movements(motor_set_id, obj_x, obj_y)
-            case MovementStrategy.CARDINAL | MovementStrategy.CARDINAL_DIAGONAL:
-                direction, distance = self._determine_movement_direction(obj_x, obj_y)
-                if direction == "none":
-                    return []
+        quantised = self._movement_strategy in (
+            MovementStrategy.CARDINAL,
+            MovementStrategy.CARDINAL_DIAGONAL,
+        )
+        if quantised and obj_x == 0 and obj_y == 0:
+            # Historic behaviour: a quantised strategy emits nothing at rest,
+            # while free-form/IK still emit three explicit zero commands.
+            return []
 
-                if self._movement_strategy == MovementStrategy.CARDINAL:
-                    movements = self._calculate_cardinal_motor_movements(motor_set_id, direction, distance)
-                else:
-                    movements = self._calculate_diagonal_motor_movements(motor_set_id, direction, distance)
+        target_x, target_y = self._quantize_target(obj_x, obj_y)
+
+        match self._kinematic_model:
+            case KinematicModel.PLANAR:
+                movements = self._calculate_planar_motor_movements(motor_set_id, target_x, target_y)
+            case KinematicModel.IK:
+                movements = self._calculate_ik_motor_movements(motor_set_id, target_x, target_y)
             case _:
-                raise NotImplementedError(f"Unknown movement strategy: {self._movement_strategy}")
+                raise NotImplementedError(f"Unknown kinematic model: {self._kinematic_model}")
         return self._apply_move_factor(movements)
 
     def zero_motor_positions(self, motor_set_id: MotorSetId) -> list[MotorMovement]:
@@ -192,114 +235,78 @@ class MotorController:
         """Use the opposite target position because actuator motion is reversed."""
         return (-obj_x, -obj_y)
 
-    def _determine_movement_direction(self, obj_x: float, obj_y: float) -> tuple[str, float]:
-        """Determine movement direction and distance from displacement.
+    def resolve_target_point(
+        self,
+        obj_x: float,
+        obj_y: float,
+        stiffness_value: float = 1.0,
+    ) -> tuple[tuple[float, float], tuple[float, float]]:
+        """Return the tactor points this controller aims at, before any cables.
 
-        Diagonal directions are emitted only when strategy is
-        `MovementStrategy.CARDINAL_DIAGONAL` and axis ratio passes
-        `self._diagonal_threshold`.
+        Runs the same input conditioning as `calculate_motor_movements` but
+        stops before the kinematic model, so callers can separate the error a
+        strategy introduces by quantising from the error introduced downstream
+        by the model and integer command truncation.
 
         Returns:
-            Tuple of (`direction`, `distance`), where direction is one of:
-            `none`, `up`, `down`, `left`, `right`, `up-left`, `up-right`,
-            `down-left`, or `down-right`.
+            Tuple of (`ideal`, `quantised`) target points. `ideal` is where an
+            unquantised strategy would aim; `quantised` is where this strategy
+            actually aims. They are equal for `FREE_FORM` and `IK`.
         """
-        if obj_x == 0 and obj_y == 0:
-            return ("none", 0)
+        x, y = self._apply_hand_orientation(obj_x, obj_y)
+        x, y = self._apply_stiffness_value(x, y, stiffness_value)
+        x, y = self._apply_actuator_destination_polarity(x, y)
+        ideal = self._clamp_to_workspace(x, y)
+        quantised = self._clamp_to_workspace(*self._quantize_target(x, y))
+        return ideal, quantised
+
+    def _quantize_target(self, obj_x: float, obj_y: float) -> tuple[float, float]:
+        """Snap the target point to the directions the strategy can express.
+
+        This is the ONLY thing a `MovementStrategy` changes. It is a pure
+        point-to-point map, so a strategy comparison run on one `KinematicModel`
+        isolates direction quantisation and nothing else.
+
+        Quantisation is radius-preserving: the snapped point keeps
+        ``hypot(obj_x, obj_y)``, so only the direction is degraded, never the
+        magnitude. Diagonals are emitted only for
+        `MovementStrategy.CARDINAL_DIAGONAL` and only when the axis ratio
+        reaches `self._diagonal_threshold`.
+
+        Returns:
+            The target point the kinematic model should drive the tactor to.
+        """
+        if self._movement_strategy in (MovementStrategy.FREE_FORM, MovementStrategy.IK):
+            return (obj_x, obj_y)
 
         abs_x, abs_y = abs(obj_x), abs(obj_y)
+        if abs_x == 0 and abs_y == 0:
+            return (0.0, 0.0)
+
+        radius = math.hypot(obj_x, obj_y)
 
         if self._movement_strategy == MovementStrategy.CARDINAL_DIAGONAL and abs_x > 0 and abs_y > 0:
             ratio = min(abs_x, abs_y) / max(abs_x, abs_y)
             if ratio >= self._diagonal_threshold:
-                distance = math.sqrt(obj_x**2 + obj_y**2)
-                if obj_x < 0:
-                    direction = "up-left" if obj_y < 0 else "down-left"
-                else:
-                    direction = "up-right" if obj_y < 0 else "down-right"
-                return (direction, distance)
+                leg = radius / math.sqrt(2.0)
+                return (math.copysign(leg, obj_x), math.copysign(leg, obj_y))
 
         if abs_x > abs_y:
-            return ("left" if obj_x < 0 else "right", abs_x)
-        return ("up" if obj_y < 0 else "down", abs_y)
+            return (math.copysign(radius, obj_x), 0.0)
+        return (0.0, math.copysign(radius, obj_y))
 
-    def _calculate_cardinal_motor_movements(
-        self,
-        motor_set_id: MotorSetId,
-        direction: str,
-        distance: float,
-    ) -> list[MotorMovement]:
-        """
-        Calculate motor movements for cardinal directions only (up, down, left, right).
-
-        Motor layout (top view):
-            0 (top)
-           / \
-          2   1
-
-        Args:
-            motor_set_id: Physical motor set to control.
-            direction: Movement direction ("up", "down", "left", "right")
-            distance: Movement magnitude in the same units as `motor_spacing`.
-
-        Returns:
-            List of per-motor deltas.
-        """
-        direction_vectors = {
-            "up": (0.0, distance),
-            "down": (0.0, -distance),
-            "left": (-distance, 0.0),
-            "right": (distance, 0.0),
-        }
-        if direction not in direction_vectors:
-            raise ValueError(f"Invalid direction: {direction}. Must be one of: up, down, left, right")
-        return self._calculate_movements_to_point(motor_set_id, direction_vectors[direction])
-
-    def _calculate_diagonal_motor_movements(
-        self,
-        motor_set_id: MotorSetId,
-        direction: str,
-        distance: float,
-    ) -> list[MotorMovement]:
-        """
-        Calculate motor movements for all directions including diagonals.
-
-        Motor layout (top view):
-            0 (top)
-           / \
-          2   1
-
-        Args:
-            motor_set_id: Physical motor set to control.
-            direction: Movement direction (cardinal or diagonal)
-            distance: Movement magnitude in the same units as `motor_spacing`.
-
-        Returns:
-            List of per-motor deltas.
-        """
-        direction_vectors = {
-            "up": (0.0, distance),
-            "down": (0.0, -distance),
-            "left": (-distance, 0.0),
-            "right": (distance, 0.0),
-            "up-left": (-distance / math.sqrt(2), distance / math.sqrt(2)),
-            "up-right": (distance / math.sqrt(2), distance / math.sqrt(2)),
-            "down-left": (-distance / math.sqrt(2), -distance / math.sqrt(2)),
-            "down-right": (distance / math.sqrt(2), -distance / math.sqrt(2)),
-        }
-        if direction not in direction_vectors:
-            allowed = ", ".join(direction_vectors.keys())
-            raise ValueError(f"Invalid direction: {direction}. Must be one of: {allowed}")
-        return self._calculate_movements_to_point(motor_set_id, direction_vectors[direction])
-
-    def _calculate_freeform_motor_movements(
+    def _calculate_planar_motor_movements(
         self,
         motor_set_id: MotorSetId,
         obj_x: float,
         obj_y: float,
     ) -> list[MotorMovement]:
         """
-        Calculate motor movements for free-form movement in any direction.
+        Convert a target point into cable deltas with the planar model.
+
+        Each cable is treated as a straight 2-D line from its anchor to the
+        tactor. This is the model historically used by the cardinal,
+        cardinal-diagonal and free-form strategies.
 
         Args:
             motor_set_id: Physical motor set to control.
