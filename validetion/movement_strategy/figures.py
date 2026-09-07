@@ -41,6 +41,7 @@ def plot_reconstructed_circles(
     samples: pd.DataFrame,
     config: StudyConfig,
     output_dir: Path | None = None,
+    kinematic_model: str = "ik",
 ) -> Path:
     """Commanded circle vs each strategy's reconstruction, one panel each.
 
@@ -54,7 +55,9 @@ def plot_reconstructed_circles(
 
     for axis, strategy in zip(np.atleast_1d(axes), strategies):
         part = samples.loc[
-            samples["strategy"].eq(strategy) & samples["segment"].eq(CIRCLE_SEGMENT)
+            samples["strategy"].eq(strategy)
+            & samples["segment"].eq(CIRCLE_SEGMENT)
+            & samples["kinematic_model"].eq(kinematic_model)
         ].reset_index(drop=True)
         style = STRATEGY_STYLE[strategy]
 
@@ -114,7 +117,11 @@ def plot_reconstructed_circles(
         fontsize=11,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.93))
-    return _save(fig, "reconstructed_circles_by_strategy.png", output_dir)
+    return _save(fig, f"reconstructed_circles_{kinematic_model}.png", output_dir)
+
+
+MODEL_HATCH = {"planar": "", "ik": "//"}
+MODEL_LABEL = {"planar": "Planar model", "ik": "IK model"}
 
 
 def plot_error_decomposition(
@@ -123,56 +130,76 @@ def plot_error_decomposition(
     config: StudyConfig,
     output_dir: Path | None = None,
 ) -> Path:
-    """Quantisation vs execution error: the strategy cost against the noise floor."""
-    fig, (ax_trace, ax_bar) = plt.subplots(1, 2, figsize=(13.5, 5.0))
+    """The full strategy x model factorial, split into its two effects.
 
-    for strategy in (s.value for s in config.strategies):
-        part = samples.loc[samples["strategy"].eq(strategy)]
-        style = STRATEGY_STYLE[strategy]
-        ax_trace.plot(
-            part["step"],
-            part["total_error"],
-            color=style["color"],
-            linewidth=1.6,
-            label=style["label"],
+    Left: reading within a model gives the quantisation (strategy) effect;
+    comparing hatched against plain gives the model effect. Right: command
+    effort, where the model effect dominates - this is the difference the
+    historic CD-vs-IK comparison actually measured while attributing it to
+    the strategy.
+    """
+    order = [s.value for s in config.strategies]
+    models = [m.value for m in config.kinematic_models]
+    positions = np.arange(len(order))
+    width = 0.8 / (len(models) * 2)
+
+    fig, (ax_error, ax_effort) = plt.subplots(1, 2, figsize=(14.5, 5.4))
+
+    for model_index, model in enumerate(models):
+        quantisation = [metrics.loc[(model, s), "quantisation_rms"] for s in order]
+        execution = [metrics.loc[(model, s), "execution_rms"] for s in order]
+        offset = (model_index * 2 - len(models) + 0.5) * width
+
+        quantisation_bars = ax_error.bar(
+            positions + offset,
+            quantisation,
+            width,
+            color="#d7191c",
+            hatch=MODEL_HATCH[model],
+            edgecolor="white",
+            label=f"Quantisation - {MODEL_LABEL[model]}",
+        )
+        execution_bars = ax_error.bar(
+            positions + offset + width,
+            execution,
+            width,
+            color="#2c7bb6",
+            hatch=MODEL_HATCH[model],
+            edgecolor="white",
+            label=f"Execution - {MODEL_LABEL[model]}",
+        )
+        # The execution bars are ~20x shorter than the quantisation bars, which
+        # is the point - but it makes them unreadable, so label every value.
+        for bars in (quantisation_bars, execution_bars):
+            ax_error.bar_label(bars, fmt="%.2f", fontsize=7, padding=1, rotation=90)
+
+        ax_effort.bar(
+            positions + (model_index - len(models) / 2 + 0.5) * 0.35,
+            [metrics.loc[(model, s), "rms_command"] for s in order],
+            0.35,
+            color="#5e3c99" if model == "planar" else "#e66101",
+            label=MODEL_LABEL[model],
         )
 
-    ax_trace.axvspan(0, config.line_steps, color="0.93", zorder=0)
-    ax_trace.axvspan(
-        config.line_steps + config.circle_steps,
-        config.line_steps + config.circle_steps + config.return_steps,
-        color="0.93",
-        zorder=0,
+    ax_error.set_xticks(positions)
+    ax_error.set_xticklabels([STRATEGY_STYLE[s]["label"] for s in order], fontsize=9)
+    ax_error.set_ylabel("RMS error (controller units)")
+    ax_error.set_title(
+        "Strategy cost vs execution floor\n"
+        "quantisation is identical across models, as it must be"
     )
-    ax_trace.set_xlabel("Path step")
-    ax_trace.set_ylabel("Total error (controller units)")
-    ax_trace.set_title("Distance from the commanded point, per step")
-    ax_trace.grid(True, alpha=0.3)
-    ax_trace.legend(fontsize=9)
+    ax_error.grid(True, alpha=0.3, axis="y")
+    ax_error.legend(fontsize=8)
 
-    order = [s.value for s in config.strategies]
-    positions = np.arange(len(order))
-    width = 0.38
-    ax_bar.bar(
-        positions - width / 2,
-        metrics.loc[order, "quantisation_rms"],
-        width,
-        label="Quantisation (strategy)",
-        color="#d7191c",
+    ax_effort.set_xticks(positions)
+    ax_effort.set_xticklabels([STRATEGY_STYLE[s]["label"] for s in order], fontsize=9)
+    ax_effort.set_ylabel("RMS motor command (controller units)")
+    ax_effort.set_title(
+        "Command effort is a MODEL effect, not a strategy effect\n"
+        "the IK mechanism transmits ~3.8x less cable travel per unit of tactor motion"
     )
-    ax_bar.bar(
-        positions + width / 2,
-        metrics.loc[order, "execution_rms"],
-        width,
-        label="Execution (model + truncation)",
-        color="#2c7bb6",
-    )
-    ax_bar.set_xticks(positions)
-    ax_bar.set_xticklabels([STRATEGY_STYLE[s]["label"] for s in order], fontsize=9)
-    ax_bar.set_ylabel("RMS error (controller units)")
-    ax_bar.set_title("Strategy cost vs shared noise floor")
-    ax_bar.grid(True, alpha=0.3, axis="y")
-    ax_bar.legend(fontsize=9)
+    ax_effort.grid(True, alpha=0.3, axis="y")
+    ax_effort.legend(fontsize=9)
 
     fig.tight_layout()
     return _save(fig, "error_decomposition.png", output_dir)
@@ -185,12 +212,19 @@ def plot_motor_commands(
 ) -> Path:
     """Motor commands per strategy - now comparable, one model for every row."""
     strategies = [s.value for s in config.strategies]
+    models = [m.value for m in config.kinematic_models]
     fig, axes = plt.subplots(
-        len(strategies), 1, figsize=(12, 3.1 * len(strategies)), sharex=True, sharey=True
+        len(strategies), len(models),
+        figsize=(6.5 * len(models), 3.1 * len(strategies)),
+        sharex=True, sharey=True, squeeze=False,
     )
 
-    for axis, strategy in zip(np.atleast_1d(axes), strategies):
-        part = samples.loc[samples["strategy"].eq(strategy)]
+    for row, strategy in enumerate(strategies):
+      for column, model in enumerate(models):
+        axis = axes[row][column]
+        part = samples.loc[
+            samples["strategy"].eq(strategy) & samples["kinematic_model"].eq(model)
+        ]
         for motor_index, shade in enumerate(("#7b3294", "#c2a5cf", "#008837")):
             axis.plot(
                 part["step"],
@@ -200,16 +234,19 @@ def plot_motor_commands(
                 label=f"Motor {motor_index}",
             )
         axis.axhline(0.0, color="0.4", linewidth=1.0)
-        axis.set_title(STRATEGY_STYLE[strategy]["label"], fontsize=11)
+        axis.set_title(
+            f"{STRATEGY_STYLE[strategy]['label']} - {MODEL_LABEL[model]}", fontsize=10
+        )
         axis.set_ylabel("Command")
         axis.grid(True, alpha=0.3)
         axis.legend(fontsize=8, ncol=3, loc="upper right")
 
-    np.atleast_1d(axes)[-1].set_xlabel("Path step")
+    for axis in axes[-1]:
+        axis.set_xlabel("Path step")
     fig.suptitle(
-        "Motor commands on a fixed kinematic model. Amplitude is near-identical across "
-        "strategies;\nthe real difference is the discontinuous jump when a quantised "
-        "direction snaps to a new sector.",
+        "Motor commands, every strategy on both models (shared y axis).\n"
+        "Amplitude is set by the MODEL, not the strategy; the strategy's own signature is "
+        "the discontinuous jump when a quantised direction snaps to a new sector.",
         fontsize=11,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.94))
@@ -223,7 +260,10 @@ def save_all(
     output_dir: Path | None = None,
 ) -> list[Path]:
     return [
-        plot_reconstructed_circles(samples, config, output_dir),
+        *(
+            plot_reconstructed_circles(samples, config, output_dir, model.value)
+            for model in config.kinematic_models
+        ),
         plot_error_decomposition(samples, metrics, config, output_dir),
         plot_motor_commands(samples, config, output_dir),
     ]

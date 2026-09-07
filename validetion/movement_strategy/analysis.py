@@ -87,8 +87,11 @@ class StudyConfig:
     stiffness_value: float = 1.0
     hand_orientation: HandOrientation = HandOrientation.NOT_MIRRORED
 
-    #: Held fixed across strategies. That is the point of the study.
-    kinematic_model: KinematicModel = KinematicModel.IK
+    #: Both models are run so the design is a full factorial. Holding the model
+    #: fixed and varying the strategy gives the quantisation effect; holding the
+    #: strategy fixed and varying the model gives the model effect. The two were
+    #: previously confounded by comparing CD-on-planar against free-form-on-IK.
+    kinematic_models: tuple[KinematicModel, ...] = (KinematicModel.PLANAR, KinematicModel.IK)
 
     # Commanded path: line out, one full circle, line back.
     outward_fraction_of_half_width: float = 0.5
@@ -131,7 +134,44 @@ def build_commanded_path(config: StudyConfig) -> pd.DataFrame:
     return path
 
 
-def _make_controller(strategy: MovementStrategy, config: StudyConfig) -> MotorController:
+def planar_anchors(config: StudyConfig) -> np.ndarray:
+    """The 2-D anchor triangle, in controller units (order: top, right, left)."""
+    anchors = ik_module.default_model()["anchors"]
+    base_span = math.hypot(
+        anchors["right"][0] - anchors["left"][0],
+        anchors["right"][1] - anchors["left"][1],
+    )
+    scale = config.motor_spacing / base_span
+    return np.array([anchors[leg][:2] for leg in ("top", "right", "left")], float) * scale
+
+
+def _trilaterate(anchors: np.ndarray, lengths: np.ndarray) -> tuple[float, float, float]:
+    """Least-squares planar trilateration: the inverse of the planar model.
+
+    Returns (x, y, residual_rms). The residual is a self-consistency measure of
+    the three distances, not a reconstruction error.
+    """
+    first, first_length = anchors[0], lengths[0]
+    design, target = [], []
+    for index in (1, 2):
+        xi, yi = anchors[index]
+        design.append([2.0 * (xi - first[0]), 2.0 * (yi - first[1])])
+        target.append(
+            (first_length**2 - lengths[index] ** 2)
+            - (first[0] ** 2 - xi**2)
+            - (first[1] ** 2 - yi**2)
+        )
+    solution, *_ = np.linalg.lstsq(np.asarray(design, float), np.asarray(target, float), rcond=None)
+    x, y = float(solution[0]), float(solution[1])
+    predicted = np.linalg.norm(anchors - np.array([x, y]), axis=1)
+    return x, y, float(np.sqrt(np.mean((predicted - lengths) ** 2)))
+
+
+def _make_controller(
+    strategy: MovementStrategy,
+    kinematic_model: KinematicModel,
+    config: StudyConfig,
+) -> MotorController:
     return MotorController(
         movement_strategy=strategy,
         top_width=config.top_width,
@@ -141,26 +181,35 @@ def _make_controller(strategy: MovementStrategy, config: StudyConfig) -> MotorCo
         move_factor=config.move_factor,
         diagonal_threshold=config.diagonal_threshold,
         hand_orientation=config.hand_orientation,
-        kinematic_model=config.kinematic_model,
+        kinematic_model=kinematic_model,
     )
 
 
 def simulate_strategy(
     strategy: MovementStrategy,
+    kinematic_model: KinematicModel,
     path: pd.DataFrame,
     config: StudyConfig,
 ) -> pd.DataFrame:
-    """Drive one strategy along the commanded path and decode the result.
+    """Drive one strategy/model pair along the path and decode the result.
+
+    Each model is decoded by its own inverse - trilateration for `PLANAR`, wire
+    FK for `IK` - because a decoder must match the encoder that produced the
+    cable deltas. Both decoders return a position in controller units, so the
+    reconstructed points remain directly comparable across models.
 
     Returns one row per step with the ideal target, the quantised target, the
     reconstructed tactor position and the three motor commands.
     """
-    controller = _make_controller(strategy, config)
+    controller = _make_controller(strategy, kinematic_model, config)
     model = controller._get_ik_model()
     sim_to_ik = controller._get_ik_base_span(model) / config.motor_spacing
     ik_to_sim = 1.0 / sim_to_ik
     rest_p1 = wire_fk.rest_pose(model)
     previous_p1 = rest_p1.copy()
+
+    anchors = planar_anchors(config)
+    rest_lengths = np.linalg.norm(anchors - np.array([0.0, 0.0]), axis=1)
 
     positions = {0: 0, 1: 0, 2: 0}
     rows: list[dict[str, float | str | bool]] = []
@@ -182,19 +231,28 @@ def simulate_strategy(
                 positions[movement.index] = movement.pos
 
         commands = np.array([positions[0], positions[1], positions[2]], dtype=float)
-        solution = wire_fk.solve_wire_fk(
-            commands * sim_to_ik, model, initial_P1=previous_p1, rest_P1=rest_p1
-        )
-        previous_p1 = solution.P1
 
-        reconstructed = (
-            float(solution.P1[0] * ik_to_sim),
-            float(solution.P1[1] * ik_to_sim),
-        )
+        if kinematic_model is KinematicModel.IK:
+            solution = wire_fk.solve_wire_fk(
+                commands * sim_to_ik, model, initial_P1=previous_p1, rest_P1=rest_p1
+            )
+            previous_p1 = solution.P1
+            reconstructed = (
+                float(solution.P1[0] * ik_to_sim),
+                float(solution.P1[1] * ik_to_sim),
+            )
+            decode_valid = bool(solution.valid)
+            decode_residual = float(solution.residual_rms * ik_to_sim)
+        else:
+            lengths = rest_lengths + commands
+            x, y, decode_residual = _trilaterate(anchors, lengths)
+            reconstructed = (x, y)
+            decode_valid = bool(np.all(lengths > 0.0))
 
         rows.append(
             {
                 "strategy": strategy.value,
+                "kinematic_model": kinematic_model.value,
                 "step": int(record.step),
                 "segment": record.segment,
                 "object_x": float(record.x),
@@ -208,8 +266,8 @@ def simulate_strategy(
                 "motor_0": commands[0],
                 "motor_1": commands[1],
                 "motor_2": commands[2],
-                "fk_valid": bool(solution.valid),
-                "fk_residual": float(solution.residual_rms * ik_to_sim),
+                "decode_valid": decode_valid,
+                "decode_residual": decode_residual,
                 "quantisation_error": math.dist(ideal, quantised),
                 "execution_error": math.dist(quantised, reconstructed),
                 "total_error": math.dist(ideal, reconstructed),
@@ -239,11 +297,20 @@ def _circle_fit_rms(points: np.ndarray) -> float:
 
 
 def strategy_metrics(samples: pd.DataFrame, config: StudyConfig) -> pd.DataFrame:
-    """One row per strategy. All values in controller units."""
+    """One row per (kinematic model, strategy). All values in controller units."""
     rows: list[dict[str, float | str | int]] = []
 
-    for strategy in config.strategies:
-        part = samples.loc[samples["strategy"].eq(strategy.value)]
+    pairs = [
+        (kinematic_model, strategy)
+        for kinematic_model in config.kinematic_models
+        for strategy in config.strategies
+    ]
+
+    for kinematic_model, strategy in pairs:
+        part = samples.loc[
+            samples["strategy"].eq(strategy.value)
+            & samples["kinematic_model"].eq(kinematic_model.value)
+        ]
         circle = part.loc[part["segment"].eq(CIRCLE_SEGMENT)]
         reconstructed = circle[["reconstructed_x", "reconstructed_y"]].to_numpy(float)
 
@@ -255,12 +322,13 @@ def strategy_metrics(samples: pd.DataFrame, config: StudyConfig) -> pd.DataFrame
 
         rows.append(
             {
+                "kinematic_model": kinematic_model.value,
                 "strategy": strategy.value,
                 "samples": int(len(part)),
-                # --- what the strategy costs ---
+                # --- what the strategy costs (model-independent by construction) ---
                 "quantisation_rms": float(np.sqrt(np.mean(part["quantisation_error"] ** 2))),
                 "quantisation_max": float(part["quantisation_error"].max()),
-                # --- shared noise floor (model + integer truncation) ---
+                # --- what the model + integer truncation cost ---
                 "execution_rms": float(np.sqrt(np.mean(part["execution_error"] ** 2))),
                 "execution_max": float(part["execution_error"].max()),
                 # --- end to end ---
@@ -277,38 +345,56 @@ def strategy_metrics(samples: pd.DataFrame, config: StudyConfig) -> pd.DataFrame
                         (last["ideal_x"], last["ideal_y"]),
                     )
                 ),
-                # --- command effort (comparable: one model for all rows) ---
+                # --- command effort ---
                 "peak_abs_command": float(np.abs(commands).max()),
                 "rms_command": float(np.sqrt(np.mean(commands**2))),
                 "total_motor_travel": float(np.abs(steps).sum()),
                 "max_step_jump": float(np.abs(steps).max()),
-                "fk_invalid_steps": int((~part["fk_valid"]).sum()),
+                "decode_invalid_steps": int((~part["decode_valid"]).sum()),
             }
         )
 
-    return pd.DataFrame(rows).set_index("strategy")
+    return pd.DataFrame(rows).set_index(["kinematic_model", "strategy"])
 
 
 def run_study(config: StudyConfig | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run every strategy on the fixed model. Returns (samples, metrics)."""
+    """Run the full strategy x model factorial. Returns (samples, metrics)."""
     config = config or StudyConfig()
     path = build_commanded_path(config)
     samples = pd.concat(
-        [simulate_strategy(strategy, path, config) for strategy in config.strategies],
+        [
+            simulate_strategy(strategy, kinematic_model, path, config)
+            for kinematic_model in config.kinematic_models
+            for strategy in config.strategies
+        ],
         ignore_index=True,
     )
     return samples, strategy_metrics(samples, config)
+
+
+def effect_summary(metrics: pd.DataFrame) -> pd.DataFrame:
+    """Separate the quantisation effect from the model effect.
+
+    Reading the factorial down a column gives the strategy effect at a fixed
+    model; reading across a row gives the model effect at a fixed strategy. The
+    historic "CD vs IK" comparison was the off-diagonal of this table, which is
+    why it could not attribute its result to either cause.
+    """
+    return metrics["total_rms"].unstack("kinematic_model").rename_axis(columns="model")
 
 
 if __name__ == "__main__":
     study_config = StudyConfig()
     study_samples, study_metrics = run_study(study_config)
 
-    pd.set_option("display.width", 200)
+    cells = len(study_config.strategies) * len(study_config.kinematic_models)
+    pd.set_option("display.width", 220)
+    pd.set_option("display.max_columns", 50)
     print(
-        f"Commanded path: {len(study_samples) // len(study_config.strategies)} samples, "
-        f"radius {study_config.radius:.0f} controller units, "
-        f"model held fixed at {study_config.kinematic_model.value}."
+        f"Commanded path: {len(study_samples) // cells} samples, "
+        f"radius {study_config.radius:.0f} controller units. "
+        f"Factorial: {len(study_config.strategies)} strategies x "
+        f"{len(study_config.kinematic_models)} kinematic models."
     )
     print("\nAll values in controller units.\n")
     print(
@@ -324,9 +410,11 @@ if __name__ == "__main__":
             ]
         ].round(3)
     )
-    print("\nCommand effort (comparable - one kinematic model for every row):\n")
+    print("\nCommand effort:\n")
     print(
         study_metrics[
             ["peak_abs_command", "rms_command", "total_motor_travel", "max_step_jump"]
         ].round(3)
     )
+    print("\nTotal RMS error, strategy (rows) x model (columns):\n")
+    print(effect_summary(study_metrics).round(2))
