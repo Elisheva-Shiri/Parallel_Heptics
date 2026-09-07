@@ -1,9 +1,16 @@
 import math
 from dataclasses import dataclass
-from enum import Enum, StrEnum
+from enum import Enum
 from typing import Any
 
 from kinematics import unified_ik_starter as ik
+from kinematics import wire_forward_kinematics as wire_fk
+
+try:
+    from enum import StrEnum
+except ImportError:  # Python < 3.11 notebook kernels
+    class StrEnum(str, Enum):
+        pass
 
 
 class MotorSetId(Enum):
@@ -96,6 +103,7 @@ class MotorController:
         self._ik_module: Any | None = None
         self._ik_model: dict[str, Any] | None = None
         self._ik_wire_reference: dict[str, float] | None = None
+        self._ik_rest_result: dict[str, Any] | None = None
         self._ik_previous_angles: dict[str, dict[str, float]] | None = None
 
     def build_message(self, motors: list[MotorMovement]) -> str:
@@ -336,11 +344,10 @@ class MotorController:
 
         self._ik_previous_angles = self._extract_ik_angles(result)
         base_motor_idx = motor_set_id.base_index
+        wire_deltas = self._calculate_ik_mechanism_wire_deltas(result, model)
         movements: list[MotorMovement] = []
         for i, leg in enumerate(("top", "right", "left")):
-            wire_length = self._calculate_ik_tactor_wire_length(leg, p1, model)
-            wire_delta = wire_length - self._ik_wire_reference[leg]
-            movements.append(MotorMovement(pos=int(wire_delta * ik_to_sim_scale), index=base_motor_idx + i))
+            movements.append(MotorMovement(pos=int(wire_deltas[leg] * ik_to_sim_scale), index=base_motor_idx + i))
         return movements
 
     def _get_ik_module(self) -> Any:
@@ -364,7 +371,8 @@ class MotorController:
             raise ValueError("IK origin reference is invalid.")
 
         reference_p1 = result["shared"]["P1"]
-        self._ik_wire_reference = self._calculate_ik_wire_reference(reference_p1, model)
+        self._ik_rest_result = result
+        self._ik_wire_reference = {leg: 0.0 for leg in ("top", "right", "left")}
         self._ik_previous_angles = self._extract_ik_angles(result)
 
     def _reset_ik_state_to_origin(self) -> None:
@@ -378,18 +386,49 @@ class MotorController:
         if not all(result[leg]["valid"] for leg in ("top", "right", "left")):
             raise ValueError("IK origin reference is invalid.")
 
-        self._ik_wire_reference = self._calculate_ik_wire_reference(result["shared"]["P1"], model)
+        self._ik_rest_result = result
+        self._ik_wire_reference = {leg: 0.0 for leg in ("top", "right", "left")}
         self._ik_previous_angles = self._extract_ik_angles(result)
 
-    def _calculate_ik_wire_reference(
+    def _calculate_ik_mechanism_wire_deltas(
         self,
-        p1: tuple[float, float, float],
+        result: dict[str, Any],
         model: dict[str, Any],
     ) -> dict[str, float]:
-        return {
-            leg: self._calculate_ik_tactor_wire_length(leg, p1, model)
-            for leg in ("top", "right", "left")
-        }
+        """Return actuator cable deltas from the solved mechanism geometry.
+
+        This is the final "Compute ΔLi" step in the IK flowchart.  The IK solver
+        provides each leg's selected ``P3`` branch; the Bowden cable model then
+        measures how the cable attachment on the first link moved relative to
+        the calibrated rest pose.
+        """
+        if self._ik_rest_result is None:
+            self._ensure_ik_wire_reference()
+        if self._ik_rest_result is None:
+            raise ValueError("IK rest reference is invalid.")
+
+        deltas: dict[str, float] = {}
+        attachment_fraction = wire_fk.CABLE_ATTACHMENT_FRACTION
+        for leg in ("top", "right", "left"):
+            pb = model["anchors"][leg]
+            p3 = result[leg]["selected_P3"]
+            p3_ref = self._ik_rest_result[leg]["selected_P3"]
+            attachment = (
+                pb[0] + attachment_fraction * (p3[0] - pb[0]),
+                pb[1] + attachment_fraction * (p3[1] - pb[1]),
+                pb[2] + attachment_fraction * (p3[2] - pb[2]),
+            )
+            reference_attachment = (
+                pb[0] + attachment_fraction * (p3_ref[0] - pb[0]),
+                pb[1] + attachment_fraction * (p3_ref[1] - pb[1]),
+                pb[2] + attachment_fraction * (p3_ref[2] - pb[2]),
+            )
+            exit_direction = wire_fk._cable_exit_direction(leg, model)
+            deltas[leg] = wire_fk.WIRE_RELEASE_SIGN * sum(
+                (attachment[axis] - reference_attachment[axis]) * float(exit_direction[axis])
+                for axis in range(3)
+            )
+        return deltas
 
     def _calculate_ik_tactor_wire_length(
         self,

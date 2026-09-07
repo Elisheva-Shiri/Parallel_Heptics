@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from motor_controller import HandOrientation, MotorController, MotorMovement, MotorSetId, MovementStrategy
+from kinematics import wire_forward_kinematics as wire_fk
 
 
 def _to_tuples(movements):
@@ -230,7 +231,7 @@ def test_ik_strategy_returns_three_scaled_motor_commands():
     assert any(movement.pos != 0 for movement in actual)
 
 
-def test_ik_strategy_translates_target_to_tactor_wire_deltas():
+def test_ik_strategy_translates_target_to_mechanism_wire_deltas():
     controller = _make_controller(MovementStrategy.IK)
     model = controller._get_ik_model()
     obj_x = 120.0
@@ -254,11 +255,11 @@ def test_ik_strategy_translates_target_to_tactor_wire_deltas():
         controller._get_ik_tactor_z(model),
     )
     reference_p1 = (0.0, 0.0, controller._get_ik_tactor_z(model))
-    expected = []
-    for index, leg in enumerate(("top", "right", "left"), start=MotorSetId.MOTORS_3_5.base_index):
-        wire_length = controller._calculate_ik_tactor_wire_length(leg, p1, model)
-        reference_length = controller._calculate_ik_tactor_wire_length(leg, reference_p1, model)
-        expected.append((index, int((wire_length - reference_length) * ik_to_sim_scale)))
+    expected_deltas, _ = wire_fk.pose_to_wire_deltas(p1, model, rest_P1=reference_p1)
+    expected = [
+        (index, int(delta * ik_to_sim_scale))
+        for index, delta in enumerate(expected_deltas, start=MotorSetId.MOTORS_3_5.base_index)
+    ]
 
     assert _to_tuples(actual) == expected
 
