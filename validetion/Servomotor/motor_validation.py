@@ -170,6 +170,9 @@ def merged_table_latex(m: pd.DataFrame, radius_mm: float = DEFAULT_SPOOL_RADIUS_
                        n_per_direction: int = 18, label: str = "tab:motor_validation") -> str:
     """The merged table as a single-column IEEEtran float (needs booktabs + array).
 
+    The caption is deliberately one line; the column definitions belong in the
+    body text (see README, section 5). ``radius_mm`` is kept for the caller.
+
     Single-column on purpose: in two-column mode a ``table*`` can only sit at the
     top of a page and never on the page it is written on, so it always drifts to
     the next page. This form stays next to the paragraph that cites it.
@@ -178,12 +181,9 @@ def merged_table_latex(m: pd.DataFrame, radius_mm: float = DEFAULT_SPOOL_RADIUS_
         r"\begin{table}[!h]",
         r"\centering",
         r"\fontsize{7.5}{9}\selectfont",
-        r"\caption{Motor validation pooled over three runs ($n = " + str(n_per_direction)
-        + r"$ per direction and amplitude). $+\Delta$/$-\Delta$: trial-local rotation, mean\,$\pm$\,SD. "
-        + r"Error: $|\bar\theta|$ vs.\ the nominal $0.09^\circ$/tick scale. "
-        + r"Hyst.: angle at commanded 0 after $+\Delta$ minus after $-\Delta$, mean\,$\pm$\,SE. "
-        + r"Cable: $|\bar\theta|$ as cable displacement at the " + f"{radius_mm:g}" + r"\,mm spool. "
-        + r"The 1000-tick row is a range check at the detector's orientation limit.}\label{" + label + "}",
+        r"\caption{Motor validation: measured spool rotation per command amplitude, "
+        r"pooled over three runs ($n = " + str(n_per_direction) + r"$ per direction).}"
+        + r"\label{" + label + "}",
         r"\setlength{\tabcolsep}{2.5pt}",
         r"\renewcommand{\arraystretch}{1.05}",
         r"\begin{tabular}{@{}r r r@{\,$\pm$\,}l r@{\,$\pm$\,}l r r r@{\,$\pm$\,}l r@{}}",
