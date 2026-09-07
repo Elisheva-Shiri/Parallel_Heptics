@@ -94,7 +94,8 @@ class ExperimentConfig:
     camera_fps: float = 30.0
 
     # Vision
-    roi_mode: str = "both"         # auto | manual | both
+    roi_mode: str = "both"              # auto | manual | both
+    roi: tuple[int, int, int] | None = None   # (cx, cy, radius); skips detection
     line_threshold: int | None = None
     radial_inset: float = 0.92
     background_drop: float = 0.55
@@ -159,6 +160,11 @@ def _pick_initial_roi(cfg: ExperimentConfig, camera: CameraRecorder | None) -> S
     if frame is None:
         print("[vision] WARNING: no camera frame available for ROI selection")
         return None
+
+    if cfg.roi is not None:
+        cx, cy, radius = cfg.roi
+        print(f"[vision] ROI pinned by --roi: cx={cx} cy={cy} r={radius}")
+        return SpoolROI(cx=cx, cy=cy, radius=radius)
 
     roi: SpoolROI | None = None
     if cfg.roi_mode in ("auto", "both"):
@@ -487,6 +493,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--camera-width", type=int, default=None)
     p.add_argument("--camera-height", type=int, default=None)
     p.add_argument("--roi-mode", choices=["auto", "manual", "both"], default="both")
+    p.add_argument(
+        "--roi",
+        type=int,
+        nargs=3,
+        default=None,
+        metavar=("CX", "CY", "R"),
+        help="Pin the spool ROI in pixels and skip detection. Essential when several "
+             "identical spools are in frame, where auto-detection may lock onto a "
+             "different one from run to run.",
+    )
     p.add_argument("--no-confirm-roi", action="store_true", help="Skip the ROI confirmation popup")
     p.add_argument("--no-frames", action="store_true", help="Do not save per-step frames")
     p.add_argument("--no-video", action="store_true", help="Do not save the continuous video")
@@ -521,6 +537,7 @@ def main() -> None:
         camera_width=args.camera_width,
         camera_height=args.camera_height,
         roi_mode=args.roi_mode,
+        roi=tuple(args.roi) if args.roi else None,
         confirm_roi=not args.no_confirm_roi,
         save_frames=not args.no_frames,
         save_video=not args.no_video,

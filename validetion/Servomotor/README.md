@@ -80,6 +80,7 @@ python run_experiment.py --dry-run --no-camera --settle-ms 0 --inter-command-ms 
 | `--trials-per-sequence` | `3` | repeats of each A/B sequence per delta |
 | `--drift-pairs` | `10` | `(+D,-D)` pairs in the drift block per delta |
 | `--roi-mode` | `both` | `auto` / `manual` / `both` (auto, then manual fallback) |
+| `--roi CX CY R` | *(detect)* | pin the spool ROI in pixels, skipping detection |
 | `--no-confirm-roi` | off | skip the ROI confirmation window |
 | `--no-frames` | off | do not save the per-step JPEGs |
 | `--no-video` | off | do not save the continuous MP4 |
@@ -88,6 +89,50 @@ python run_experiment.py --dry-run --no-camera --settle-ms 0 --inter-command-ms 
 | `--no-camera` | off | run the protocol with no vision data |
 | `--no-plots` | off | skip the automatic `analyze.py` pass |
 | `--output-root` | `responses/` | parent folder for the timestamped run folders |
+
+### Several spools in frame
+
+The rig carries three identical spools on one bracket. `--roi-mode auto` picks a
+single circle by brightness and size, and with identical spools that choice is
+not stable: consecutive runs on the same scene have locked onto different
+spools. If it picks one the commanded motor does not drive, the run completes
+with `actual == target` on every row and angle changes of ~0 deg. It looks like
+a dead motor; it is a misaimed ROI.
+
+So identify the spool once, then pin it with `--roi`. To find which spool a
+motor drives, command it and see what moves:
+
+```powershell
+uv run python -c @'
+import cv2, numpy as np, time
+from motor_io import MotorSerial
+from vision_angle import SpoolAngleDetector, SpoolROI
+cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+def grab():
+    t=time.time(); f=None
+    while time.time()-t<1.5:
+        ok,x=cap.read()
+        if ok: f=x
+    return f
+g = cv2.medianBlur(cv2.cvtColor(grab(), cv2.COLOR_BGR2GRAY), 5)
+c = cv2.HoughCircles(g, cv2.HOUGH_GRADIENT, dp=1.2, minDist=60, param1=120,
+                     param2=30, minRadius=25, maxRadius=55)
+circles = sorted(np.round(c[0]).astype(int), key=lambda z: z[1])
+dets = [SpoolAngleDetector(SpoolROI(int(x),int(y),int(r))) for x,y,r in circles]
+m = MotorSerial(port="COM13"); m.open()
+m.send(0, 0); time.sleep(1.2); a0 = [d.measure(grab()).angle_deg for d in dets]
+m.send(0, 250); time.sleep(1.5); a1 = [d.measure(grab()).angle_deg for d in dets]
+m.send(0, 0); m.close(); cap.release()
+for i,(p,q) in enumerate(zip(a0,a1)):
+    d = (q-p+90)%180-90
+    print(f"spool {i} at {tuple(circles[i])}: {d:+.2f} deg", "<== MOVED" if abs(d)>3 else "")
+'@
+```
+
+Then pass that spool: `--roi 430 155 41`.
+
+Re-check the numbers whenever the camera or bracket is moved; the circle centres
+shift with it.
 
 ### Short hardware check (~30 s)
 
@@ -105,15 +150,21 @@ uv run python run_experiment.py --dry-run --no-camera --settle-ms 0 --inter-comm
 # 2. camera only - check the ROI is found and the angle is measured
 uv run python run_experiment.py --dry-run --deltas 250 --trials-per-sequence 1 --drift-pairs 2
 
-# 3. the real thing, short
+# 3. the real thing, short - pin the ROI to the spool the motor actually drives
 uv run python run_experiment.py --port COM13 --camera-index 1 `
-    --deltas 250 --trials-per-sequence 1 --drift-pairs 2
+    --deltas 250 --trials-per-sequence 1 --drift-pairs 2 `
+    --roi 430 155 41 --no-confirm-roi
 ```
 
 Step 3 should print `protocol: 14 steps over 1 deltas`, then 14 rows where
-`actual` equals `target` and `angle` moves by roughly +/-22 deg for a 250-tick
-command. Check `frames/` shows the red line tracking the spool line before
-committing to a full run.
+`actual` equals `target` and `angle` moves by roughly +/-20 deg for a 250-tick
+command, returning to the same rest angle at every target-0 step. Check
+`frames/` shows the red line on the correct spool, tracking its dark line,
+before committing to a full run.
+
+Test runs land in `responses/` like any other run, and the cross-run tools treat
+everything there as real data. Move throwaway runs out (e.g. to
+`output/testruns/`) so they do not enter the manuscript figures.
 
 **Timing matters for target/angle alignment.** After each command the runner
 waits `--settle-ms`, then takes a frame whose capture time is *strictly after*
