@@ -166,12 +166,11 @@ def _tex_num(value: float, fmt: str) -> str:
     return "$-$" + text[1:] if text.startswith("-") else text
 
 
-def merged_table_latex(m: pd.DataFrame, radius_mm: float = DEFAULT_SPOOL_RADIUS_MM,
-                       n_per_direction: int = 18, label: str = "tab:motor_validation") -> str:
+def merged_table_latex(m: pd.DataFrame, n_per_direction: int = 18, label: str = "tab:motor_validation") -> str:
     """The merged table as a single-column IEEEtran float (needs booktabs + array).
 
     The caption is deliberately one line; the column definitions belong in the
-    body text (see README, section 5). ``radius_mm`` is kept for the caller.
+    body text (see README, section 5).
 
     Single-column on purpose: in two-column mode a ``table*`` can only sit at the
     top of a page and never on the page it is written on, so it always drifts to
@@ -327,7 +326,7 @@ def run(
     k, r2 = fit_gain(t)
     res = resolution_table(t, k, spool_radius_mm)
     m = merged_table(t, h, spool_radius_mm)
-    latex = merged_table_latex(m, spool_radius_mm, int(t["n_pos"].iloc[0]))
+    latex = merged_table_latex(m, int(t["n_pos"].iloc[0]))
 
     out = results_root / selection
     csv = out / "csv"
