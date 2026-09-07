@@ -14,14 +14,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from analysis import CIRCLE_SEGMENT, StudyConfig
+from analysis import CIRCLE_SEGMENT, StudyConfig, ingredient_grid, strategy_positions
 
 FIGURE_DIR = Path(__file__).resolve().parent / "figures"
 
 STRATEGY_STYLE: dict[str, dict[str, object]] = {
-    "cardinal": {"color": "#d7191c", "label": "Cardinal (4-way)"},
-    "cardinal_diagonal": {"color": "#fdae61", "label": "Cardinal-diagonal (8-way)"},
-    "free_form": {"color": "#2c7bb6", "label": "Free-form (continuous)"},
+    "cardinal": {"color": "#d7191c", "label": "Cardinal\n(4-way, planar)"},
+    "cardinal_diagonal": {"color": "#fdae61", "label": "Cardinal-diagonal\n(8-way, planar)"},
+    "free_form": {"color": "#2c7bb6", "label": "Free-form\n(continuous, planar)"},
+    "ik": {"color": "#1a9641", "label": "IK\n(continuous, 3-D mechanism)"},
 }
 COMMANDED_STYLE = {"color": "0.45", "linestyle": "--", "linewidth": 2.0}
 
@@ -37,27 +38,23 @@ def _save(fig: plt.Figure, name: str, output_dir: Path | None) -> Path:
     return path
 
 
-def plot_reconstructed_circles(
+def plot_reconstructed_paths(
     samples: pd.DataFrame,
     config: StudyConfig,
     output_dir: Path | None = None,
-    kinematic_model: str = "ik",
 ) -> Path:
-    """Commanded circle vs each strategy's reconstruction, one panel each.
+    """Commanded circle vs reconstruction, one panel per movement strategy.
 
-    The point of the panel row is that all three look round - which is exactly
-    why a shape metric cannot rank them. The angular markers show where each
-    strategy actually is at the same step.
+    Each strategy runs exactly as the device defines it, so this is the four
+    experimental conditions side by side.
     """
-    strategies = [s.value for s in config.strategies]
-    fig, axes = plt.subplots(1, len(strategies), figsize=(5.2 * len(strategies), 5.6))
+    strategies = [strategy.value for strategy in config.strategies]
+    fig, axes = plt.subplots(1, len(strategies), figsize=(5.0 * len(strategies), 5.8))
     marker_steps = np.linspace(0, config.circle_steps - 1, 12, dtype=int)
 
     for axis, strategy in zip(np.atleast_1d(axes), strategies):
         part = samples.loc[
-            samples["strategy"].eq(strategy)
-            & samples["segment"].eq(CIRCLE_SEGMENT)
-            & samples["kinematic_model"].eq(kinematic_model)
+            samples["run"].eq(strategy) & samples["segment"].eq(CIRCLE_SEGMENT)
         ].reset_index(drop=True)
         style = STRATEGY_STYLE[strategy]
 
@@ -81,7 +78,6 @@ def plot_reconstructed_circles(
                 linewidth=1.0,
                 zorder=2,
             )
-
         axis.scatter(
             part["reconstructed_x"],
             part["reconstructed_y"],
@@ -93,15 +89,17 @@ def plot_reconstructed_circles(
         )
 
         rms = float(np.sqrt(np.mean(part["total_error"] ** 2)))
-        distinct = len(np.unique(np.round(part[["ideal_x", "ideal_y"]].to_numpy(float), 6), axis=0))
         reachable = len(
             np.unique(np.round(part[["quantised_x", "quantised_y"]].to_numpy(float), 6), axis=0)
         )
+        commanded = len(
+            np.unique(np.round(part[["ideal_x", "ideal_y"]].to_numpy(float), 6), axis=0)
+        )
         axis.set_title(
             f"{style['label']}\n"
-            f"point-to-point RMS = {rms:.1f} units | "
-            f"{reachable} of {distinct} commanded points reachable",
-            fontsize=11,
+            f"point-to-point RMS = {rms:.1f} units\n"
+            f"{reachable} of {commanded} commanded points reachable",
+            fontsize=10,
         )
         axis.set_xlabel("X (controller units)")
         axis.set_ylabel("Y (controller units)")
@@ -110,99 +108,136 @@ def plot_reconstructed_circles(
         axis.legend(loc="upper right", fontsize=8)
 
     fig.suptitle(
-        "Same mechanism, same commanded circle - only the direction quantisation differs.\n"
+        "The four movement strategies on the same commanded circle.\n"
         "Every reconstructed point lands on the commanded radius, so shape metrics score all "
-        "three as near-perfect circles;\nthe tie lines and the reachable-point count show the "
+        "four as near-perfect circles;\nthe tie lines and the reachable-point count show the "
         "along-path error those metrics cannot see.",
         fontsize=11,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
-    return _save(fig, f"reconstructed_circles_{kinematic_model}.png", output_dir)
+    fig.tight_layout(rect=(0, 0, 1, 0.90))
+    return _save(fig, "reconstructed_paths_by_strategy.png", output_dir)
 
 
-MODEL_HATCH = {"planar": "", "ik": "//"}
-MODEL_LABEL = {"planar": "Planar model", "ik": "IK model"}
-
-
-def plot_error_decomposition(
-    samples: pd.DataFrame,
+def plot_strategy_comparison(
     metrics: pd.DataFrame,
     config: StudyConfig,
     output_dir: Path | None = None,
 ) -> Path:
-    """The full strategy x model factorial, split into its two effects.
-
-    Left: reading within a model gives the quantisation (strategy) effect;
-    comparing hatched against plain gives the model effect. Right: command
-    effort, where the model effect dominates - this is the difference the
-    historic CD-vs-IK comparison actually measured while attributing it to
-    the strategy.
-    """
-    order = [s.value for s in config.strategies]
-    models = [m.value for m in config.kinematic_models]
+    """Per-strategy error split, and per-strategy command effort."""
+    order = [strategy.value for strategy in config.strategies]
     positions = np.arange(len(order))
-    width = 0.8 / (len(models) * 2)
+    labels = [STRATEGY_STYLE[s]["label"] for s in order]
 
-    fig, (ax_error, ax_effort) = plt.subplots(1, 2, figsize=(14.5, 5.4))
+    fig, (ax_error, ax_effort) = plt.subplots(1, 2, figsize=(15.0, 5.6))
 
-    for model_index, model in enumerate(models):
-        quantisation = [metrics.loc[(model, s), "quantisation_rms"] for s in order]
-        execution = [metrics.loc[(model, s), "execution_rms"] for s in order]
-        offset = (model_index * 2 - len(models) + 0.5) * width
-
-        quantisation_bars = ax_error.bar(
-            positions + offset,
-            quantisation,
-            width,
-            color="#d7191c",
-            hatch=MODEL_HATCH[model],
-            edgecolor="white",
-            label=f"Quantisation - {MODEL_LABEL[model]}",
-        )
-        execution_bars = ax_error.bar(
-            positions + offset + width,
-            execution,
-            width,
-            color="#2c7bb6",
-            hatch=MODEL_HATCH[model],
-            edgecolor="white",
-            label=f"Execution - {MODEL_LABEL[model]}",
-        )
-        # The execution bars are ~20x shorter than the quantisation bars, which
-        # is the point - but it makes them unreadable, so label every value.
-        for bars in (quantisation_bars, execution_bars):
-            ax_error.bar_label(bars, fmt="%.2f", fontsize=7, padding=1, rotation=90)
-
-        ax_effort.bar(
-            positions + (model_index - len(models) / 2 + 0.5) * 0.35,
-            [metrics.loc[(model, s), "rms_command"] for s in order],
-            0.35,
-            color="#5e3c99" if model == "planar" else "#e66101",
-            label=MODEL_LABEL[model],
-        )
+    width = 0.38
+    quantisation_bars = ax_error.bar(
+        positions - width / 2,
+        [metrics.loc[s, "quantisation_rms"] for s in order],
+        width,
+        color="#d7191c",
+        label="Quantisation (direction ingredient)",
+    )
+    execution_bars = ax_error.bar(
+        positions + width / 2,
+        [metrics.loc[s, "execution_rms"] for s in order],
+        width,
+        color="#2c7bb6",
+        label="Execution (model + truncation)",
+    )
+    for bars in (quantisation_bars, execution_bars):
+        ax_error.bar_label(bars, fmt="%.2f", fontsize=8, padding=1)
 
     ax_error.set_xticks(positions)
-    ax_error.set_xticklabels([STRATEGY_STYLE[s]["label"] for s in order], fontsize=9)
+    ax_error.set_xticklabels(labels, fontsize=8)
     ax_error.set_ylabel("RMS error (controller units)")
-    ax_error.set_title(
-        "Strategy cost vs execution floor\n"
-        "quantisation is identical across models, as it must be"
-    )
+    ax_error.set_title("Where each strategy's error comes from")
     ax_error.grid(True, alpha=0.3, axis="y")
-    ax_error.legend(fontsize=8)
+    ax_error.legend(fontsize=9)
 
+    effort_bars = ax_effort.bar(
+        positions,
+        [metrics.loc[s, "rms_command"] for s in order],
+        0.6,
+        color=[STRATEGY_STYLE[s]["color"] for s in order],
+    )
+    ax_effort.bar_label(effort_bars, fmt="%.1f", fontsize=9, padding=2)
     ax_effort.set_xticks(positions)
-    ax_effort.set_xticklabels([STRATEGY_STYLE[s]["label"] for s in order], fontsize=9)
+    ax_effort.set_xticklabels(labels, fontsize=8)
     ax_effort.set_ylabel("RMS motor command (controller units)")
     ax_effort.set_title(
-        "Command effort is a MODEL effect, not a strategy effect\n"
-        "the IK mechanism transmits ~3.8x less cable travel per unit of tactor motion"
+        "Command effort\n"
+        "IK is the only strategy on the 3-D mechanism model - that, not its\n"
+        "continuous direction, is what sets it apart here"
     )
     ax_effort.grid(True, alpha=0.3, axis="y")
-    ax_effort.legend(fontsize=9)
 
     fig.tight_layout()
-    return _save(fig, "error_decomposition.png", output_dir)
+    return _save(fig, "strategy_comparison.png", output_dir)
+
+
+def plot_ingredient_grids(
+    metrics: pd.DataFrame,
+    config: StudyConfig,
+    output_dir: Path | None = None,
+) -> Path:
+    """Attribution grids, with each named strategy marked at its own cell.
+
+    Reading down a column isolates the direction-quantisation ingredient;
+    reading across a row isolates the kinematic-model ingredient. The marked
+    cells show that cardinal-diagonal and IK sit on a diagonal - they differ in
+    both ingredients, which is why comparing only those two cannot attribute a
+    result to either.
+    """
+    positions = strategy_positions(config)
+    panels = [
+        ("total_rms", "Total RMS error", "Reds"),
+        ("rms_command", "RMS motor command", "Purples"),
+    ]
+    fig, axes = plt.subplots(1, len(panels), figsize=(7.6 * len(panels), 5.4))
+
+    for axis, (column, title, cmap) in zip(np.atleast_1d(axes), panels):
+        grid = ingredient_grid(metrics, column)
+        image = axis.imshow(grid.to_numpy(float), cmap=cmap, aspect="auto")
+
+        for row_index, quantisation in enumerate(grid.index):
+            for column_index, model in enumerate(grid.columns):
+                value = grid.iloc[row_index, column_index]
+                occupants = positions.index[
+                    positions["quantisation"].eq(quantisation)
+                    & positions["kinematic_model"].eq(model)
+                ].tolist()
+                caption = f"{value:.2f}"
+                if occupants:
+                    caption += "\n" + "\n".join(occupants)
+                axis.text(
+                    column_index,
+                    row_index,
+                    caption,
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                    color="black",
+                    bbox={"facecolor": "white", "alpha": 0.55, "edgecolor": "none", "pad": 2},
+                )
+
+        axis.set_xticks(range(len(grid.columns)))
+        axis.set_xticklabels(grid.columns)
+        axis.set_yticks(range(len(grid.index)))
+        axis.set_yticklabels(grid.index)
+        axis.set_xlabel("Kinematic model")
+        axis.set_ylabel("Direction quantisation")
+        axis.set_title(f"{title} (controller units)")
+        fig.colorbar(image, ax=axis, shrink=0.85)
+
+    fig.suptitle(
+        "Attributing a strategy difference to one ingredient.\n"
+        "Named strategies are labelled at the cell they occupy; two strategies on a diagonal "
+        "differ in both ingredients.",
+        fontsize=11,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.90))
+    return _save(fig, "ingredient_grids.png", output_dir)
 
 
 def plot_motor_commands(
@@ -210,21 +245,14 @@ def plot_motor_commands(
     config: StudyConfig,
     output_dir: Path | None = None,
 ) -> Path:
-    """Motor commands per strategy - now comparable, one model for every row."""
-    strategies = [s.value for s in config.strategies]
-    models = [m.value for m in config.kinematic_models]
+    """Motor commands per strategy, shared axes."""
+    strategies = [strategy.value for strategy in config.strategies]
     fig, axes = plt.subplots(
-        len(strategies), len(models),
-        figsize=(6.5 * len(models), 3.1 * len(strategies)),
-        sharex=True, sharey=True, squeeze=False,
+        len(strategies), 1, figsize=(12, 2.9 * len(strategies)), sharex=True, sharey=True
     )
 
-    for row, strategy in enumerate(strategies):
-      for column, model in enumerate(models):
-        axis = axes[row][column]
-        part = samples.loc[
-            samples["strategy"].eq(strategy) & samples["kinematic_model"].eq(model)
-        ]
+    for axis, strategy in zip(np.atleast_1d(axes), strategies):
+        part = samples.loc[samples["run"].eq(strategy)]
         for motor_index, shade in enumerate(("#7b3294", "#c2a5cf", "#008837")):
             axis.plot(
                 part["step"],
@@ -234,19 +262,16 @@ def plot_motor_commands(
                 label=f"Motor {motor_index}",
             )
         axis.axhline(0.0, color="0.4", linewidth=1.0)
-        axis.set_title(
-            f"{STRATEGY_STYLE[strategy]['label']} - {MODEL_LABEL[model]}", fontsize=10
-        )
+        axis.set_title(STRATEGY_STYLE[strategy]["label"].replace("\n", " "), fontsize=10)
         axis.set_ylabel("Command")
         axis.grid(True, alpha=0.3)
         axis.legend(fontsize=8, ncol=3, loc="upper right")
 
-    for axis in axes[-1]:
-        axis.set_xlabel("Path step")
+    np.atleast_1d(axes)[-1].set_xlabel("Path step")
     fig.suptitle(
-        "Motor commands, every strategy on both models (shared y axis).\n"
-        "Amplitude is set by the MODEL, not the strategy; the strategy's own signature is "
-        "the discontinuous jump when a quantised direction snaps to a new sector.",
+        "Motor commands, one panel per movement strategy (shared y axis).\n"
+        "Amplitude is set by the kinematic model; the quantisation ingredient shows up as the "
+        "discontinuous jump when a direction snaps to a new sector.",
         fontsize=11,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.94))
@@ -260,11 +285,9 @@ def save_all(
     output_dir: Path | None = None,
 ) -> list[Path]:
     return [
-        *(
-            plot_reconstructed_circles(samples, config, output_dir, model.value)
-            for model in config.kinematic_models
-        ),
-        plot_error_decomposition(samples, metrics, config, output_dir),
+        plot_reconstructed_paths(samples, config, output_dir),
+        plot_strategy_comparison(metrics, config, output_dir),
+        plot_ingredient_grids(metrics, config, output_dir),
         plot_motor_commands(samples, config, output_dir),
     ]
 
@@ -278,4 +301,4 @@ if __name__ == "__main__":
     figure_config = StudyConfig()
     figure_samples, figure_metrics = run_study(figure_config)
     for saved in save_all(figure_samples, figure_metrics, figure_config):
-        print("saved", saved)
+        print("saved", saved.name)

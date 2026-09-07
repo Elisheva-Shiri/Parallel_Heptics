@@ -32,14 +32,17 @@ class MotorSetId(Enum):
 
 
 class MovementStrategy(StrEnum):
-    """Available movement-to-motor mapping strategies.
+    """The movement strategies the device can run - the experimental conditions.
 
-    A strategy only decides how the commanded direction is quantised. It does
-    NOT decide which kinematic model converts the resulting target point into
-    cable deltas - that is `KinematicModel`, chosen independently.
+    Each strategy is a complete, named way of driving the tactor, and each is
+    built from two independent ingredients: how the commanded direction is
+    quantised (`Quantisation`) and which kinematic model converts the resulting
+    target point into cable deltas (`KinematicModel`). See
+    `STRATEGY_DEFINITIONS` for the exact composition of each one.
 
-    `IK` is kept for backward compatibility and is equivalent to `FREE_FORM`
-    combined with `KinematicModel.IK`.
+    Spelling the ingredients out matters when strategies are compared: two
+    strategies that differ in both ingredients cannot have their difference
+    attributed to either one.
     """
 
     CARDINAL = "cardinal"
@@ -48,26 +51,42 @@ class MovementStrategy(StrEnum):
     IK = "ik"
 
 
+class Quantisation(StrEnum):
+    """How coarsely a strategy may express the commanded direction."""
+
+    #: Any direction; the target point passes through untouched.
+    NONE = "none"
+    #: Snap to the nearest of 4 axis directions.
+    CARDINAL_4 = "cardinal_4"
+    #: Snap to the nearest of 8, subject to `diagonal_threshold`.
+    CARDINAL_8 = "cardinal_8"
+
+
 class KinematicModel(StrEnum):
     """Model used to turn a target point into per-motor cable deltas.
 
     `PLANAR` treats each cable as a straight line from its anchor to the tactor
     in 2-D. `IK` solves the full 3-D leg mechanism and measures Bowden-cable
-    displacement. Holding this fixed is what makes a comparison across
-    `MovementStrategy` values attributable to the strategy alone.
+    displacement.
     """
 
     PLANAR = "planar"
     IK = "ik"
 
 
-#: Kinematic model each strategy uses when none is given explicitly. This keeps
-#: existing callers (backend.py) byte-identical after the strategy/model split.
-_DEFAULT_KINEMATIC_MODEL: dict[str, "KinematicModel"] = {
-    MovementStrategy.CARDINAL: KinematicModel.PLANAR,
-    MovementStrategy.CARDINAL_DIAGONAL: KinematicModel.PLANAR,
-    MovementStrategy.FREE_FORM: KinematicModel.PLANAR,
-    MovementStrategy.IK: KinematicModel.IK,
+#: What each strategy is made of. This is the single place the two ingredients
+#: are bound together, and it is what makes the composition of a strategy
+#: inspectable instead of implicit.
+#:
+#: Note that the four strategies populate only four of the six possible
+#: (quantisation, model) cells, and that CARDINAL_DIAGONAL and IK differ in
+#: BOTH ingredients - which is why comparing those two in isolation cannot
+#: attribute a result to the quantisation or to the model.
+STRATEGY_DEFINITIONS: dict[str, tuple["Quantisation", "KinematicModel"]] = {
+    MovementStrategy.CARDINAL: (Quantisation.CARDINAL_4, KinematicModel.PLANAR),
+    MovementStrategy.CARDINAL_DIAGONAL: (Quantisation.CARDINAL_8, KinematicModel.PLANAR),
+    MovementStrategy.FREE_FORM: (Quantisation.NONE, KinematicModel.PLANAR),
+    MovementStrategy.IK: (Quantisation.NONE, KinematicModel.IK),
 }
 
 
@@ -110,6 +129,7 @@ class MotorController:
         diagonal_threshold: float = 0.5,
         hand_orientation: HandOrientation = HandOrientation.NOT_MIRRORED,
         kinematic_model: "KinematicModel | None" = None,
+        quantisation: "Quantisation | None" = None,
     ):
         """Create a motor controller with geometry and movement parameters.
 
@@ -123,16 +143,18 @@ class MotorController:
             diagonal_threshold: Min axis-ratio needed to classify movement as diagonal
                 in `MovementStrategy.CARDINAL_DIAGONAL`.
             hand_orientation: Whether to mirror left/right motion on the X axis.
-            kinematic_model: Model used to convert the target point into cable
-                deltas. Defaults to the model historically paired with
-                `movement_strategy`. Pass explicitly to compare strategies on a
-                fixed mechanism.
+            kinematic_model: Overrides the model this strategy is defined with.
+                Leave as None for normal use; set it only to hold one
+                ingredient fixed while varying the other, so a difference can
+                be attributed to one of them.
+            quantisation: Overrides the quantisation this strategy is defined
+                with. Same purpose as `kinematic_model`.
         """
         self._movement_strategy = movement_strategy
+        default_quantisation, default_model = STRATEGY_DEFINITIONS[movement_strategy]
+        self._quantisation = quantisation if quantisation is not None else default_quantisation
         self._kinematic_model = (
-            kinematic_model
-            if kinematic_model is not None
-            else _DEFAULT_KINEMATIC_MODEL[movement_strategy]
+            kinematic_model if kinematic_model is not None else default_model
         )
         self._hand_orientation = hand_orientation
         self._top_width = top_width
@@ -191,10 +213,7 @@ class MotorController:
         obj_x, obj_y = self._apply_stiffness_value(obj_x, obj_y, stiffness_value)
         obj_x, obj_y = self._apply_actuator_destination_polarity(obj_x, obj_y)
 
-        quantised = self._movement_strategy in (
-            MovementStrategy.CARDINAL,
-            MovementStrategy.CARDINAL_DIAGONAL,
-        )
+        quantised = self._quantisation is not Quantisation.NONE
         if quantised and obj_x == 0 and obj_y == 0:
             # Historic behaviour: a quantised strategy emits nothing at rest,
             # while free-form/IK still emit three explicit zero commands.
@@ -263,20 +282,19 @@ class MotorController:
     def _quantize_target(self, obj_x: float, obj_y: float) -> tuple[float, float]:
         """Snap the target point to the directions the strategy can express.
 
-        This is the ONLY thing a `MovementStrategy` changes. It is a pure
-        point-to-point map, so a strategy comparison run on one `KinematicModel`
-        isolates direction quantisation and nothing else.
+        A pure point-to-point map driven by `self._quantisation`, which a
+        strategy supplies but does not otherwise influence. Holding the model
+        fixed and varying only this isolates the direction-quantisation effect.
 
         Quantisation is radius-preserving: the snapped point keeps
         ``hypot(obj_x, obj_y)``, so only the direction is degraded, never the
-        magnitude. Diagonals are emitted only for
-        `MovementStrategy.CARDINAL_DIAGONAL` and only when the axis ratio
-        reaches `self._diagonal_threshold`.
+        magnitude. Diagonals are emitted only for `Quantisation.CARDINAL_8` and
+        only when the axis ratio reaches `self._diagonal_threshold`.
 
         Returns:
             The target point the kinematic model should drive the tactor to.
         """
-        if self._movement_strategy in (MovementStrategy.FREE_FORM, MovementStrategy.IK):
+        if self._quantisation is Quantisation.NONE:
             return (obj_x, obj_y)
 
         abs_x, abs_y = abs(obj_x), abs(obj_y)
@@ -285,7 +303,7 @@ class MotorController:
 
         radius = math.hypot(obj_x, obj_y)
 
-        if self._movement_strategy == MovementStrategy.CARDINAL_DIAGONAL and abs_x > 0 and abs_y > 0:
+        if self._quantisation is Quantisation.CARDINAL_8 and abs_x > 0 and abs_y > 0:
             ratio = min(abs_x, abs_y) / max(abs_x, abs_y)
             if ratio >= self._diagonal_threshold:
                 leg = radius / math.sqrt(2.0)

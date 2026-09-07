@@ -54,20 +54,25 @@ from consts import EDGE_THRESHOLD, TOP_HEIGHT, TOP_WIDTH  # noqa: E402
 from kinematics import unified_ik_starter as ik_module  # noqa: E402
 from kinematics import wire_forward_kinematics as wire_fk  # noqa: E402
 from motor_controller import (  # noqa: E402
+    STRATEGY_DEFINITIONS,
     HandOrientation,
     KinematicModel,
     MotorController,
     MotorSetId,
     MovementStrategy,
+    Quantisation,
 )
 
-#: Strategies under test. `IK` is excluded on purpose: it is `FREE_FORM` paired
-#: with `KinematicModel.IK`, i.e. a model choice, not a strategy. Including it
-#: would vary the model and the quantisation at the same time.
+#: The four movement strategies as the device runs them - the experimental
+#: conditions. Each is reported as itself, with the ingredients it is built
+#: from (see `motor_controller.STRATEGY_DEFINITIONS`) shown alongside, so a
+#: difference between two strategies can be traced to the ingredient that
+#: caused it.
 STRATEGIES: tuple[MovementStrategy, ...] = (
     MovementStrategy.CARDINAL,
     MovementStrategy.CARDINAL_DIAGONAL,
     MovementStrategy.FREE_FORM,
+    MovementStrategy.IK,
 )
 
 CIRCLE_SEGMENT = "circle"
@@ -87,11 +92,11 @@ class StudyConfig:
     stiffness_value: float = 1.0
     hand_orientation: HandOrientation = HandOrientation.NOT_MIRRORED
 
-    #: Both models are run so the design is a full factorial. Holding the model
-    #: fixed and varying the strategy gives the quantisation effect; holding the
-    #: strategy fixed and varying the model gives the model effect. The two were
-    #: previously confounded by comparing CD-on-planar against free-form-on-IK.
-    kinematic_models: tuple[KinematicModel, ...] = (KinematicModel.PLANAR, KinematicModel.IK)
+    #: When True, additionally run every (quantisation, model) combination, not
+    #: just the four the named strategies occupy. That grid is what lets the
+    #: quantisation effect and the model effect be separated; the four named
+    #: strategies alone cover only four of its six cells.
+    run_ingredient_grid: bool = True
 
     # Commanded path: line out, one full circle, line back.
     outward_fraction_of_half_width: float = 0.5
@@ -168,9 +173,10 @@ def _trilaterate(anchors: np.ndarray, lengths: np.ndarray) -> tuple[float, float
 
 
 def _make_controller(
-    strategy: MovementStrategy,
-    kinematic_model: KinematicModel,
     config: StudyConfig,
+    strategy: MovementStrategy,
+    quantisation: Quantisation | None = None,
+    kinematic_model: KinematicModel | None = None,
 ) -> MotorController:
     return MotorController(
         movement_strategy=strategy,
@@ -181,27 +187,24 @@ def _make_controller(
         move_factor=config.move_factor,
         diagonal_threshold=config.diagonal_threshold,
         hand_orientation=config.hand_orientation,
+        quantisation=quantisation,
         kinematic_model=kinematic_model,
     )
 
 
-def simulate_strategy(
-    strategy: MovementStrategy,
-    kinematic_model: KinematicModel,
+def simulate_run(
+    label: str,
+    controller: MotorController,
     path: pd.DataFrame,
     config: StudyConfig,
 ) -> pd.DataFrame:
-    """Drive one strategy/model pair along the path and decode the result.
+    """Drive one configured controller along the commanded path and decode it.
 
     Each model is decoded by its own inverse - trilateration for `PLANAR`, wire
     FK for `IK` - because a decoder must match the encoder that produced the
-    cable deltas. Both decoders return a position in controller units, so the
-    reconstructed points remain directly comparable across models.
-
-    Returns one row per step with the ideal target, the quantised target, the
-    reconstructed tactor position and the three motor commands.
+    cable deltas. Both decoders return controller-unit positions, so the
+    reconstructed points stay directly comparable.
     """
-    controller = _make_controller(strategy, kinematic_model, config)
     model = controller._get_ik_model()
     sim_to_ik = controller._get_ik_base_span(model) / config.motor_spacing
     ik_to_sim = 1.0 / sim_to_ik
@@ -210,6 +213,7 @@ def simulate_strategy(
 
     anchors = planar_anchors(config)
     rest_lengths = np.linalg.norm(anchors - np.array([0.0, 0.0]), axis=1)
+    uses_ik = controller._kinematic_model is KinematicModel.IK
 
     positions = {0: 0, 1: 0, 2: 0}
     rows: list[dict[str, float | str | bool]] = []
@@ -232,7 +236,7 @@ def simulate_strategy(
 
         commands = np.array([positions[0], positions[1], positions[2]], dtype=float)
 
-        if kinematic_model is KinematicModel.IK:
+        if uses_ik:
             solution = wire_fk.solve_wire_fk(
                 commands * sim_to_ik, model, initial_P1=previous_p1, rest_P1=rest_p1
             )
@@ -251,8 +255,10 @@ def simulate_strategy(
 
         rows.append(
             {
-                "strategy": strategy.value,
-                "kinematic_model": kinematic_model.value,
+                "run": label,
+                "strategy": controller._movement_strategy.value,
+                "quantisation": controller._quantisation.value,
+                "kinematic_model": controller._kinematic_model.value,
                 "step": int(record.step),
                 "segment": record.segment,
                 "object_x": float(record.x),
@@ -296,21 +302,12 @@ def _circle_fit_rms(points: np.ndarray) -> float:
     return float(np.sqrt(np.mean(deviation**2)))
 
 
-def strategy_metrics(samples: pd.DataFrame, config: StudyConfig) -> pd.DataFrame:
-    """One row per (kinematic model, strategy). All values in controller units."""
+def run_metrics(samples: pd.DataFrame, config: StudyConfig) -> pd.DataFrame:
+    """One row per run. All values in controller units."""
     rows: list[dict[str, float | str | int]] = []
 
-    pairs = [
-        (kinematic_model, strategy)
-        for kinematic_model in config.kinematic_models
-        for strategy in config.strategies
-    ]
-
-    for kinematic_model, strategy in pairs:
-        part = samples.loc[
-            samples["strategy"].eq(strategy.value)
-            & samples["kinematic_model"].eq(kinematic_model.value)
-        ]
+    for label in samples["run"].unique():
+        part = samples.loc[samples["run"].eq(label)]
         circle = part.loc[part["segment"].eq(CIRCLE_SEGMENT)]
         reconstructed = circle[["reconstructed_x", "reconstructed_y"]].to_numpy(float)
 
@@ -322,13 +319,15 @@ def strategy_metrics(samples: pd.DataFrame, config: StudyConfig) -> pd.DataFrame
 
         rows.append(
             {
-                "kinematic_model": kinematic_model.value,
-                "strategy": strategy.value,
+                "run": label,
+                "strategy": part["strategy"].iat[0],
+                "quantisation": part["quantisation"].iat[0],
+                "kinematic_model": part["kinematic_model"].iat[0],
                 "samples": int(len(part)),
-                # --- what the strategy costs (model-independent by construction) ---
+                # --- what the quantisation ingredient costs ---
                 "quantisation_rms": float(np.sqrt(np.mean(part["quantisation_error"] ** 2))),
                 "quantisation_max": float(part["quantisation_error"].max()),
-                # --- what the model + integer truncation cost ---
+                # --- what the model ingredient + integer truncation cost ---
                 "execution_rms": float(np.sqrt(np.mean(part["execution_error"] ** 2))),
                 "execution_max": float(part["execution_error"].max()),
                 # --- end to end ---
@@ -354,67 +353,105 @@ def strategy_metrics(samples: pd.DataFrame, config: StudyConfig) -> pd.DataFrame
             }
         )
 
-    return pd.DataFrame(rows).set_index(["kinematic_model", "strategy"])
+    return pd.DataFrame(rows).set_index("run")
 
 
 def run_study(config: StudyConfig | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run the full strategy x model factorial. Returns (samples, metrics)."""
+    """Run the four named strategies, plus the ingredient grid.
+
+    Returns (samples, metrics). Rows whose `run` equals a strategy name are the
+    device's actual conditions; rows named ``"<quantisation>+<model>"`` are the
+    grid used to attribute a difference to one ingredient.
+    """
     config = config or StudyConfig()
     path = build_commanded_path(config)
-    samples = pd.concat(
-        [
-            simulate_strategy(strategy, kinematic_model, path, config)
-            for kinematic_model in config.kinematic_models
-            for strategy in config.strategies
-        ],
-        ignore_index=True,
-    )
-    return samples, strategy_metrics(samples, config)
+    frames: list[pd.DataFrame] = []
+
+    # The strategies as the device actually runs them.
+    for strategy in config.strategies:
+        frames.append(
+            simulate_run(strategy.value, _make_controller(config, strategy), path, config)
+        )
+
+    # Every ingredient combination, including the two no named strategy uses.
+    if config.run_ingredient_grid:
+        for quantisation in Quantisation:
+            for kinematic_model in KinematicModel:
+                frames.append(
+                    simulate_run(
+                        f"{quantisation.value}+{kinematic_model.value}",
+                        _make_controller(
+                            config,
+                            MovementStrategy.FREE_FORM,
+                            quantisation=quantisation,
+                            kinematic_model=kinematic_model,
+                        ),
+                        path,
+                        config,
+                    )
+                )
+
+    samples = pd.concat(frames, ignore_index=True)
+    return samples, run_metrics(samples, config)
 
 
-def effect_summary(metrics: pd.DataFrame) -> pd.DataFrame:
-    """Separate the quantisation effect from the model effect.
+def named_strategy_table(metrics: pd.DataFrame, config: StudyConfig) -> pd.DataFrame:
+    """The four device conditions, with the ingredients each is built from."""
+    names = [strategy.value for strategy in config.strategies]
+    columns = [
+        "quantisation",
+        "kinematic_model",
+        "quantisation_rms",
+        "execution_rms",
+        "total_rms",
+        "rms_command",
+        "max_step_jump",
+    ]
+    return metrics.loc[names, columns]
 
-    Reading the factorial down a column gives the strategy effect at a fixed
-    model; reading across a row gives the model effect at a fixed strategy. The
-    historic "CD vs IK" comparison was the off-diagonal of this table, which is
-    why it could not attribute its result to either cause.
+
+def ingredient_grid(metrics: pd.DataFrame, column: str = "total_rms") -> pd.DataFrame:
+    """`column` as quantisation (rows) x kinematic model (columns).
+
+    Reading down a column isolates the quantisation effect; reading across a
+    row isolates the model effect. Two strategies sitting on a diagonal of this
+    grid differ in BOTH ingredients, so a difference between them cannot be
+    attributed to either one.
     """
-    return metrics["total_rms"].unstack("kinematic_model").rename_axis(columns="model")
+    grid = metrics.loc[[label for label in metrics.index if "+" in label]]
+    return grid.pivot(index="quantisation", columns="kinematic_model", values=column)
+
+
+def strategy_positions(config: StudyConfig) -> pd.DataFrame:
+    """Where each named strategy sits in the ingredient grid."""
+    return pd.DataFrame(
+        [
+            {
+                "strategy": strategy.value,
+                "quantisation": STRATEGY_DEFINITIONS[strategy][0].value,
+                "kinematic_model": STRATEGY_DEFINITIONS[strategy][1].value,
+            }
+            for strategy in config.strategies
+        ]
+    ).set_index("strategy")
 
 
 if __name__ == "__main__":
     study_config = StudyConfig()
     study_samples, study_metrics = run_study(study_config)
 
-    cells = len(study_config.strategies) * len(study_config.kinematic_models)
     pd.set_option("display.width", 220)
     pd.set_option("display.max_columns", 50)
-    print(
-        f"Commanded path: {len(study_samples) // cells} samples, "
-        f"radius {study_config.radius:.0f} controller units. "
-        f"Factorial: {len(study_config.strategies)} strategies x "
-        f"{len(study_config.kinematic_models)} kinematic models."
-    )
-    print("\nAll values in controller units.\n")
-    print(
-        study_metrics[
-            [
-                "quantisation_rms",
-                "execution_rms",
-                "total_rms",
-                "total_max",
-                "radial_rms",
-                "aspect_ratio",
-                "closure_error",
-            ]
-        ].round(3)
-    )
-    print("\nCommand effort:\n")
-    print(
-        study_metrics[
-            ["peak_abs_command", "rms_command", "total_motor_travel", "max_step_jump"]
-        ].round(3)
-    )
-    print("\nTotal RMS error, strategy (rows) x model (columns):\n")
-    print(effect_summary(study_metrics).round(2))
+
+    print("The four movement strategies, and what each is built from:\n")
+    print(strategy_positions(study_config).to_string())
+
+    print("\n\nResults per strategy (controller units):\n")
+    print(named_strategy_table(study_metrics, study_config).round(3).to_string())
+
+    print("\n\nIngredient grid - total RMS error")
+    print("(quantisation down, kinematic model across)\n")
+    print(ingredient_grid(study_metrics, "total_rms").round(2).to_string())
+
+    print("\n\nIngredient grid - RMS motor command\n")
+    print(ingredient_grid(study_metrics, "rms_command").round(2).to_string())
