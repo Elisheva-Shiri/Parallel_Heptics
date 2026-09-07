@@ -462,6 +462,26 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SEC",
         help="Max seconds to wait for a camera frame newer than settle end (default 3.0)",
     )
+    p.add_argument(
+        "--deltas",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="D",
+        help=f"Command amplitudes to test (default: {' '.join(map(str, DEFAULT_DELTAS))})",
+    )
+    p.add_argument(
+        "--trials-per-sequence",
+        type=int,
+        default=3,
+        help="Repeats of each A/B sequence per delta (default 3)",
+    )
+    p.add_argument(
+        "--drift-pairs",
+        type=int,
+        default=10,
+        help="(+D,-D) pairs in the drift block per delta (default 10)",
+    )
     p.add_argument("--camera-index", type=int, default=1)
     p.add_argument("--camera-fps", type=float, default=30.0)
     p.add_argument("--camera-width", type=int, default=None)
@@ -490,6 +510,9 @@ def main() -> None:
         port=args.port,
         baud=args.baud,
         motor_index=args.motor_index,
+        deltas=tuple(args.deltas) if args.deltas else DEFAULT_DELTAS,
+        trials_per_sequence=args.trials_per_sequence,
+        drift_pairs=args.drift_pairs,
         settle_ms=args.settle_ms,
         inter_command_ms=args.inter_command_ms,
         frame_grab_timeout_s=args.frame_grab_timeout,

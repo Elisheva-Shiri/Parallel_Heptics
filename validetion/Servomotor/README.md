@@ -76,6 +76,9 @@ python run_experiment.py --dry-run --no-camera --settle-ms 0 --inter-command-ms 
 | `--camera-index` | `1` | OpenCV camera index |
 | `--camera-fps` | `30` | requested capture rate |
 | `--camera-width` / `--camera-height` | *(driver default)* | requested capture size |
+| `--deltas` | `5 10 25 75 125 250 500 1000` | command amplitudes to test |
+| `--trials-per-sequence` | `3` | repeats of each A/B sequence per delta |
+| `--drift-pairs` | `10` | `(+D,-D)` pairs in the drift block per delta |
 | `--roi-mode` | `both` | `auto` / `manual` / `both` (auto, then manual fallback) |
 | `--no-confirm-roi` | off | skip the ROI confirmation window |
 | `--no-frames` | off | do not save the per-step JPEGs |
@@ -85,6 +88,32 @@ python run_experiment.py --dry-run --no-camera --settle-ms 0 --inter-command-ms 
 | `--no-camera` | off | run the protocol with no vision data |
 | `--no-plots` | off | skip the automatic `analyze.py` pass |
 | `--output-root` | `responses/` | parent folder for the timestamped run folders |
+
+### Short hardware check (~30 s)
+
+Before a full 400-command run, confirm motor, camera and vision are all alive
+with a 14-command version of the protocol:
+
+```powershell
+# 0. what is connected?
+uv run python -c "import serial.tools.list_ports as l; [print(p.device, p.description) for p in l.comports()]"
+
+# 1. no hardware at all - does the pipeline still run end to end?
+uv run python run_experiment.py --dry-run --no-camera --settle-ms 0 --inter-command-ms 0 `
+    --deltas 250 --trials-per-sequence 1 --drift-pairs 2
+
+# 2. camera only - check the ROI is found and the angle is measured
+uv run python run_experiment.py --dry-run --deltas 250 --trials-per-sequence 1 --drift-pairs 2
+
+# 3. the real thing, short
+uv run python run_experiment.py --port COM13 --camera-index 1 `
+    --deltas 250 --trials-per-sequence 1 --drift-pairs 2
+```
+
+Step 3 should print `protocol: 14 steps over 1 deltas`, then 14 rows where
+`actual` equals `target` and `angle` moves by roughly +/-22 deg for a 250-tick
+command. Check `frames/` shows the red line tracking the spool line before
+committing to a full run.
 
 **Timing matters for target/angle alignment.** After each command the runner
 waits `--settle-ms`, then takes a frame whose capture time is *strictly after*
