@@ -8,8 +8,9 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-REPORT_PATH = ROOT / "analysis" / "motor_response_analizer_servo" / "generate_report.py"
-RESPONSES = ROOT / "analysis" / "motor_response_analizer_servo" / "responses"
+PACKAGE = ROOT / "validetion" / "Servomotor"
+REPORT_PATH = PACKAGE / "generate_report.py"
+RESPONSES = PACKAGE / "responses"
 PRIMARY_RUN = RESPONSES / "motor_response_2026_04_28_15_02_26"
 DRY_RUN = RESPONSES / "motor_response_2026_04_28_14_33_58"
 

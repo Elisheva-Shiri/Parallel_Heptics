@@ -13,14 +13,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "analysis"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from motor_response_analizer_servo.protocol import build_protocol
-from motor_response_analizer_servo.vision_angle import (
+from protocol import build_protocol
+from vision_angle import (
     SpoolAngleDetector, find_spool_roi,
 )
-from motor_response_analizer_servo.motor_io import DryRunMotor
+from motor_io import DryRunMotor
 
 
 H, W = 480, 640

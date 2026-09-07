@@ -39,8 +39,17 @@ class ReportInputs:
     pdf_path: Path
 
 
+# The black line is undirected, so its orientation is only defined modulo 180
+# deg. At the +/-1000-tick endpoint the true rotation reaches the wrap region and
+# the detector can report the equivalent orientation on the other side. The
+# documented convention (see analyze.py) is to keep the measured magnitude and
+# take the sign from the command. Reimplemented here rather than imported, so
+# this module stays an independent recomputation of the saved summary.
+ENDPOINT_TICKS = 1000.0
+
+
 def add_trial_relative_angle(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy with trial-local angle changes."""
+    """Return a copy with trial-local angle changes, endpoint sign-corrected."""
 
     out = df.copy()
     out["angle_in_trial_independent"] = np.nan
@@ -57,6 +66,13 @@ def add_trial_relative_angle(df: pd.DataFrame) -> pd.DataFrame:
         out.loc[sub.index, "angle_in_trial_independent"] = (
             pd.to_numeric(sub["angle_deg"], errors="coerce") - zero
         )
+
+    target = pd.to_numeric(out.get("target"), errors="coerce")
+    angle = out["angle_in_trial_independent"]
+    endpoint = (target.abs() == ENDPOINT_TICKS) & (target != 0) & angle.notna()
+    out.loc[endpoint, "angle_in_trial_independent"] = (
+        np.sign(target[endpoint]) * angle[endpoint].abs()
+    )
     return out
 
 

@@ -17,10 +17,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "analysis"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from motor_response_analizer_servo.protocol import build_protocol
+from protocol import build_protocol
 
 
 ANGLE_PER_UNIT_DEG = 0.05
