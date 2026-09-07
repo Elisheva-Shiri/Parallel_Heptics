@@ -12,7 +12,6 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import cv2
 import numpy as np
@@ -21,8 +20,8 @@ import numpy as np
 @dataclass
 class CameraConfig:
     index: int = 1
-    width: Optional[int] = None
-    height: Optional[int] = None
+    width: int | None = None
+    height: int | None = None
     fps: float = 30.0
     fourcc: str = "mp4v"
     backend: int = cv2.CAP_DSHOW   # DirectShow is much faster on Windows
@@ -34,17 +33,17 @@ class CameraRecorder:
     def __init__(
         self,
         config: CameraConfig,
-        video_path: Optional[Path] = None,
+        video_path: Path | None = None,
         log_print=print,
     ):
         self._cfg = config
         self._video_path = Path(video_path) if video_path is not None else None
-        self._cap: Optional[cv2.VideoCapture] = None
-        self._writer: Optional[cv2.VideoWriter] = None
-        self._thread: Optional[threading.Thread] = None
+        self._cap: cv2.VideoCapture | None = None
+        self._writer: cv2.VideoWriter | None = None
+        self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
-        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_frame: np.ndarray | None = None
         self._latest_ts: float = 0.0
         self._frame_count: int = 0
         self._actual_fps: float = config.fps
@@ -71,7 +70,7 @@ class CameraRecorder:
 
         # Warm up the camera and grab one real frame.
         warmup_deadline = time.time() + 2.0
-        first_frame: Optional[np.ndarray] = None
+        first_frame: np.ndarray | None = None
         while time.time() < warmup_deadline:
             ok, frame = cap.read()
             if ok and frame is not None:
@@ -120,7 +119,7 @@ class CameraRecorder:
                 f"{self._actual_fps:.1f} fps"
             )
 
-    def __enter__(self) -> "CameraRecorder":
+    def __enter__(self) -> CameraRecorder:
         self.start()
         return self
 
@@ -158,11 +157,11 @@ class CameraRecorder:
     # Frame access
     # ------------------------------------------------------------------
 
-    def get_latest(self) -> tuple[Optional[np.ndarray], float]:
+    def get_latest(self) -> tuple[np.ndarray | None, float]:
         with self._lock:
             return (None if self._latest_frame is None else self._latest_frame.copy(), self._latest_ts)
 
-    def wait_for_frame_after(self, ts_after: float, timeout_s: float = 3.0) -> Optional[np.ndarray]:
+    def wait_for_frame_after(self, ts_after: float, timeout_s: float = 3.0) -> np.ndarray | None:
         """Wait until ``latest_ts > ts_after``, then return a copy of that frame.
 
         Used after settling so we do not analyze a buffered frame captured *before*
@@ -179,7 +178,7 @@ class CameraRecorder:
             time.sleep(0.003)
         return None
 
-    def wait_for_fresh(self, min_age_s: float = 0.0, timeout_s: float = 1.0) -> Optional[np.ndarray]:
+    def wait_for_fresh(self, min_age_s: float = 0.0, timeout_s: float = 1.0) -> np.ndarray | None:
         """Wait until at least one frame newer than `now - min_age_s` is available.
 
         Returns ``None`` on timeout.

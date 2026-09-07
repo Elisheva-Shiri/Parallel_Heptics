@@ -17,22 +17,20 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
-from analyze import (
+from analyze import (  # noqa: E402  (flat module layout, see README)
     COMMAND_DEG_PER_TICK,
     add_block_relative_angle,
     add_trial_change,
     command_ticks_to_nominal_deg,
     load_log,
 )
-
 
 plt.rcParams.update({
     "figure.dpi": 120,
@@ -44,6 +42,10 @@ plt.rcParams.update({
     "font.size": 10,
 })
 
+
+PACKAGE_DIR = Path(__file__).resolve().parent
+DEFAULT_RESPONSES_DIR = PACKAGE_DIR / "responses"
+DEFAULT_OUTPUT_DIR = PACKAGE_DIR / "output" / "validation_summary"
 
 RUN_MARKERS = ["o", "s", "^", "D", "P", "X"]
 RUN_COLORS = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown"]
@@ -79,9 +81,7 @@ def _is_complete_camera_run(run_dir: Path) -> bool:
         return False
     if summary.get("n_angle_failures", 0) not in (0, None):
         return False
-    if summary.get("n_rows", 1) == 0:
-        return False
-    return True
+    return summary.get("n_rows", 1) != 0
 
 
 def discover_runs(responses_dir: Path) -> list[Path]:
@@ -224,7 +224,7 @@ def plot_summary_figure(run_delta: pd.DataFrame, across: pd.DataFrame, out_dir: 
     ax_map, ax_signed, ax_repeat = axes
 
     # A) nominal command reference versus measured response.
-    for i, (run_id, sub) in enumerate(run_delta.groupby("run_id", observed=True)):
+    for i, (_run_id, sub) in enumerate(run_delta.groupby("run_id", observed=True)):
         marker = RUN_MARKERS[i % len(RUN_MARKERS)]
         color = RUN_COLORS[i % len(RUN_COLORS)]
         ax_map.plot(
@@ -287,7 +287,7 @@ def plot_summary_figure(run_delta: pd.DataFrame, across: pd.DataFrame, out_dir: 
     ax_signed.legend()
 
     # C) within-run repeatability.
-    for i, (run_id, sub) in enumerate(run_delta.groupby("run_id", observed=True)):
+    for i, (_run_id, sub) in enumerate(run_delta.groupby("run_id", observed=True)):
         marker = RUN_MARKERS[i % len(RUN_MARKERS)]
         color = RUN_COLORS[i % len(RUN_COLORS)]
         ax_repeat.plot(
@@ -386,7 +386,7 @@ def plot_small_motion_zoom(protocol: pd.DataFrame, out_dir: Path) -> None:
             colors.append(color)
 
     bp = ax.boxplot(values, tick_labels=groups, patch_artist=True, showmeans=True)
-    for patch, color in zip(bp["boxes"], colors):
+    for patch, color in zip(bp["boxes"], colors, strict=True):
         patch.set_facecolor(color)
         patch.set_alpha(0.35)
     for i, vals in enumerate(values, start=1):
@@ -449,13 +449,13 @@ def main() -> None:
     parser.add_argument(
         "--responses-dir",
         type=Path,
-        default=Path("responses"),
+        default=DEFAULT_RESPONSES_DIR,
         help="Folder containing motor_response_* run folders.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("output") / "validation_summary",
+        default=DEFAULT_OUTPUT_DIR,
         help="Folder where combined plots and tables are written.",
     )
     parser.add_argument(

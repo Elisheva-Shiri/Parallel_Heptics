@@ -5,9 +5,9 @@ reuse the saved ``per_delta_summary.csv`` blindly; it recomputes the key summary
 statistics directly from ``protocol_log.csv`` and writes a diff check next to the
 PDF.
 
-Typical use from the repository root::
+Run with::
 
-    uv run python -m analysis.motor_response_analizer_servo.generate_report
+    python generate_report.py [run_dir]
 """
 
 from __future__ import annotations
@@ -23,10 +23,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_RESPONSES_DIR = PACKAGE_DIR / "responses"
-DEFAULT_OUTPUT_DIR = Path("output") / "pdf"
+DEFAULT_OUTPUT_DIR = PACKAGE_DIR / "output" / "pdf"
 
 
 @dataclass(frozen=True)
@@ -271,9 +270,17 @@ def compare_runs(primary_summary: pd.DataFrame, comparison_summary: pd.DataFrame
     return merged, metrics
 
 
-def _require_reportlab() -> dict[str, Any]:
-    """Import ReportLab lazily so numeric tests do not require PDF dependencies."""
+def build_pdf_report(
+    inputs: ReportInputs,
+    primary_summary: pd.DataFrame,
+    primary_metrics: dict[str, Any],
+    comparison_table: pd.DataFrame | None,
+    comparison_metrics: dict[str, float] | None,
+) -> None:
+    """Build the PDF report."""
 
+    # Imported here so the numeric functions above stay usable (and testable)
+    # without the optional PDF dependencies installed.
     try:
         from PIL import Image as PILImage
         from reportlab.lib import colors
@@ -293,61 +300,10 @@ def _require_reportlab() -> dict[str, Any]:
             Table,
             TableStyle,
         )
-    except ImportError as exc:  # pragma: no cover - exercised only without optional dependency
+    except ImportError as exc:  # pragma: no cover - only without the optional extras
         raise SystemExit(
-            "Report generation requires reportlab and pillow. Install with `uv sync`, "
-            "or run `uv run --with reportlab --with pillow "
-            "python -m analysis.motor_response_analizer_servo.generate_report`."
+            "Report generation requires reportlab and pillow. Install them with `uv sync`."
         ) from exc
-
-    return {
-        "PILImage": PILImage,
-        "colors": colors,
-        "TA_CENTER": TA_CENTER,
-        "A4": A4,
-        "ParagraphStyle": ParagraphStyle,
-        "getSampleStyleSheet": getSampleStyleSheet,
-        "cm": cm,
-        "Image": Image,
-        "KeepTogether": KeepTogether,
-        "ListFlowable": ListFlowable,
-        "ListItem": ListItem,
-        "PageBreak": PageBreak,
-        "Paragraph": Paragraph,
-        "SimpleDocTemplate": SimpleDocTemplate,
-        "Spacer": Spacer,
-        "Table": Table,
-        "TableStyle": TableStyle,
-    }
-
-
-def build_pdf_report(
-    inputs: ReportInputs,
-    primary_summary: pd.DataFrame,
-    primary_metrics: dict[str, Any],
-    comparison_table: pd.DataFrame | None,
-    comparison_metrics: dict[str, float] | None,
-) -> None:
-    """Build the PDF report."""
-
-    rl = _require_reportlab()
-    PILImage = rl["PILImage"]
-    colors = rl["colors"]
-    TA_CENTER = rl["TA_CENTER"]
-    A4 = rl["A4"]
-    ParagraphStyle = rl["ParagraphStyle"]
-    getSampleStyleSheet = rl["getSampleStyleSheet"]
-    cm = rl["cm"]
-    Image = rl["Image"]
-    KeepTogether = rl["KeepTogether"]
-    ListFlowable = rl["ListFlowable"]
-    ListItem = rl["ListItem"]
-    PageBreak = rl["PageBreak"]
-    Paragraph = rl["Paragraph"]
-    SimpleDocTemplate = rl["SimpleDocTemplate"]
-    Spacer = rl["Spacer"]
-    Table = rl["Table"]
-    TableStyle = rl["TableStyle"]
 
     styles = getSampleStyleSheet()
     styles.add(
@@ -456,7 +412,7 @@ def build_pdf_report(
     story: list[Any] = [
         para("Motor Response Characterization Analysis", "TitleCenter"),
         para(
-            f"Primary run: {run.name} | Source: analysis/motor_response_analizer_servo | "
+            f"Primary run: {run.name} | Source: validetion/Servomotor | "
             f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}",
             "SubtitleCenter",
         ),

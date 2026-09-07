@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
 
 import cv2
 import numpy as np
@@ -75,18 +74,18 @@ class SpoolROI:
 class AngleMeasurement:
     """Result of running the angle detector on a single frame."""
 
-    angle_deg: Optional[float]            # wrapped angle in (-90, 90] (None on failure)
+    angle_deg: float | None            # wrapped angle in (-90, 90] (None on failure)
     confidence: float                     # PCA variance ratio (1st / total), 0..1
     line_pixel_count: int
-    centroid: Optional[tuple[float, float]]
-    direction: Optional[tuple[float, float]]   # unit vector along the line
+    centroid: tuple[float, float] | None
+    direction: tuple[float, float] | None   # unit vector along the line
 
 
 # ---------------------------------------------------------------------------
 # Spool ROI detection
 # ---------------------------------------------------------------------------
 
-def detect_dark_spot(frame_bgr: np.ndarray) -> Optional[tuple[int, int, int, int]]:
+def detect_dark_spot(frame_bgr: np.ndarray) -> tuple[int, int, int, int] | None:
     """Return the bounding box (x0, y0, x1, y1) of the darker (grey) spot.
 
     Logic: the background is "different shades of white" and the dark spot is
@@ -130,8 +129,8 @@ def detect_dark_spot(frame_bgr: np.ndarray) -> Optional[tuple[int, int, int, int
 
 def detect_white_spool(
     frame_bgr: np.ndarray,
-    search_box: Optional[tuple[int, int, int, int]] = None,
-) -> Optional[SpoolROI]:
+    search_box: tuple[int, int, int, int] | None = None,
+) -> SpoolROI | None:
     """Find the white spool: a bright circular region inside the dark spot.
 
     Returns the spool's centre and radius in *frame* coordinates (not the
@@ -205,7 +204,7 @@ def manual_pick_spool(frame_bgr: np.ndarray, window_name: str = "Pick spool") ->
         )
         cv2.imshow(window_name, img)
 
-    def on_mouse(event, x, y, flags, _param):
+    def on_mouse(event, x, y, _flags, _param):
         if event == cv2.EVENT_LBUTTONDOWN:
             state["centre"] = (x, y)
             state["radius"] = 0
@@ -228,11 +227,12 @@ def manual_pick_spool(frame_bgr: np.ndarray, window_name: str = "Pick spool") ->
         if key == 27:
             cv2.destroyWindow(window_name)
             raise RuntimeError("Spool ROI selection cancelled by user")
-        if key in (13, 10, 32):  # Enter / Space
-            if state["centre"] is not None and state["radius"] is not None and state["radius"] > 5:
-                cv2.destroyWindow(window_name)
-                cx, cy = state["centre"]
-                return SpoolROI(cx=cx, cy=cy, radius=int(state["radius"]))
+        accepted = key in (13, 10, 32)  # Enter / Return / Space
+        valid = state["centre"] is not None and (state["radius"] or 0) > 5
+        if accepted and valid:
+            cv2.destroyWindow(window_name)
+            cx, cy = state["centre"]
+            return SpoolROI(cx=cx, cy=cy, radius=int(state["radius"]))
         if key in (ord("r"), ord("R")):
             state["centre"] = None
             state["radius"] = None
@@ -240,23 +240,21 @@ def manual_pick_spool(frame_bgr: np.ndarray, window_name: str = "Pick spool") ->
             redraw()
 
 
-def find_spool_roi(
-    frame_bgr: np.ndarray,
-    mode: str = "both",
-) -> SpoolROI:
+def find_spool_roi(frame_bgr: np.ndarray, mode: str = "both") -> SpoolROI:
     """Top-level dispatcher that returns a :class:`SpoolROI`.
 
     ``mode``:
-        * ``"auto"``       – auto-detect, raise on failure.
-        * ``"manual"``     – always ask the user to click.
-        * ``"both"``       – try auto first, fall back to manual.
+        * ``"auto"``   - auto-detect, raise on failure.
+        * ``"manual"`` - always ask the user to click.
+        * ``"both"``   - try auto first, fall back to manual.
     """
+    if mode not in ("auto", "manual", "both"):
+        raise ValueError(f"Unknown ROI mode: {mode!r} (expected auto, manual or both)")
     if mode in ("auto", "both"):
-        box = detect_dark_spot(frame_bgr)
-        roi = detect_white_spool(frame_bgr, search_box=box)
+        roi = detect_white_spool(frame_bgr, search_box=detect_dark_spot(frame_bgr))
         if roi is not None:
             return roi
-        if roi is None and mode == "auto":
+        if mode == "auto":
             raise RuntimeError("Auto-detection of the spool failed")
     return manual_pick_spool(frame_bgr)
 
@@ -278,7 +276,7 @@ class SpoolAngleDetector:
     def __init__(
         self,
         roi: SpoolROI,
-        line_threshold: Optional[int] = None,   # None -> auto from spool brightness
+        line_threshold: int | None = None,   # None -> auto from spool brightness
         radial_inset: float = 0.92,             # ignore the outer rim
         min_pixels: int = 30,
         morph_kernel: int = 3,
@@ -364,30 +362,33 @@ class SpoolAngleDetector:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def unwrap_series(angles_deg: list[Optional[float]]) -> list[Optional[float]]:
+    def unwrap_next(prev_deg: float | None, angle_deg: float) -> float:
+        """Shift ``angle_deg`` by a multiple of 180 deg to land within 90 deg of ``prev_deg``.
+
+        180 deg is the period of the line-orientation ambiguity, so the shifted
+        value describes the same physical line. With ``prev_deg is None`` the
+        angle is returned unchanged (it becomes the reference).
+        """
+        if prev_deg is None:
+            return angle_deg
+        return angle_deg + 180.0 * round((prev_deg - angle_deg) / 180.0)
+
+    @classmethod
+    def unwrap_series(cls, angles_deg: list[float | None]) -> list[float | None]:
         """Continuously unwrap a list of wrapped angles in (-90, 90].
 
         ``None`` entries are passed through unchanged. The first non-None entry
-        is treated as the reference; subsequent jumps larger than 90 deg are
-        compensated by adding/subtracting 180 deg (the line ambiguity).
+        is treated as the reference; every later value is unwrapped against the
+        previous unwrapped one via :meth:`unwrap_next`.
         """
-        out: list[Optional[float]] = []
-        offset = 0.0
-        prev: Optional[float] = None
+        out: list[float | None] = []
+        prev: float | None = None
         for a in angles_deg:
             if a is None:
                 out.append(None)
                 continue
-            adjusted = a + offset
-            if prev is not None:
-                while adjusted - prev > 90.0:
-                    adjusted -= 180.0
-                    offset -= 180.0
-                while prev - adjusted > 90.0:
-                    adjusted += 180.0
-                    offset += 180.0
-            out.append(adjusted)
-            prev = adjusted
+            prev = cls.unwrap_next(prev, a)
+            out.append(prev)
         return out
 
     # ------------------------------------------------------------------

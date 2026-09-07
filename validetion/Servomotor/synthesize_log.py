@@ -4,29 +4,27 @@ Each motor unit is mapped to a fictitious angle in degrees (0.05 deg/unit) plus
 a small per-trial random noise and a small encoder error.  Useful to verify
 that ``analyze.py`` produces sensible plots before any real hardware is run.
 
-Run from repo root:
-    python analysis/motor_response_analizer_servo/_synthesize_log.py
+Run with::
+
+    python synthesize_log.py
 """
 
 from __future__ import annotations
 
-import sys
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 from protocol import build_protocol
-
 
 ANGLE_PER_UNIT_DEG = 0.05
 ANGLE_NOISE_DEG = 0.4
 ENCODER_NOISE_PCT = 1.5
 
-OUT_ROOT = Path("analysis")
+# Deliberately NOT responses/: the cross-run tools treat every folder there as
+# real camera data, so synthetic runs must not be discoverable alongside it.
+OUT_ROOT = Path(__file__).resolve().parent / "output" / "synthetic"
 
 
 def main() -> None:

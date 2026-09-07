@@ -1,26 +1,19 @@
 """Smoke-test the protocol generator and the angle detector with synthetic frames.
 
-Run from the repo root:
-    python analysis/motor_response_analizer_servo/_smoke_test.py
+Needs no hardware and writes nothing. Run with::
+
+    python smoke_test.py
 """
 
 from __future__ import annotations
 
 import math
-import sys
-from pathlib import Path
 
 import cv2
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from protocol import build_protocol
-from vision_angle import (
-    SpoolAngleDetector, find_spool_roi,
-)
 from motor_io import DryRunMotor
-
+from protocol import build_protocol
+from vision_angle import SpoolAngleDetector, find_spool_roi
 
 H, W = 480, 640
 
@@ -47,7 +40,7 @@ def main() -> None:
     print("=" * 60)
     proto = build_protocol()
     print(f"  total commands: {len(proto)}")
-    deltas = sorted(set(s.delta for s in proto))
+    deltas = sorted({s.delta for s in proto})
     print(f"  unique deltas:  {deltas}")
     by_delta = {d: sum(1 for s in proto if s.delta == d) for d in deltas}
     print(f"  steps / delta:  {by_delta}  (expected 50 each)")

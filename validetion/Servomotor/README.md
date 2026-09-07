@@ -1,194 +1,231 @@
-# Motor Response Characterization Experiment
+# Servo Motor Response Characterization
 
-End-to-end pipeline that:
+Validation pipeline for the servo/spool command path: it drives one motor
+through a deterministic command protocol, films the spool, measures how far the
+spool actually rotated, and reports accuracy, repeatability and drift.
 
-1. **Drives the motor** with a deterministic A/B/drift protocol identical to
-   `esp32_protocol_log.xlsx`.
-2. **Records the spool** with camera index 1 (full MP4 + per-step settled JPEG).
-3. **Measures the black-line angle** on the white spool inside the darker spot
-   (auto-detected ROI, manual click fallback) frame-by-frame.
-4. **Logs everything** to `protocol_log.xlsx` with the same columns as the
-   template plus `angle_deg`, `angle_change_from_zero`, `angle_confidence`, ...
-5. **Plots** the order-vs-angle traces per trial, per delta, and the per-delta
-   error summary.
+The experiment does **not** tune control gains. The PCA9685 hobby-servo path has
+no external PID loop, so the question it answers is: *do repeated position
+commands produce consistent, correctly-signed mechanical motion over the command
+range the haptic device uses?*
 
 ## Layout
 
 ```
-analysis/motor_response_analizer_servo/
-    protocol.py          # generates the protocol (deltas through +/-1000, A/B, drift)
-    motor_io.py          # ESP32 serial I/O (ZM0P<n>F  ->  OK:M0P<actual>)
-    camera_recorder.py   # threaded camera capture + MP4 recording
-    vision_angle.py      # black-line angle detector (PCA on dark spool pixels)
-    run_experiment.py    # the runner that ties it all together
-    analyze.py           # post-run plots and per-delta summary
-    _smoke_test.py       # offline self-test (no hardware)
-    _synthesize_log.py   # generate fake data for testing analyze.py
+validetion/Servomotor/
+    protocol.py                     protocol generator (deltas, A/B trials, drift block)
+    motor_io.py                     ESP32 serial I/O (ZM0P<n>F -> OK:M0P<actual>)
+    camera_recorder.py              threaded camera capture + MP4 recording
+    vision_angle.py                 black-line angle detector (PCA over dark spool pixels)
+
+    run_experiment.py               [entry] acquisition: protocol -> logs -> plots
+    analyze.py                      [entry] per-run plots and per-delta summary
+    generate_report.py              [entry] verified PDF report for one/two runs
+    generate_validation_summary.py  [entry] manuscript figures across all runs
+
+    smoke_test.py                   offline self-test (no hardware, writes nothing)
+    synthesize_log.py               fake run data for exercising analyze.py
+
+    responses/                      run data (git-ignored, ~180 MB)
+    output/                         generated reports and figures (git-ignored)
 ```
 
-## Protocol summary
+These are flat modules, not an installable package: run them from this folder,
+e.g. `python analyze.py`. Every default path is resolved relative to this
+folder, so the commands behave the same whatever your working directory is.
 
-For each `delta` in **`[5, 10, 25, 75, 125, 250, 500, 1000]`** (configurable via
-``ExperimentConfig.deltas`` / programmatic ``build_protocol(deltas=...)``):
+Dependencies come from the repository's `pyproject.toml` — prefix any command
+with `uv run` to use the project environment.
 
-* **Sequence A**: `0 -> +D -> 0 -> -D -> 0`  (5 commands)  - run 3 times.
-* **Sequence B**: `0 -> -D -> 0 -> +D -> 0`  (5 commands)  - run 3 times.
-* Trials are **interleaved A, B, A, B, A, B**.
-* Then a **drift block** of `10 * (+D, -D)` = 20 alternating commands.
+## Protocol
 
-Total (default): **8** delta blocks x (6 trials x 5 + 20 drift) = **50 commands per delta**,
-**400 commands total** (through +/-1000).
+For each `delta` in `[5, 10, 25, 75, 125, 250, 500, 1000]` motor ticks:
 
-## Run it
+* **Sequence A**: `0 -> +D -> 0 -> -D -> 0` (5 commands), repeated 3 times.
+* **Sequence B**: `0 -> -D -> 0 -> +D -> 0` (5 commands), repeated 3 times.
+* Trials interleave **A, B, A, B, A, B**.
+* Then a **drift block**: 10 x `(+D, -D)` = 20 alternating commands.
+
+That is 6 x 5 + 20 = **50 commands per delta**, **400 commands** total. It yields
+six positive and six negative response samples per delta.
+
+## 1. Acquire a run
 
 ```powershell
-# Real experiment (camera idx 1, default ESP32 on COM13):
-python -m analysis.motor_response_analizer_servo.run_experiment
+# Real experiment (ESP32 on COM13, camera index 1):
+python run_experiment.py
 
-# Different port, longer settle/even wider gap between steps:
-python -m analysis.motor_response_analizer_servo.run_experiment `
-    --port COM5 --settle-ms 1800 --inter-command-ms 400 --no-frames
+# Different port, longer settle and a wider gap between steps:
+python run_experiment.py --port COM5 --settle-ms 1800 --inter-command-ms 400
 
-# Always click the spool ROI manually (no auto-detection):
-python -m analysis.motor_response_analizer_servo.run_experiment --roi-mode manual
+# Always click the spool ROI by hand:
+python run_experiment.py --roi-mode manual
 
-# Dry run on a laptop (no ESP32, no camera) for sanity check:
-python -m analysis.motor_response_analizer_servo.run_experiment `
-    --dry-run --no-camera --settle-ms 0 --inter-command-ms 0
+# No hardware and no camera, just to check the pipeline runs:
+python run_experiment.py --dry-run --no-camera --settle-ms 0 --inter-command-ms 0
 ```
 
-CLI flags:
+| flag | default | meaning |
+|---|---|---|
+| `--port` | `COM13` | ESP32 serial port |
+| `--baud` | `115200` | serial baud rate |
+| `--motor-index` | `0` | which motor (the `M0` in the command string) |
+| `--settle-ms` | `1200` | wait after the firmware `OK:` for the spool to settle |
+| `--inter-command-ms` | `250` | pause after the vision capture, before the next command |
+| `--frame-grab-timeout` | `3.0` | max seconds to wait for a frame newer than the settle |
+| `--camera-index` | `1` | OpenCV camera index |
+| `--camera-fps` | `30` | requested capture rate |
+| `--camera-width` / `--camera-height` | *(driver default)* | requested capture size |
+| `--roi-mode` | `both` | `auto` / `manual` / `both` (auto, then manual fallback) |
+| `--no-confirm-roi` | off | skip the ROI confirmation window |
+| `--no-frames` | off | do not save the per-step JPEGs |
+| `--no-video` | off | do not save the continuous MP4 |
+| `--no-annotate` | off | save raw frames instead of annotated ones |
+| `--dry-run` | off | no serial; pretend `actual = target` |
+| `--no-camera` | off | run the protocol with no vision data |
+| `--no-plots` | off | skip the automatic `analyze.py` pass |
+| `--output-root` | `responses/` | parent folder for the timestamped run folders |
 
-| flag                    | default | meaning |
-|-------------------------|---------|---------|
-| `--port`                | `COM13` | ESP32 serial port |
-| `--baud`                | `115200` | serial baud |
-| `--motor-index`         | `0`     | which motor (matches `M0` in the template) |
-| `--settle-ms`           | `1200`  | ms after firmware `OK:` then wait for spool/camera to stabilize before grab |
-| `--inter-command-ms`    | `250`   | ms pause after vision step before **next** motor command |
-| `--frame-grab-timeout`  | `3.0`   | max seconds to obtain a camera frame **newer than** end of settle (see below) |
-| `--camera-index`        | `1`     | OpenCV camera index |
-| `--camera-fps`          | `30`    | requested capture fps |
-| `--roi-mode`            | `both`  | `auto` / `manual` / `both` |
-| `--no-confirm-roi`      | off     | skip the ROI confirmation popup |
-| `--no-frames`           | off     | don't save per-step JPEGs |
-| `--no-video`            | off     | don't save the continuous MP4 |
-| `--no-annotate`         | off     | save raw frames (no overlay) |
-| `--dry-run`             | off     | no serial; pretend `actual = target` |
-| `--no-camera`           | off     | run protocol with no vision data |
-| `--no-plots`           | off     | skip PNG plots + `per_delta_summary.csv` |
-| `--output-root`         | *(package)* `responses/` | parent folder for timestamped runs |
+**Timing matters for target/angle alignment.** After each command the runner
+waits `--settle-ms`, then takes a frame whose capture time is *strictly after*
+that wait, so it never measures a buffered image from before the move finished.
+If the plots look one step "late", raise `--settle-ms` and `--inter-command-ms`.
 
-After each successful **single command**, outputs and **plots** are written under
-``motor_response_analizer_servo/responses/`` (next to the Python files), unless you pass **`--no-plots`** or **`--output-root`**.
+Each run writes `responses/motor_response_<YYYY_MM_DD_HH_MM_SS>/`:
 
-**Timing (important for correct target vs angle):** after each command the runner waits
-``settle-ms``, then takes a frame whose capture time is **strictly after** that wait
-(so it is not an old buffered image from before the move ended). Then it waits
-``inter-command-ms`` before the next command. If plots look one step "late", increase
-``settle-ms`` and/or ``inter-command-ms``.
+```
+protocol_log.csv / .xlsx    full log: protocol columns + measured angles
+recording.mp4               continuous camera recording
+spool_roi.png               the ROI that was used
+frames/step_0001.jpg ...    the settled frame per step (annotated)
+run_summary.json            config, counters and timing
+per_delta_summary.csv       per-delta stats          } written by
+plots/                      PNG figures              } analyze.py
+```
+
+## 2. Per-run plots
+
+`run_experiment.py` calls this automatically. Run it yourself to regenerate
+plots, or after using `--no-plots`:
 
 ```powershell
-# Skip plots (only logs + video + frames):
-python -m analysis.motor_response_analizer_servo.run_experiment --no-plots
+python analyze.py                       # newest run under responses/
+python analyze.py responses/motor_response_2026_04_28_15_02_26
 ```
 
-## Output (default location)
+Written to `<run>/plots/`:
 
-Each run creates one folder **next to this code**:
+* **`command_vs_response_angle.png`** — commanded angle vs measured spool angle
+  per step, with the residual underneath.
+* **`timeline_full.png`** — whole-experiment timeline: commanded target (black)
+  and measured angle (red), with the delta blocks separated.
+* **`timeline_delta_<D>.png`** — one per delta, each trial shaded by its A/B
+  sequence and the drift block highlighted.
+* **`trial_overlay_<D>.png`** — one per delta: every trial as *angle minus the
+  block mean*, plus a panel of all measured values grouped into `+delta`,
+  `-delta` and drift.
+* **`delta_summary.png`** — (a) box-plot of the per-delta residuals
+  (repeatability), (b) mean +/- SD of the angle change for `+delta` and `-delta`.
 
-```
-analysis/motor_response_analizer_servo/responses/motor_response_<YYYY_MM_DD_HH_MM_SS>/
-    protocol_log.xlsx         # full log, mirrors the template + extra columns
-    protocol_log.csv          # same data, plain CSV
-    recording.mp4             # full camera recording
-    spool_roi.png             # snapshot of the chosen ROI
-    frames/step_0001.jpg ...  # one settled frame per step (annotated)
-    run_summary.json          # config + counters
-    per_delta_summary.csv     # table of per-delta angle/encoder stats (from analyze)
-    plots/                    # PNG figures (created automatically after the run)
-        command_vs_response_motor.png    # command vs encoder + motor error each step
-        command_vs_response_angle.png    # vision angles + residual (if camera ran)
-        timeline_full.png
-        timeline_delta_<D>.png   # one per delta
-        trial_overlay_<D>.png    # one per delta (A vs B trials overlaid)
-        delta_summary.png        # 3-panel error summary
-```
+Plus `<run>/per_delta_summary.csv` with the same numbers as a flat table.
 
-## Plot it (re-run or manual)
+### Angle conventions
 
-Plots are written to **`<run_folder>/plots/`** by default when the experiment finishes.
-To regenerate from an existing run, or if you used `--no-plots` earlier:
+The spool line is **undirected**, so its orientation is only defined modulo
+180 deg. Two corrections follow from that, and both are display/analysis
+conventions applied consistently by `analyze.py` and `generate_report.py`:
+
+* **Endpoint sign correction** — at `|target| = 1000` the true rotation reaches
+  the wrap region, so the measured *magnitude* is kept and the *sign* is taken
+  from the command. Treat 1000 as an endpoint stress test, not a linear
+  calibration point.
+* **Command-reference orientation** — for plotting, each non-zero command's
+  measured angle is shifted by at most one 180 deg period toward the nominal
+  command scale, so drift traces stay readable.
+
+The nominal command scale, `+/-1000 ticks = +/-90 deg`, is a **reference for
+comparison only**. It is not a second measured angle; the only physical
+measurement is the camera-derived spool angle.
+
+## 3. Verified PDF report
+
+Recomputes the per-delta statistics straight from `protocol_log.csv`, diffs them
+against the saved `per_delta_summary.csv`, and writes the PDF plus the
+verification artifacts to `output/pdf/`.
 
 ```powershell
-# Most recent run under analysis/:
-python -m analysis.motor_response_analizer_servo.analyze
+# Latest complete camera run, auto-compared against the previous one:
+python generate_report.py
 
-# Or a specific folder:
-python -m analysis.motor_response_analizer_servo.analyze
-
-# Or a specific run folder:
-python -m analysis.motor_response_analizer_servo.analyze `
-    analysis/motor_response_analizer_servo/responses/motor_response_2026_04_28_13_53_58
+# A specific run, with no between-run comparison:
+python generate_report.py responses/motor_response_2026_04_28_15_02_26 --no-comparison
 ```
 
-Generated plots:
+| flag | default | meaning |
+|---|---|---|
+| `run_dir` | *(latest complete run)* | primary run to report on |
+| `--comparison-run` | *(previous complete run)* | second run for the between-run comparison |
+| `--no-comparison` | off | report on the primary run only |
+| `--output-dir` | `output/pdf/` | where the PDF and verification files go |
+| `--pdf-name` | `motor_response_analysis_report.pdf` | PDF filename inside `--output-dir` |
 
-* **`command_vs_response_motor.png`** - every step: **blue** = commanded `target` (motor units),
-  **orange** = ESP32 **`actual`**; bottom panel = **actual − target** error.
-* **`command_vs_response_angle.png`** - vision: proxy command in degrees (`k·target` via linear fit through the origin)
-  vs **camera angle** (`angle_block_zeroed`), bottom panel = angle residual.
-* **`timeline_full.png`** - whole-experiment timeline (commanded target in black,
-  measured angle in red, vertical separators between delta blocks).
-* **`timeline_delta_<D>.png`** - one figure per delta, with each protocol trial
-  shaded by its A/B sequence and the drift block highlighted at the end.
-* **`trial_overlay_<D>.png`** - per delta, Sequences **A** and **B**: each trial shows
-  **angle minus the mean angle for that delta** (horizontal line at 0 = mean); numeric
-  **mean angle** printed in the **upper right**.
-* **`delta_summary.png`** - 3 panels:
-  * (a) box-plot of `(angle - mean)` per delta - smaller box = more repeatable,
-  * (b) mean +/- std angle change for `+delta` and `-delta` separately,
-  * (c) ESP32 encoder relative error per delta (`(actual - target) / target * 100`).
+Outputs: `motor_response_analysis_report.pdf`, `verified_metrics.json`,
+`<run>_independent_summary.csv`, `<run>_summary_diff_check.csv` and (when
+comparing) `between_run_comparison.csv`. The printed "calculation check max
+diff" should be at roundoff level (~1e-15); anything larger means the saved
+summary and the raw log disagree.
 
-## Generate the verified PDF report
+## 4. Cross-run validation figures
 
-The repository now includes a reproducible report generator for the motor-response
-results. It recomputes the per-delta statistics from `protocol_log.csv`, compares
-them with the saved `per_delta_summary.csv`, writes verification CSV/JSON files,
-and creates `output/pdf/motor_response_analysis_report.pdf`.
+Combines every complete camera run into manuscript-ready figures (PNG + editable
+SVG) and tables under `output/validation_summary/`.
 
 ```powershell
-# Latest complete real-camera run, with automatic comparison to the previous run:
-python -m analysis.motor_response_analizer_servo.generate_report
+python generate_validation_summary.py
+python generate_validation_summary.py --run responses/motor_response_2026_04_28_15_02_26
+```
 
-# Specific run:
-python -m analysis.motor_response_analizer_servo.generate_report `
-    analysis/motor_response_analizer_servo/responses/motor_response_2026_04_28_15_02_26
+| flag | default | meaning |
+|---|---|---|
+| `--responses-dir` | `responses/` | folder holding the `motor_response_*` runs |
+| `--output-dir` | `output/validation_summary/` | where figures and tables go |
+| `--run` | *(auto-discover)* | include one specific run; repeatable |
 
-# Specific run without between-run comparison:
-python -m analysis.motor_response_analizer_servo.generate_report `
-    analysis/motor_response_analizer_servo/responses/motor_response_2026_04_28_15_02_26 `
-    --no-comparison
+Produces `validation_summary_figure` (command scale vs measured motion, response
+direction, repeatability), `validation_protocol_vs_drift`,
+`validation_small_motion_zoom`, the backing CSVs, and
+`validation_summary_text.md` with a draft results paragraph.
+
+## Offline checks
+
+```powershell
+python smoke_test.py       # protocol + dry-run I/O + angle detector on synthetic frames
+python synthesize_log.py   # fake run under output/synthetic/, for exercising analyze.py
+```
+
+The report's numeric functions are covered by
+`tests/test_motor_response_report.py` in the repository root:
+
+```powershell
+uv run python -m pytest tests/test_motor_response_report.py
 ```
 
 ## Hardware notes
 
-* The serial settings match `motor_cli.py`: 115200 baud, DTR/RTS held low so the
-  ESP32 does not reset on connect.
-* The runner waits for the firmware's `OK:M<idx>P<actual>` line before sleeping
-  for `settle-ms` and grabbing the angle - so `settle-ms` is purely the
-  mechanical settle time on top of the firmware response.
-* Camera index 1 is used by default and DirectShow is selected on Windows for
-  fast capture.
-* For steps with large ``|target|``, try ``--settle-ms 1500`` … ``2000`` if needed.
+* Serial settings match `motor_cli.py`: 115200 baud with DTR/RTS held low, so
+  connecting does not reset the ESP32.
+* The runner waits for the firmware's `OK:M<idx>P<actual>` before sleeping
+  `--settle-ms`, so that value is purely mechanical settle time on top of the
+  firmware response.
+* Camera index 1 by default; DirectShow is used on Windows for fast capture.
+* For large `|target|`, `--settle-ms 1500`–`2000` may be needed.
 
 ## Vision tips
 
-* The detector assumes the spool is **bright white** with a **single dark line**
-  passing through (or near) its centre.
-* If auto-detection picks the wrong circle, run with `--roi-mode manual` and
-  click the spool centre, then drag to set the radius.
-* If the line is unusually thick / thin, tweak `background_drop` and
+* The detector expects a **bright white spool** carrying a **single dark line**
+  through or near its centre, sitting inside a darker surrounding spot.
+* If auto-detection picks the wrong circle, use `--roi-mode manual` and click
+  the centre, then drag to set the radius.
+* For an unusually thick or thin line, adjust `background_drop` and
   `min_contrast` in `vision_angle.py:SpoolAngleDetector.__init__`.
-* Lighting matters: try to keep the spool brightness `> 200` and the line
-  brightness `< 80` in the captured frames.
+* Lighting matters: aim for spool brightness `> 200` and line brightness `< 80`.

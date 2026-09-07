@@ -17,8 +17,8 @@ columns are filled by the experiment runner at runtime.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from typing import Iterable
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass
 
 # Default: coarse coverage from 5 to 1000 encoder units (positive and negative).
 DEFAULT_DELTAS: tuple[int, ...] = (5, 10, 25, 75, 125, 250, 500, 1000)
@@ -65,7 +65,7 @@ def build_protocol(
     for block, delta in enumerate(deltas, start=1):
         # Interleave A,B,A,B,... so A appears trials_per_sequence times and so does B.
         trial_idx = 0
-        for repeat in range(trials_per_sequence):
+        for _repeat in range(trials_per_sequence):
             for seq in ("A", "B"):
                 trial_idx += 1
                 for step_index, target in enumerate(_sequence_targets(seq, delta), start=1):

@@ -14,14 +14,9 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 import serial
-
-
-def build_command(motor_index: int, target: int) -> str:
-    """Build the ESP32 ZM<motor>P<target>F command string."""
-    return f"ZM{motor_index}P{target}F"
+from protocol import build_command
 
 
 @dataclass
@@ -29,9 +24,9 @@ class MotorResponse:
     """Parsed reply to a single motor command."""
 
     raw: str                       # full response text (may span multiple lines)
-    ok_line: Optional[str]         # the ``OK:...`` line if found
-    actual: Optional[int]          # parsed actual encoder position for our motor
-    error: Optional[str]           # firmware error string, if any (``E:...``)
+    ok_line: str | None         # the ``OK:...`` line if found
+    actual: int | None          # parsed actual encoder position for our motor
+    error: str | None           # firmware error string, if any (``E:...``)
     elapsed_s: float               # time between send and OK/E response
 
 
@@ -52,7 +47,7 @@ class MotorSerial:
         self._baud = baud
         self._boot_wait_s = boot_wait_s
         self._response_timeout_s = response_timeout_s
-        self._ser: Optional[serial.Serial] = None
+        self._ser: serial.Serial | None = None
         self._boot_log: list[str] = []
 
     def open(self) -> list[str]:
@@ -88,7 +83,7 @@ class MotorSerial:
             self._ser.close()
         self._ser = None
 
-    def __enter__(self) -> "MotorSerial":
+    def __enter__(self) -> MotorSerial:
         self.open()
         return self
 
@@ -130,9 +125,9 @@ class MotorSerial:
         self._ser.flush()
 
         lines: list[str] = []
-        ok_line: Optional[str] = None
-        error: Optional[str] = None
-        actual: Optional[int] = None
+        ok_line: str | None = None
+        error: str | None = None
+        actual: int | None = None
 
         deadline = t0 + self._response_timeout_s
         while time.time() < deadline:
@@ -167,7 +162,7 @@ class DryRunMotor:
     Returns ``actual = target`` so the runner can be exercised without hardware.
     """
 
-    def __init__(self, port: str = "DRY", baud: int = 0, **_kwargs):
+    def __init__(self, port: str = "DRY", baud: int = 0, **_kwargs):  # noqa: ARG002 - signature parity with MotorSerial
         self._port_name = port
         self._open = False
         self._boot_log = ["[DRY RUN] no real serial connection"]
@@ -179,7 +174,7 @@ class DryRunMotor:
     def close(self) -> None:
         self._open = False
 
-    def __enter__(self) -> "DryRunMotor":
+    def __enter__(self) -> DryRunMotor:
         self.open()
         return self
 
@@ -204,7 +199,7 @@ class DryRunMotor:
         target = int(match.group(1)) if match else 0
         return self._send_raw(message, motor_index, target)
 
-    def _send_raw(self, message: str, motor_index: int, target: int) -> MotorResponse:
+    def _send_raw(self, _message: str, motor_index: int, target: int) -> MotorResponse:
         ok_line = f"OK:M{motor_index}P{target}"
         return MotorResponse(
             raw=ok_line, ok_line=ok_line, actual=target, error=None, elapsed_s=0.0,

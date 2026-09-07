@@ -1,101 +1,65 @@
 """Run the motor response characterization experiment end-to-end.
 
-Workflow:
+One command drives the whole pipeline: protocol -> acquisition -> logs ->
+summary -> plots.
 
-1.  Build the protocol (deltas + A/B trials + drift block, see ``protocol.py``).
-2.  Open the ESP32 over serial (``ZM<idx>P<target>F`` -> ``OK:M<idx>P<actual>``).
-3.  Open camera index 1 in the background and start recording.
-4.  Pick up an initial spool ROI (auto-detect the dark spot + white spool, with
-    a manual-click fallback).
-5.  For every protocol step:
-        * send the motor command
-        * wait for the firmware ``OK`` response
-        * sleep ``settle_ms`` for the motor to mechanically settle
-        * grab the latest camera frame
-        * measure the black-line angle on the spool
-        * record everything into a row of an Excel/CSV log
-6.  Stop the recording, save the angle-annotated frames, and dump a summary.
+Per protocol step the runner:
 
-Single command does the full pipeline (**one run**):
+1. sends the motor command over serial (``ZM<idx>P<target>F``),
+2. waits for the firmware ``OK:M<idx>P<actual>`` reply,
+3. sleeps ``settle_ms`` for the spool to mechanically settle,
+4. grabs a camera frame captured *after* that settle (never a stale buffer),
+5. measures the black-line angle on the spool and writes one log row.
 
-* motor protocol → camera capture → ``protocol_log.*`` → **plots** + ``per_delta_summary.csv`` (unless ``--no-plots``).
+Each run creates ``responses/motor_response_<timestamp>/`` next to this file::
 
-By default all outputs go under **this package**:
-
-    analysis/motor_response_analizer_servo/responses/motor_response_<timestamp>/
-        protocol_log.csv / .xlsx
-        recording.mp4
-        frames/
-        plots/
-        per_delta_summary.csv
-        run_summary.json
-
-Use ``--output-root`` only if you want a different parent folder.
+    protocol_log.csv / .xlsx   full log: protocol columns + angle measurements
+    recording.mp4              continuous camera recording
+    frames/step_0001.jpg ...   the settled frame per step (annotated)
+    spool_roi.png              snapshot of the ROI used
+    run_summary.json           config, counters and timing
+    per_delta_summary.csv      per-delta stats (from analyze.py)
+    plots/                     PNG figures (from analyze.py)
 
 Run with::
 
-    python -m analysis.motor_response_analizer_servo.run_experiment --port COM13
+    python run_experiment.py --port COM13          # real hardware
+    python run_experiment.py --dry-run --no-camera # no hardware, sanity check
 
-Or, without hardware/camera::
-
-    python -m analysis.motor_response_analizer_servo.run_experiment --dry-run --no-camera
-
-The output folder layout is (default: under ``motor_response_analizer_servo/responses/``)::
-
-    motor_response_analizer_servo/responses/motor_response_<timestamp>/
-        protocol_log.xlsx       # full log (matches the Excel template + extra columns)
-        protocol_log.csv        # same data, plain CSV
-        recording.mp4           # full-length camera recording
-        frames/step_0001.jpg    # settled frame for each step (annotated)
-        spool_roi.png           # the auto/manual ROI overlay used
-        run_summary.json        # config + counters + timing summary
+See ``--output-root`` to write runs somewhere other than ``responses/``.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import cv2
 import pandas as pd
-
-# Allow running both as a script (``python file.py``) and as a module
-# (``python -m analysis.motor_response_analizer_servo.run_experiment``).
-if __package__ in (None, ""):
-    # Run as a script: siblings live next to this file (its directory is
-    # already sys.path[0]).
-    from protocol import build_protocol, ProtocolStep, DEFAULT_DELTAS
-    from motor_io import MotorSerial, DryRunMotor
-    from vision_angle import (
-        SpoolAngleDetector,
-        SpoolROI,
-        detect_dark_spot,
-        detect_white_spool,
-        manual_pick_spool,
-    )
-    from camera_recorder import CameraConfig, CameraRecorder
-else:
-    from .protocol import build_protocol, ProtocolStep, DEFAULT_DELTAS
-    from .motor_io import MotorSerial, DryRunMotor
-    from .vision_angle import (
-        SpoolAngleDetector,
-        SpoolROI,
-        detect_dark_spot,
-        detect_white_spool,
-        manual_pick_spool,
-    )
-    from .camera_recorder import CameraConfig, CameraRecorder
-
+from camera_recorder import CameraConfig, CameraRecorder
+from motor_io import DryRunMotor, MotorSerial
+from protocol import DEFAULT_DELTAS, ProtocolStep, build_protocol
+from vision_angle import (
+    SpoolAngleDetector,
+    SpoolROI,
+    detect_dark_spot,
+    detect_white_spool,
+    manual_pick_spool,
+)
 
 # ---------------------------------------------------------------------------
 # Output location — default: ``<this package>/responses/``
 # ---------------------------------------------------------------------------
+
+CONFIRM_ROI_WINDOW = "Confirm ROI: Enter=ok, r=redo"
+KEYS_ACCEPT = (13, 10, 32)          # Enter / Return / Space
+KEYS_REDO = (ord("r"), ord("R"))
+KEY_ESCAPE = 27
+
 
 def default_responses_parent() -> Path:
     """Directory that holds timestamped ``motor_response_<date>/`` runs (next to code)."""
@@ -125,13 +89,13 @@ class ExperimentConfig:
 
     # Camera
     camera_index: int = 1
-    camera_width: Optional[int] = None
-    camera_height: Optional[int] = None
+    camera_width: int | None = None
+    camera_height: int | None = None
     camera_fps: float = 30.0
 
     # Vision
     roi_mode: str = "both"         # auto | manual | both
-    line_threshold: Optional[int] = None
+    line_threshold: int | None = None
     radial_inset: float = 0.92
     background_drop: float = 0.55
     min_contrast: int = 25
@@ -175,7 +139,7 @@ def _open_motor(cfg: ExperimentConfig):
     )
 
 
-def _open_camera(cfg: ExperimentConfig, video_path: Optional[Path]) -> Optional[CameraRecorder]:
+def _open_camera(cfg: ExperimentConfig, video_path: Path | None) -> CameraRecorder | None:
     if cfg.no_camera:
         print("[camera] disabled (--no-camera)")
         return None
@@ -188,7 +152,7 @@ def _open_camera(cfg: ExperimentConfig, video_path: Optional[Path]) -> Optional[
     return CameraRecorder(cam_cfg, video_path=video_path if cfg.save_video else None)
 
 
-def _pick_initial_roi(cfg: ExperimentConfig, camera: Optional[CameraRecorder]) -> Optional[SpoolROI]:
+def _pick_initial_roi(cfg: ExperimentConfig, camera: CameraRecorder | None) -> SpoolROI | None:
     if camera is None:
         return None
     frame = camera.wait_for_fresh(min_age_s=0.5, timeout_s=3.0)
@@ -196,7 +160,7 @@ def _pick_initial_roi(cfg: ExperimentConfig, camera: Optional[CameraRecorder]) -
         print("[vision] WARNING: no camera frame available for ROI selection")
         return None
 
-    roi: Optional[SpoolROI] = None
+    roi: SpoolROI | None = None
     if cfg.roi_mode in ("auto", "both"):
         box = detect_dark_spot(frame)
         roi = detect_white_spool(frame, search_box=box)
@@ -211,26 +175,29 @@ def _pick_initial_roi(cfg: ExperimentConfig, camera: Optional[CameraRecorder]) -
         raise RuntimeError("Auto ROI detection failed and roi_mode='auto'")
 
     if cfg.confirm_roi and roi is not None:
-        # Show overlay and let the user confirm or redo (SpoolAngleDetector is imported at module top)
-        det_preview = SpoolAngleDetector(roi)
-        meas = det_preview.measure(frame)
-        preview = det_preview.annotate(frame, meas)
-        cv2.imshow("Confirm ROI: Enter=ok, r=redo", preview)
+        roi = _confirm_roi(roi, frame)
+    return roi
+
+
+def _confirm_roi(roi: SpoolROI, frame) -> SpoolROI:
+    """Show the ROI overlay and let the user accept it or click a new one."""
+    def show(current: SpoolROI) -> None:
+        detector = SpoolAngleDetector(current)
+        cv2.imshow(CONFIRM_ROI_WINDOW, detector.annotate(frame, detector.measure(frame)))
+
+    show(roi)
+    try:
         while True:
             key = cv2.waitKey(20) & 0xFF
-            if key in (13, 10, 32):
-                break
-            if key in (ord("r"), ord("R")):
+            if key in KEYS_ACCEPT:
+                return roi
+            if key in KEYS_REDO:
                 roi = manual_pick_spool(frame)
-                det_preview = SpoolAngleDetector(roi)
-                meas = det_preview.measure(frame)
-                preview = det_preview.annotate(frame, meas)
-                cv2.imshow("Confirm ROI: Enter=ok, r=redo", preview)
-            if key == 27:
-                cv2.destroyWindow("Confirm ROI: Enter=ok, r=redo")
+                show(roi)
+            elif key == KEY_ESCAPE:
                 raise RuntimeError("ROI confirmation cancelled")
-        cv2.destroyWindow("Confirm ROI: Enter=ok, r=redo")
-    return roi
+    finally:
+        cv2.destroyWindow(CONFIRM_ROI_WINDOW)
 
 
 def _row_dict(step: ProtocolStep) -> dict:
@@ -262,7 +229,7 @@ def _row_dict(step: ProtocolStep) -> dict:
     }
 
 
-def _save_logs(rows: list[dict], out_dir: Path) -> tuple[Path, Optional[Path]]:
+def _save_logs(rows: list[dict], out_dir: Path) -> tuple[Path, Path | None]:
     df = pd.DataFrame(rows)
     csv_path = out_dir / "protocol_log.csv"
     xlsx_path = out_dir / "protocol_log.xlsx"
@@ -282,9 +249,9 @@ def _save_logs(rows: list[dict], out_dir: Path) -> tuple[Path, Optional[Path]]:
     return csv_path, xlsx_path
 
 
-def _save_summary(out_dir: Path, cfg: ExperimentConfig, roi: Optional[SpoolROI],
-                  rows: list[dict], camera: Optional[CameraRecorder]) -> Path:
-    deltas = sorted(set(r["delta"] for r in rows))
+def _save_summary(out_dir: Path, cfg: ExperimentConfig, roi: SpoolROI | None,
+                  rows: list[dict], camera: CameraRecorder | None) -> Path:
+    deltas = sorted({r["delta"] for r in rows})
     summary = {
         "config": {**asdict(cfg), "output_root": str(cfg.output_root)},
         "n_rows": len(rows),
@@ -305,20 +272,17 @@ def _save_summary(out_dir: Path, cfg: ExperimentConfig, roi: Optional[SpoolROI],
 
 
 def _run_analysis_plots(out_dir: Path) -> None:
-    """Generate ``plots/*.png`` and ``per_delta_summary.csv`` (see ``analyze.py``)."""
+    """Generate ``plots/*.png`` and ``per_delta_summary.csv`` (see ``analyze.py``).
+
+    Imported lazily and guarded: the acquisition data is already on disk at this
+    point, so a plotting failure must not lose the run.
+    """
     try:
-        if __package__ in (None, ""):
-            from analyze import analyze
-        else:
-            from .analyze import analyze
-    except ImportError as e:
-        print(f"[analyze] WARNING: could not load analyze module: {e}")
-        return
-    try:
-        plots_dir = analyze(out_dir)
-        print(f"[analyze] done - open: {plots_dir}")
+        from analyze import analyze
+
+        print(f"[analyze] done - open: {analyze(out_dir)}")
     except Exception as e:
-        print(f"[analyze] WARNING: plot generation failed: {e!s}")
+        print(f"[analyze] WARNING: plot generation failed ({e!s}). Data is safe in {out_dir}.")
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +301,7 @@ def run(cfg: ExperimentConfig) -> Path:
         trials_per_sequence=cfg.trials_per_sequence,
         drift_pairs=cfg.drift_pairs,
     )
-    print(f"[setup] protocol: {len(proto)} steps over {len(set(p.delta for p in proto))} deltas")
+    print(f"[setup] protocol: {len(proto)} steps over {len({p.delta for p in proto})} deltas")
     print(
         f"[setup] timing: settle_ms={cfg.settle_ms}  inter_command_ms={cfg.inter_command_ms}  "
         f"frame_grab_timeout_s={cfg.frame_grab_timeout_s}"
@@ -351,8 +315,8 @@ def run(cfg: ExperimentConfig) -> Path:
     if camera is not None:
         camera.start()
 
-    detector: Optional[SpoolAngleDetector] = None
-    roi: Optional[SpoolROI] = None
+    detector: SpoolAngleDetector | None = None
+    roi: SpoolROI | None = None
     try:
         if camera is not None:
             roi = _pick_initial_roi(cfg, camera)
@@ -372,8 +336,8 @@ def run(cfg: ExperimentConfig) -> Path:
                     cv2.imwrite(str(out_dir / "spool_roi.png"), overlay)
 
         rows: list[dict] = []
-        zero_angle: Optional[float] = None
-        prev_angle: Optional[float] = None
+        zero_angle: float | None = None
+        prev_angle: float | None = None
 
         t_start = time.time()
         for i, step in enumerate(proto, start=1):
@@ -417,10 +381,7 @@ def run(cfg: ExperimentConfig) -> Path:
                         if zero_angle is None:
                             zero_angle = meas.angle_deg
                         # Online unwrap relative to the previous measurement.
-                        unwrapped = SpoolAngleDetector.unwrap_series(
-                            [prev_angle, meas.angle_deg] if prev_angle is not None else [meas.angle_deg]
-                        )
-                        unwrap_now = unwrapped[-1]
+                        unwrap_now = SpoolAngleDetector.unwrap_next(prev_angle, meas.angle_deg)
                         row["angle_deg"] = unwrap_now
                         row["angle_change_from_prev"] = (
                             None if prev_angle is None else unwrap_now - prev_angle
@@ -517,7 +478,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output-root",
         default=None,
         metavar="DIR",
-        help="Parent folder for runs (default: motor_response_analizer_servo/responses next to this code)",
+        help="Parent folder for runs (default: responses/ next to this code)",
     )
     return p
 

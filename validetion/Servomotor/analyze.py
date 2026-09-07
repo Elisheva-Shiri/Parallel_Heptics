@@ -3,41 +3,38 @@
 Inputs: the ``protocol_log.csv`` (or .xlsx) produced by ``run_experiment.py``.
 Outputs (saved next to the log file, in a ``plots/`` subfolder):
 
-  1. ``command_vs_response_angle.png``  - per step: command ticks mapped to a
+  1. ``command_vs_response_angle.png`` - per step: command ticks mapped to a
      nominal angle scale (``+/-1000 ticks = +/-90 deg``) vs measured trial-local
      camera angle. The mapped command is a reference scale, not an independent
      measured motor angle.
-  3. ``timeline_full.png``           - whole-experiment timeline:
-                                       commanded target vs measured angle.
-  4. ``timeline_delta_<D>.png``      - same plot zoomed to a single delta block
-                                       (one figure per delta).
-  5. ``trial_overlay_<D>.png``       - **per delta:** each trial plots
-                                       ``angle_deg − mean(angle in this delta)``
-                                       versus step (0 = block mean); the numeric
-                                       mean appears in the **upper right** corner.
-  6. ``delta_summary.png``           - per-delta angle-response summary:
-                                       a) box-plot of |angle change - mean|
-                                          per delta (repeatability),
-                                       b) mean +/- std of the angle change for
-                                          +delta and -delta motor commands,
-  7. ``per_delta_summary.csv``       - same data as a flat table.
+  2. ``timeline_full.png``        - whole-experiment timeline: commanded target
+                                    vs measured angle.
+  3. ``timeline_delta_<D>.png``   - the same plot zoomed to a single delta block
+                                    (one figure per delta).
+  4. ``trial_overlay_<D>.png``    - per delta, each trial plots
+                                    ``angle_deg - mean(angle in this delta)``
+                                    versus step (0 = block mean); the numeric
+                                    mean appears in the upper-right corner.
+  5. ``delta_summary.png``        - per-delta angle-response summary:
+                                    (a) box-plot of |angle change - mean| per
+                                    delta (repeatability), (b) mean +/- std of
+                                    the angle change for +delta and -delta.
+  6. ``per_delta_summary.csv``    - the same data as a flat table (written to the
+                                    run folder, not to ``plots/``).
 
 The "angle change" used in the summary is computed *within each delta block*
-relative to the local zero of that block (so different starting offsets per
-block do not affect the comparison).
+relative to the local zero of that block, so different starting offsets per
+block do not affect the comparison.
 
 Run with::
 
-    python -m analysis.motor_response_analizer_servo.analyze <run_dir>
-    # or
-    python analysis/motor_response_analizer_servo/analyze.py <run_dir>
+    python analyze.py [run_dir]
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -58,6 +55,20 @@ plt.rcParams.update({
 SEQUENCE_COLORS = {"A": "tab:blue", "B": "tab:orange", "drift": "tab:gray"}
 COMMAND_TICKS_AT_90_DEG = 1000.0
 COMMAND_DEG_PER_TICK = 90.0 / COMMAND_TICKS_AT_90_DEG
+
+# Small deltas sit near the measurement noise floor; pin their y-axis so the
+# per-delta figures stay comparable instead of auto-scaling to the noise.
+SMALL_DELTA_YLIM = {5: (-1.0, 1.0), 10: (-1.0, 1.0), 25: (-4.0, 4.0)}
+
+
+def _drift_angle_column(df: pd.DataFrame) -> str:
+    """Name of the block-zeroed angle column, preferring the display-corrected one."""
+    return "angle_block_zeroed_display" if "angle_block_zeroed_display" in df.columns else "angle_block_zeroed"
+
+
+def _response_angle_column(df: pd.DataFrame) -> str:
+    """Name of the trial-local response column, preferring the endpoint-corrected one."""
+    return "angle_response_deg" if "angle_response_deg" in df.columns else "angle_in_trial"
 
 
 def command_ticks_to_nominal_deg(target: pd.Series | np.ndarray) -> np.ndarray:
@@ -97,9 +108,11 @@ def _orient_to_command_reference(target: pd.Series, angle: pd.Series) -> pd.Seri
     tgt = pd.to_numeric(target, errors="coerce")
     ref = pd.Series(command_ticks_to_nominal_deg(tgt), index=out.index)
     mask = (tgt != 0) & out.notna() & ref.notna()
-    for idx in out.index[mask]:
-        candidates = np.array([out.loc[idx], out.loc[idx] - 180.0, out.loc[idx] + 180.0], dtype=float)
-        out.loc[idx] = candidates[np.argmin(np.abs(candidates - ref.loc[idx]))]
+    # Choose the one of {angle, angle-180, angle+180} nearest the reference:
+    # that is a single 180-deg step, clipped so we never shift by more than one
+    # period even when the measurement is far from the command scale.
+    shift = np.clip(np.round((ref[mask] - out[mask]) / 180.0), -1.0, 1.0)
+    out.loc[mask] = out[mask] + 180.0 * shift
     return out
 
 
@@ -147,7 +160,7 @@ def add_trial_change(df: pd.DataFrame) -> pd.DataFrame:
     if "angle_deg" not in df.columns:
         return df
     proto = df[df["mode"] == "protocol"]
-    for (block, trial), sub in proto.groupby(["block", "trial"]):
+    for (_block, _trial), sub in proto.groupby(["block", "trial"]):
         valid = sub["angle_deg"].dropna()
         if valid.empty:
             continue
@@ -170,7 +183,7 @@ def plot_full_timeline(df: pd.DataFrame, out_path: Path) -> None:
     ax_target.set_xlabel("step index")
 
     ax_angle = ax_target.twinx()
-    angle_col = "angle_block_zeroed_display" if "angle_block_zeroed_display" in df.columns else "angle_block_zeroed"
+    angle_col = _drift_angle_column(df)
     if angle_col in df.columns:
         ax_angle.plot(x, df[angle_col], color="crimson", lw=1.2,
                       label="measured angle [deg] (block-zeroed; 1000 endpoint sign-corrected)")
@@ -179,7 +192,7 @@ def plot_full_timeline(df: pd.DataFrame, out_path: Path) -> None:
         ax_angle.grid(False)
 
     # Vertical lines at the start of each block.
-    for block, sub in df.groupby("block"):
+    for _block, sub in df.groupby("block"):
         x0 = sub.index.min()
         ax_target.axvline(x0, color="gray", alpha=0.25, lw=0.8)
         delta = int(sub["delta"].iloc[0])
@@ -211,7 +224,7 @@ def plot_delta_timeline(df: pd.DataFrame, delta: int, out_path: Path) -> None:
     ax_t.set_xlabel(f"step index (within delta={delta} block)")
 
     ax_a = ax_t.twinx()
-    angle_col = "angle_block_zeroed_display" if "angle_block_zeroed_display" in sub.columns else "angle_block_zeroed"
+    angle_col = _drift_angle_column(sub)
     if angle_col in sub.columns:
         ax_a.plot(x, sub[angle_col], color="crimson", lw=1.4,
                   label="measured angle [deg] (block-zeroed)")
@@ -279,7 +292,7 @@ def plot_trial_overlay(df: pd.DataFrame, delta: int, out_path: Path) -> None:
     axes = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])]
     ax_values = fig.add_subplot(gs[1, :])
 
-    for ax, seq in zip(axes, ["A", "B"]):
+    for ax, seq in zip(axes, ["A", "B"], strict=True):
         seq_data = proto[proto["sequence"] == seq]
         seq_data = seq_data.sort_values(["trial", "step_index"])
         if seq_data.empty:
@@ -302,10 +315,8 @@ def plot_trial_overlay(df: pd.DataFrame, delta: int, out_path: Path) -> None:
         if seq == "A":
             ax.set_ylabel("Angle minus block mean [deg]")
         ax.set_xticks([1, 2, 3, 4, 5])
-        if int(delta) in (5, 10):
-            ax.set_ylim(-1.0, 1.0)
-        elif int(delta) == 25:
-            ax.set_ylim(-4.0, 4.0)
+        if int(delta) in SMALL_DELTA_YLIM:
+            ax.set_ylim(*SMALL_DELTA_YLIM[int(delta)])
         ax.grid(True, which="major", linestyle="-", linewidth=0.35, alpha=0.55)
         ax.legend(fontsize=8, ncol=2, framealpha=0.9, loc="upper left")
 
@@ -317,13 +328,13 @@ def plot_trial_overlay(df: pd.DataFrame, delta: int, out_path: Path) -> None:
             ha="right",
             va="top",
             fontsize=9,
-            bbox=dict(boxstyle="round", facecolor="white", edgecolor="0.65", alpha=0.95),
+            bbox={"boxstyle": "round", "facecolor": "white", "edgecolor": "0.65", "alpha": 0.95},
             zorder=10,
         )
 
     # Bottom panel: all response values by group, including the drift block.
-    response_col = "angle_response_deg" if "angle_response_deg" in block.columns else "angle_in_trial"
-    drift_col = "angle_block_zeroed_display" if "angle_block_zeroed_display" in block.columns else "angle_block_zeroed"
+    response_col = _response_angle_column(block)
+    drift_col = _drift_angle_column(block)
     groups = [
         ("+delta\nprotocol", proto[pd.to_numeric(proto["target"], errors="coerce") > 0][response_col], "tab:blue"),
         ("-delta\nprotocol", proto[pd.to_numeric(proto["target"], errors="coerce") < 0][response_col], "tab:orange"),
@@ -363,10 +374,8 @@ def plot_trial_overlay(df: pd.DataFrame, delta: int, out_path: Path) -> None:
     ax_values.set_xticklabels([g[0] for g in groups])
     ax_values.set_ylabel("Measured response [deg]")
     ax_values.set_title("All measured values: protocol signs and drift block (thick line = group mean)")
-    if int(delta) in (5, 10):
-        ax_values.set_ylim(-1.0, 1.0)
-    elif int(delta) == 25:
-        ax_values.set_ylim(-4.0, 4.0)
+    if int(delta) in SMALL_DELTA_YLIM:
+        ax_values.set_ylim(*SMALL_DELTA_YLIM[int(delta)])
     ax_values.grid(True, which="major", linestyle="-", linewidth=0.35, alpha=0.55)
 
     fig.suptitle(f"Delta = {delta}: trial overlay and all measured response values")
@@ -393,7 +402,7 @@ def per_delta_summary(df: pd.DataFrame) -> pd.DataFrame:
     proto = df[(df["mode"] == "protocol") & (df["target"] != 0)].copy()
     if proto.empty:
         return pd.DataFrame()
-    response_col = "angle_response_deg" if "angle_response_deg" in proto.columns else "angle_in_trial"
+    response_col = _response_angle_column(proto)
 
     # For analysis we want the move *into* +/-delta which is step_index 2 or 4.
     # angle_response_deg at those steps is the actual induced rotation, with only
@@ -430,12 +439,12 @@ def plot_delta_summary(df: pd.DataFrame, summary: pd.DataFrame, out_path: Path) 
 
     # (a) repeatability box plot of (sample - mean) per delta
     proto = df[(df["mode"] == "protocol") & (df["target"] != 0)].copy()
-    response_col = "angle_response_deg" if "angle_response_deg" in proto.columns else "angle_in_trial"
+    response_col = _response_angle_column(proto)
     box_data = []
     box_labels = []
     for delta, sub in proto.groupby("delta"):
         residuals = []
-        for sign, side in [(+1, "+"), (-1, "-")]:
+        for sign, _side in [(+1, "+"), (-1, "-")]:
             sel = sub[np.sign(sub["target"]) == sign][response_col].dropna().to_numpy()
             if sel.size > 1:
                 residuals.append(sel - sel.mean())
@@ -500,25 +509,21 @@ def plot_delta_summary(df: pd.DataFrame, summary: pd.DataFrame, out_path: Path) 
     plt.close(fig)
 
 
-def _safe_numeric(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce")
-
-
 def plot_command_vs_response_angle(df: pd.DataFrame, out_path: Path) -> None:
     """Mapped command angle vs measured block-zeroed camera angle.
 
     The command line is not a measured motor angle. It is the fixed display
     mapping requested for interpretation: +/-1000 command ticks = +/-90 deg.
     """
-    angle_col = "angle_block_zeroed_display" if "angle_block_zeroed_display" in df.columns else "angle_block_zeroed"
+    angle_col = _drift_angle_column(df)
     if angle_col not in df.columns:
-        return None
+        return
 
     steps = np.arange(len(df))
     cmd_angle = command_ticks_to_nominal_deg(df["target"])
     meas = pd.to_numeric(df[angle_col], errors="coerce").to_numpy(dtype=float)
     if np.all(np.isnan(meas)):
-        return None
+        return
     err = meas - cmd_angle
 
     fig, (ax0, ax1) = plt.subplots(
@@ -546,28 +551,22 @@ def plot_command_vs_response_angle(df: pd.DataFrame, out_path: Path) -> None:
     ax1.set_xlabel("Step")
     ax1.set_ylabel("Angle error\n(measured - mapped command) [deg]")
 
-    plt.tight_layout()
+    fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
-    return None
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _latest_motor_run_dir() -> Optional[Path]:
-    """Pick newest ``motor_response_*`` run: prefers ``<analyze.py package>/responses/``, then ``analysis/``."""
-    dirs: list[Path] = []
-    pkg_resp = Path(__file__).resolve().parent / "responses"
-    if pkg_resp.is_dir():
-        dirs.extend(p for p in pkg_resp.glob("motor_response_*") if p.is_dir())
-    cwd_analysis = Path("analysis").resolve()
-    if cwd_analysis.is_dir():
-        dirs.extend(p for p in cwd_analysis.glob("motor_response_*") if p.is_dir())
-    if not dirs:
-        return None
-    return max(dirs, key=lambda p: p.stat().st_mtime)
+RESPONSES_DIR = Path(__file__).resolve().parent / "responses"
+
+
+def _latest_motor_run_dir() -> Path | None:
+    """Newest ``motor_response_*`` folder under ``responses/``, or ``None`` if there is none."""
+    runs = [p for p in RESPONSES_DIR.glob("motor_response_*") if p.is_dir()]
+    return max(runs, key=lambda p: p.stat().st_mtime) if runs else None
 
 
 def analyze(run_dir: Path) -> Path:
@@ -606,8 +605,7 @@ def main() -> None:
         type=Path,
         nargs="?",
         default=None,
-        help="Folder ``motor_response_<timestamp>``. If omitted, uses newest run "
-             "under ``motor_response_analizer_servo/responses/`` then under ``analysis/``.",
+        help="Folder ``motor_response_<timestamp>``. Defaults to the newest run under ``responses/``.",
     )
     args = p.parse_args()
 
@@ -615,8 +613,7 @@ def main() -> None:
         run_dir = _latest_motor_run_dir()
         if run_dir is None:
             raise SystemExit(
-                "No motor_response_* run found. Expected under motor_response_analizer_servo/responses/ "
-                "or analysis/. Pass the run folder explicitly."
+                f"No motor_response_* run found under {RESPONSES_DIR}. Pass the run folder explicitly."
             )
         print(f"[analyze] using most recent run: {run_dir}")
     else:
