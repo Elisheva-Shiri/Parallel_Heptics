@@ -182,7 +182,9 @@ def merged_table_latex(m: pd.DataFrame, n_per_direction: int = 18, label: str = 
         r"\fontsize{7.5}{9}\selectfont",
         r"\caption{Motor validation: measured spool rotation per command amplitude, "
         r"pooled over three runs ($n = " + str(n_per_direction) + r"$ per direction). "
-        r"Values are mean\,$\pm$\,SD; hysteresis is mean\,$\pm$\,SE.}"
+        r"Values are mean\,$\pm$\,SD; hysteresis is mean\,$\pm$\,SE. "
+        r"$|\bar\theta|$ is the mean of the two directional magnitudes, and Error its "
+        r"deviation from the nominal $0.09^\circ$/tick scale.}"
         + r"\label{" + label + "}",
         r"\setlength{\tabcolsep}{2.5pt}",
         r"\renewcommand{\arraystretch}{1.05}",
