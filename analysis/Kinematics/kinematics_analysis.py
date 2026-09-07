@@ -89,6 +89,14 @@ FINGER_ALIASES = {
 }
 FINGER_LABELS = {"I": "Index", "M": "Middle", "R": "Ring", "P": "Pinky"}
 FINGER_TO_COLOR = {"I": "#1f77b4", "M": "#ff7f0e", "R": "#2ca02c", "P": "#d62728"}
+GROUP_TO_COLOR = {
+    "L": "#FF69B4",  # pink
+    "L_E": "#FF69B4",
+    "L_P": "#FF69B4",
+    "N": "#7B2CBF",  # purple
+    "N_E": "#7B2CBF",
+    "N_P": "#7B2CBF",
+}
 IGNORED_PATH_PATTERNS = (
     "old",
     "unfinished",
@@ -97,69 +105,73 @@ FILTER_PATH_PATTERNS = (
     "filter",
     "filtered",
 )
+TOP_CAMERA_HEIGHT_ABOVE_TABLE_CM = 100.0
+SIDE_CAMERA_HEIGHT_ABOVE_TABLE_CM = 10.0
+TOP_CAMERA_FRAME_WIDTH_PX = CENTER_X * 2.0
+TOP_CAMERA_FRAME_HEIGHT_PX = CENTER_Y * 2.0
 WORKSPACE_SPECS_CM = {
     # User-specified physical workspaces.  These normalize derived coordinates
     # while preserving the original camera/analog pixel values in all outputs.
-    "L": {"workspace_width_cm": 60.0, "workspace_height_cm": 60.0},
-    "N": {"workspace_width_cm": 40.0, "workspace_height_cm": 50.0},
+    "L": {"workspace_width_cm": 80.0, "workspace_height_cm": 60.0},
+    "N": {"workspace_width_cm": 60.0, "workspace_height_cm": 45.0},
 }
 EXPERIMENT_SETUP_CONTEXT = {
     "L": {
         "side_camera_side": "right",
         "participant_position_context": "slightly_left",
-        "movement_space_context": "larger 60x60 cm movement space",
+        "movement_space_context": "Lab/airslide 80x60 cm movement field",
         "side_camera_interpretation_note": (
-            "L experiment: side camera was on the participant's right side; "
-            "participant was slightly left of the workspace center."
+            "L/Lab-airslide experiment: top camera was 100 cm above the table; "
+            "side camera was on the participant's right side, 10 cm above the table."
         ),
     },
     "N": {
         "side_camera_side": "left",
         "participant_position_context": "centered",
-        "movement_space_context": "smaller 40x50 cm movement space",
+        "movement_space_context": "Natural 60x45 cm movement field",
         "side_camera_interpretation_note": (
-            "N experiment: participant sat at the center of the smaller movement "
-            "space; side camera was on the participant's left side."
+            "N/Natural experiment: top camera was 100 cm above the table; "
+            "side camera was on the participant's left side, 10 cm above the table."
         ),
     },
 }
 STIFFNESS_CMAP = "viridis"
 MOTOR_CONTROL_METRICS = [
     "success_rate",
-    "mean_max_r_center_px",
-    "mean_speed_px_s",
-    "mean_acceleration_px_s2",
-    "mean_jerk_px_s3",
-    "mean_normalized_jerk_cost",
-    "mean_curvature_1_px",
+    "mean_max_r_workspace_cm",
+    "mean_speed_cm_s",
+    "mean_acceleration_cm_s2",
+    "mean_jerk_cm_s3",
+    "mean_normalized_jerk_cost_cm",
+    "mean_curvature_1_cm",
     "speed_curvature_power_law_slope",
     "speed_curvature_power_law_r2",
-    "mean_path_length_px",
-    "mean_straightness_index",
-    "mean_vx_px_s",
-    "mean_vy_px_s",
+    "mean_path_length_cm",
+    "mean_straightness_index_cm",
+    "mean_vx_cm_s",
+    "mean_vy_cm_s",
 ]
 TRIAL_SUCCESS_METRICS = [
-    "max_r_center_px",
-    "path_length_px",
-    "straightness_index",
-    "mean_speed_px_s",
-    "max_speed_px_s",
-    "mean_acceleration_px_s2",
-    "max_acceleration_px_s2",
-    "mean_jerk_px_s3",
-    "max_jerk_px_s3",
-    "normalized_jerk_cost",
-    "mean_curvature_1_px",
+    "max_r_workspace_cm",
+    "path_length_cm",
+    "straightness_index_cm",
+    "mean_speed_cm_s",
+    "max_speed_cm_s",
+    "mean_acceleration_cm_s2",
+    "max_acceleration_cm_s2",
+    "mean_jerk_cm_s3",
+    "max_jerk_cm_s3",
+    "normalized_jerk_cost_cm",
+    "mean_curvature_1_cm",
     "speed_curvature_power_law_slope",
     "speed_curvature_power_law_r2",
-    "mean_abs_radial_velocity_px_s",
-    "mean_abs_tangential_velocity_px_s",
+    "mean_abs_radial_velocity_cm_s",
+    "mean_abs_tangential_velocity_cm_s",
     "movement_direction_resultant_length",
     "movement_direction_entropy_bits",
     "duration_s",
-    "mean_side_z_lift_px",
-    "max_side_z_lift_px",
+    "mean_side_z_lift_cm",
+    "max_side_z_lift_cm",
     "side_detection_rate",
 ]
 
@@ -1471,7 +1483,18 @@ def save_experiment_setup_context(output_root: Path) -> Path:
 def _figure_colors(labels: Iterable[Any]) -> dict[Any, Any]:
     labels = list(labels)
     cmap = plt.get_cmap("tab20")
-    return {label: cmap(i % cmap.N) for i, label in enumerate(labels)}
+    colors: dict[Any, Any] = {}
+    fallback_labels: list[Any] = []
+    for label in labels:
+        group_color = GROUP_TO_COLOR.get(str(label))
+        if group_color is not None:
+            colors[label] = group_color
+        else:
+            fallback_labels.append(label)
+    colors.update(
+        {label: cmap(i % cmap.N) for i, label in enumerate(fallback_labels)}
+    )
+    return colors
 
 
 def _stiffness_viridis_colors(
@@ -1563,8 +1586,11 @@ def _ordered_fingers(values: Iterable[Any]) -> list[Any]:
 def add_workspace_normalization_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Add N/L workspace metadata and normalized physical coordinates.
 
-    Original pixel/analog values remain unchanged.  Added centimeter columns use
-    the requested workspaces: L = 60x60 cm, N = 40x50 cm.
+    Original pixel/analog values remain unchanged for traceability.  Added
+    centimeter columns use the requested movement fields: L = 80x60 cm,
+    N = 60x45 cm. Side-view Z is a camera-proxy converted with the setup's
+    vertical top-field scale because no independent side-camera calibration grid
+    is stored with the analysis.
     """
 
     if df.empty:
@@ -1590,6 +1616,15 @@ def add_workspace_normalization_columns(df: pd.DataFrame) -> pd.DataFrame:
             "workspace_height_cm", np.nan
         )
     )
+    out["top_camera_height_above_table_cm"] = TOP_CAMERA_HEIGHT_ABOVE_TABLE_CM
+    out["side_camera_height_above_table_cm"] = SIDE_CAMERA_HEIGHT_ABOVE_TABLE_CM
+    out["top_camera_frame_width_px"] = TOP_CAMERA_FRAME_WIDTH_PX
+    out["top_camera_frame_height_px"] = TOP_CAMERA_FRAME_HEIGHT_PX
+    out["x_cm_per_px"] = out["workspace_width_cm"] / TOP_CAMERA_FRAME_WIDTH_PX
+    out["y_cm_per_px"] = out["workspace_height_cm"] / TOP_CAMERA_FRAME_HEIGHT_PX
+    # Side-camera z is a proxy: without a side calibration target, use the
+    # setup's vertical movement-field scale and keep all raw *_px columns.
+    out["side_z_cm_per_px"] = out["y_cm_per_px"]
     for context_col in [
         "side_camera_side",
         "participant_position_context",
@@ -1604,24 +1639,145 @@ def add_workspace_normalization_columns(df: pd.DataFrame) -> pd.DataFrame:
         out["side_camera_view_sign"] = out["side_camera_side"].map(
             side_camera_view_sign_for_side
         )
-    if "x_centered_px" in out.columns:
-        out["x_workspace_cm"] = (
-            pd.to_numeric(out["x_centered_px"], errors="coerce")
-            / CENTER_X
-            * (out["workspace_width_cm"] / 2.0)
-        )
-    if "y_centered_px" in out.columns:
-        out["y_workspace_cm"] = (
-            pd.to_numeric(out["y_centered_px"], errors="coerce")
-            / CENTER_Y
-            * (out["workspace_height_cm"] / 2.0)
-        )
+    def _scale_px_to_cm(source: str, target: str, scale_col: str) -> None:
+        if source in out.columns and target not in out.columns:
+            out[target] = pd.to_numeric(out[source], errors="coerce") * pd.to_numeric(
+                out[scale_col], errors="coerce"
+            )
+
+    for source, target in [
+        ("x_centered_px", "x_workspace_cm"),
+        ("x_lpf_px", "x_lpf_cm"),
+        ("x_hpf_px", "x_hpf_cm"),
+        ("thumb_x_centered_px", "thumb_x_centered_cm"),
+        ("active_finger_x_centered_px", "active_finger_x_centered_cm"),
+        ("thumb_active_dx_px", "thumb_active_dx_cm"),
+        ("hand_midpoint_x_centered_px", "hand_midpoint_x_centered_cm"),
+        ("x_3d_px", "x_3d_cm"),
+        ("side_x_from_frame_center_px", "side_x_from_frame_center_cm"),
+        ("side_x_from_center_camera_corrected_px", "side_x_from_center_camera_corrected_cm"),
+        ("side_lateral_camera_corrected_px", "side_lateral_camera_corrected_cm"),
+        ("mean_x_centered_px", "mean_x_workspace_cm"),
+        ("mean_side_x_from_center_camera_corrected_px", "mean_side_x_from_center_camera_corrected_cm"),
+        ("mean_side_lateral_camera_corrected_px", "mean_side_lateral_camera_corrected_cm"),
+    ]:
+        _scale_px_to_cm(source, target, "x_cm_per_px")
+    for source, target in [
+        ("y_centered_px", "y_workspace_cm"),
+        ("y_lpf_px", "y_lpf_cm"),
+        ("y_hpf_px", "y_hpf_cm"),
+        ("thumb_y_centered_px", "thumb_y_centered_cm"),
+        ("active_finger_y_centered_px", "active_finger_y_centered_cm"),
+        ("thumb_active_dy_px", "thumb_active_dy_cm"),
+        ("hand_midpoint_y_centered_px", "hand_midpoint_y_centered_cm"),
+        ("y_3d_px", "y_3d_cm"),
+        ("mean_y_centered_px", "mean_y_workspace_cm"),
+    ]:
+        _scale_px_to_cm(source, target, "y_cm_per_px")
+    for source, target in [
+        ("side_z_lift_px", "side_z_lift_cm"),
+        ("side_z_lift_raw_px", "side_z_lift_raw_cm"),
+        ("side_z_lift_centroid_px", "side_z_lift_centroid_cm"),
+        ("z_lift_px", "z_lift_cm"),
+        ("z_3d_proxy_px", "z_3d_proxy_cm"),
+        ("mean_side_z_lift_px", "mean_side_z_lift_cm"),
+        ("max_side_z_lift_px", "max_side_z_lift_cm"),
+        ("mean_z_lift_px", "mean_z_lift_cm"),
+        ("max_z_lift_px", "max_z_lift_cm"),
+    ]:
+        _scale_px_to_cm(source, target, "side_z_cm_per_px")
+    for source, target in [
+        ("vx_px_s", "vx_cm_s"),
+        ("mean_vx_px_s", "mean_vx_cm_s"),
+        ("vx_3d_px_s", "vx_3d_cm_s"),
+        ("side_lateral_velocity_raw_px_s", "side_lateral_velocity_raw_cm_s"),
+        ("side_lateral_velocity_camera_corrected_px_s", "side_lateral_velocity_camera_corrected_cm_s"),
+    ]:
+        _scale_px_to_cm(source, target, "x_cm_per_px")
+    for source, target in [
+        ("vy_px_s", "vy_cm_s"),
+        ("mean_vy_px_s", "mean_vy_cm_s"),
+        ("vy_3d_px_s", "vy_3d_cm_s"),
+    ]:
+        _scale_px_to_cm(source, target, "y_cm_per_px")
+    for source, target in [
+        ("vz_px_s", "vz_cm_s"),
+        ("vz_3d_proxy_px_s", "vz_3d_proxy_cm_s"),
+        ("mean_vz_px_s", "mean_vz_cm_s"),
+        ("side_z_velocity_px_s", "side_z_velocity_cm_s"),
+    ]:
+        _scale_px_to_cm(source, target, "side_z_cm_per_px")
+    for source, target in [
+        ("ax_px_s2", "ax_cm_s2"),
+        ("mean_ax_px_s2", "mean_ax_cm_s2"),
+        ("ax_3d_px_s2", "ax_3d_cm_s2"),
+    ]:
+        _scale_px_to_cm(source, target, "x_cm_per_px")
+    for source, target in [
+        ("ay_px_s2", "ay_cm_s2"),
+        ("mean_ay_px_s2", "mean_ay_cm_s2"),
+        ("ay_3d_px_s2", "ay_3d_cm_s2"),
+    ]:
+        _scale_px_to_cm(source, target, "y_cm_per_px")
+    for source, target in [
+        ("az_px_s2", "az_cm_s2"),
+        ("az_3d_proxy_px_s2", "az_3d_proxy_cm_s2"),
+    ]:
+        _scale_px_to_cm(source, target, "side_z_cm_per_px")
+    for source, target in [
+        ("jx_px_s3", "jx_cm_s3"),
+    ]:
+        _scale_px_to_cm(source, target, "x_cm_per_px")
+    for source, target in [
+        ("jy_px_s3", "jy_cm_s3"),
+    ]:
+        _scale_px_to_cm(source, target, "y_cm_per_px")
+
     if {"x_workspace_cm", "y_workspace_cm"}.issubset(out.columns):
         out["r_workspace_cm"] = np.hypot(out["x_workspace_cm"], out["y_workspace_cm"])
         half_diag = np.hypot(
             out["workspace_width_cm"] / 2.0, out["workspace_height_cm"] / 2.0
         )
         out["r_workspace_normalized"] = out["r_workspace_cm"] / half_diag
+        out["position_angle_cm_deg"] = np.degrees(
+            np.arctan2(out["y_workspace_cm"], out["x_workspace_cm"])
+        )
+    if {"thumb_active_dx_cm", "thumb_active_dy_cm"}.issubset(out.columns):
+        out["thumb_active_span_cm"] = np.hypot(
+            out["thumb_active_dx_cm"], out["thumb_active_dy_cm"]
+        )
+        out["hand_orientation_xy_cm_deg"] = np.degrees(
+            np.arctan2(out["thumb_active_dy_cm"], out["thumb_active_dx_cm"])
+        )
+    if {"vx_cm_s", "vy_cm_s"}.issubset(out.columns):
+        out["speed_cm_s"] = np.hypot(out["vx_cm_s"], out["vy_cm_s"])
+        out["movement_angle_cm_deg"] = np.degrees(
+            np.arctan2(out["vy_cm_s"], out["vx_cm_s"])
+        )
+    if {"ax_cm_s2", "ay_cm_s2"}.issubset(out.columns):
+        out["acceleration_cm_s2"] = np.hypot(out["ax_cm_s2"], out["ay_cm_s2"])
+    if {"jx_cm_s3", "jy_cm_s3"}.issubset(out.columns):
+        out["jerk_cm_s3"] = np.hypot(out["jx_cm_s3"], out["jy_cm_s3"])
+    if {"vx_cm_s", "vy_cm_s", "ax_cm_s2", "ay_cm_s2", "speed_cm_s"}.issubset(out.columns):
+        curvature_num = (out["vx_cm_s"] * out["ay_cm_s2"] - out["vy_cm_s"] * out["ax_cm_s2"]).abs()
+        curvature_den = np.power(out["speed_cm_s"], 3)
+        out["curvature_1_cm"] = np.where(curvature_den > 0, curvature_num / curvature_den, np.nan)
+    if {"x_3d_cm", "y_3d_cm", "z_3d_proxy_cm"}.issubset(out.columns):
+        out["r_3d_from_center_cm"] = np.sqrt(
+            out["x_3d_cm"] ** 2 + out["y_3d_cm"] ** 2 + out["z_3d_proxy_cm"] ** 2
+        )
+    if {"vx_3d_cm_s", "vy_3d_cm_s", "vz_3d_proxy_cm_s"}.issubset(out.columns):
+        out["speed_3d_proxy_cm_s"] = np.sqrt(
+            out["vx_3d_cm_s"] ** 2 + out["vy_3d_cm_s"] ** 2 + out["vz_3d_proxy_cm_s"] ** 2
+        )
+    if {"ax_3d_cm_s2", "ay_3d_cm_s2", "az_3d_proxy_cm_s2"}.issubset(out.columns):
+        out["acceleration_3d_proxy_cm_s2"] = np.sqrt(
+            out["ax_3d_cm_s2"] ** 2 + out["ay_3d_cm_s2"] ** 2 + out["az_3d_proxy_cm_s2"] ** 2
+        )
+    if {"side_z_lift_cm", "side_x_from_center_camera_corrected_cm"}.issubset(out.columns):
+        out["side_lift_lateral_angle_camera_corrected_cm_deg"] = np.degrees(
+            np.arctan2(out["side_z_lift_cm"], out["side_x_from_center_camera_corrected_cm"])
+        )
     return out
 
 
@@ -1878,7 +2034,7 @@ def _speed_curvature_power_law(segment: pd.DataFrame) -> dict[str, float]:
 
     For planar upper-limb drawing/reaching, motor-control work often expects
     speed to decrease with curvature; the classic two-thirds/one-third form is
-    roughly ``speed ∝ curvature^-1/3`` on sufficiently curved movement portions.
+    roughly ``speed proportional to curvature^-1/3`` on sufficiently curved movement portions.
     """
     required = {"speed_px_s", "curvature_1_px"}
     if not required.issubset(segment.columns):
@@ -2597,6 +2753,17 @@ def compute_tracking_kinematics(
                 d[col] = val
         d = _add_hand_actor_columns(d)
         d = add_workspace_normalization_columns(d)
+        if {"r_workspace_cm", "stiffness_segment_id"}.issubset(d.columns):
+            d["radial_velocity_cm_s"] = (
+                d.groupby("stiffness_segment_id", sort=False)["r_workspace_cm"].diff()
+                / segment_dt
+            )
+        if {"position_angle_cm_deg", "vx_cm_s", "vy_cm_s"}.issubset(d.columns):
+            theta_cm = np.deg2rad(d["position_angle_cm_deg"])
+            d["tangential_velocity_cm_s"] = (
+                -np.sin(theta_cm) * d["vx_cm_s"] + np.cos(theta_cm) * d["vy_cm_s"]
+            )
+            d["movement_direction_cm"] = d["movement_angle_cm_deg"].map(_direction_label)
         for optional_col in [
             "thumb_x_centered_px",
             "thumb_y_centered_px",
@@ -2605,7 +2772,11 @@ def compute_tracking_kinematics(
             "thumb_active_dx_px",
             "thumb_active_dy_px",
             "thumb_active_span_px",
+            "thumb_active_span_cm",
             "hand_orientation_xy_deg",
+            "hand_orientation_xy_cm_deg",
+            "radial_velocity_cm_s",
+            "tangential_velocity_cm_s",
         ]:
             if optional_col not in d.columns:
                 d[optional_col] = np.nan
@@ -2641,6 +2812,11 @@ def compute_tracking_kinematics(
                     np.hypot(seg["x_centered_px"].diff(), seg["y_centered_px"].diff())
                 )
             )
+            path_len_cm = float(
+                np.nansum(
+                    np.hypot(seg["x_workspace_cm"].diff(), seg["y_workspace_cm"].diff())
+                )
+            ) if {"x_workspace_cm", "y_workspace_cm"}.issubset(seg.columns) else np.nan
             net_disp = (
                 float(
                     np.hypot(
@@ -2651,9 +2827,22 @@ def compute_tracking_kinematics(
                 if len(seg)
                 else np.nan
             )
+            net_disp_cm = (
+                float(
+                    np.hypot(
+                        seg["x_workspace_cm"].iloc[-1] - seg["x_workspace_cm"].iloc[0],
+                        seg["y_workspace_cm"].iloc[-1] - seg["y_workspace_cm"].iloc[0],
+                    )
+                )
+                if len(seg) and {"x_workspace_cm", "y_workspace_cm"}.issubset(seg.columns)
+                else np.nan
+            )
             dominant_angle = _circ_mean_deg(
                 movement["movement_angle_deg"], movement["speed_px_s"].fillna(0)
             )
+            dominant_angle_cm = _circ_mean_deg(
+                movement["movement_angle_cm_deg"], movement["speed_cm_s"].fillna(0)
+            ) if {"movement_angle_cm_deg", "speed_cm_s"}.issubset(movement.columns) else dominant_angle
             counts = movement["movement_direction"].value_counts(normalize=True)
             entropy = (
                 float(-(counts * np.log2(counts)).sum()) if len(counts) else np.nan
@@ -2749,10 +2938,18 @@ def compute_tracking_kinematics(
                     else np.nan,
                     "mean_r_center_px": float(movement["r_center_px"].median()),
                     "max_r_center_px": float(movement["r_center_px"].max()),
+                    "max_r_workspace_cm": float(movement["r_workspace_cm"].max())
+                    if "r_workspace_cm" in movement.columns
+                    else np.nan,
                     "mean_thumb_active_span_px": float(
                         movement["thumb_active_span_px"].median()
                     )
                     if "thumb_active_span_px" in movement.columns
+                    else np.nan,
+                    "mean_thumb_active_span_cm": float(
+                        movement["thumb_active_span_cm"].median()
+                    )
+                    if "thumb_active_span_cm" in movement.columns
                     else np.nan,
                     "mean_hand_orientation_xy_deg": _circ_mean_deg(
                         movement["hand_orientation_xy_deg"]
@@ -2760,14 +2957,31 @@ def compute_tracking_kinematics(
                     if "hand_orientation_xy_deg" in movement.columns
                     else np.nan,
                     "path_length_px": path_len,
+                    "path_length_cm": path_len_cm,
                     "net_displacement_px": net_disp,
+                    "net_displacement_cm": net_disp_cm,
                     "straightness_index": net_disp / path_len
                     if path_len > 0
+                    else np.nan,
+                    "straightness_index_cm": net_disp_cm / path_len_cm
+                    if np.isfinite(path_len_cm) and path_len_cm > 0
                     else np.nan,
                     "mean_vx_px_s": float(movement["vx_px_s"].median()),
                     "mean_vy_px_s": float(movement["vy_px_s"].median()),
                     "mean_speed_px_s": float(movement["speed_px_s"].median()),
                     "max_speed_px_s": float(movement["speed_px_s"].max()),
+                    "mean_vx_cm_s": float(movement["vx_cm_s"].median())
+                    if "vx_cm_s" in movement.columns
+                    else np.nan,
+                    "mean_vy_cm_s": float(movement["vy_cm_s"].median())
+                    if "vy_cm_s" in movement.columns
+                    else np.nan,
+                    "mean_speed_cm_s": float(movement["speed_cm_s"].median())
+                    if "speed_cm_s" in movement.columns
+                    else np.nan,
+                    "max_speed_cm_s": float(movement["speed_cm_s"].max())
+                    if "speed_cm_s" in movement.columns
+                    else np.nan,
                     "mean_ax_px_s2": float(movement["ax_px_s2"].median()),
                     "mean_ay_px_s2": float(movement["ay_px_s2"].median()),
                     "mean_acceleration_px_s2": float(
@@ -2776,11 +2990,45 @@ def compute_tracking_kinematics(
                     "max_acceleration_px_s2": float(
                         movement["acceleration_px_s2"].max()
                     ),
+                    "mean_ax_cm_s2": float(movement["ax_cm_s2"].median())
+                    if "ax_cm_s2" in movement.columns
+                    else np.nan,
+                    "mean_ay_cm_s2": float(movement["ay_cm_s2"].median())
+                    if "ay_cm_s2" in movement.columns
+                    else np.nan,
+                    "mean_acceleration_cm_s2": float(movement["acceleration_cm_s2"].median())
+                    if "acceleration_cm_s2" in movement.columns
+                    else np.nan,
+                    "max_acceleration_cm_s2": float(movement["acceleration_cm_s2"].max())
+                    if "acceleration_cm_s2" in movement.columns
+                    else np.nan,
                     "mean_jerk_px_s3": float(movement["jerk_px_s3"].median()),
                     "max_jerk_px_s3": float(movement["jerk_px_s3"].max()),
+                    "mean_jerk_cm_s3": float(movement["jerk_cm_s3"].median())
+                    if "jerk_cm_s3" in movement.columns
+                    else np.nan,
+                    "max_jerk_cm_s3": float(movement["jerk_cm_s3"].max())
+                    if "jerk_cm_s3" in movement.columns
+                    else np.nan,
                     "normalized_jerk_cost": _normalized_jerk_cost(movement, path_length_px=path_len),
+                    "normalized_jerk_cost_cm": _normalized_jerk_cost(
+                        pd.DataFrame(
+                            {
+                                "time_s": movement["time_s"],
+                                "jx_px_s3": movement["jx_cm_s3"],
+                                "jy_px_s3": movement["jy_cm_s3"],
+                            }
+                        ),
+                        path_length_px=path_len_cm,
+                    ) if np.isfinite(path_len_cm) and {"time_s", "jx_cm_s3", "jy_cm_s3"}.issubset(movement.columns) else np.nan,
                     "mean_curvature_1_px": float(movement["curvature_1_px"].median()),
                     "median_curvature_1_px": float(movement["curvature_1_px"].median()),
+                    "mean_curvature_1_cm": float(movement["curvature_1_cm"].median())
+                    if "curvature_1_cm" in movement.columns
+                    else np.nan,
+                    "median_curvature_1_cm": float(movement["curvature_1_cm"].median())
+                    if "curvature_1_cm" in movement.columns
+                    else np.nan,
                     "speed_curvature_power_law_slope": speed_curvature["slope"],
                     "speed_curvature_power_law_intercept": speed_curvature["intercept"],
                     "speed_curvature_power_law_r2": speed_curvature["r2"],
@@ -2794,9 +3042,21 @@ def compute_tracking_kinematics(
                     "mean_abs_tangential_velocity_px_s": float(
                         movement["tangential_velocity_px_s"].abs().median()
                     ),
+                    "mean_radial_velocity_cm_s": float(
+                        movement["radial_velocity_cm_s"].median()
+                    ) if "radial_velocity_cm_s" in movement.columns else np.nan,
+                    "mean_abs_radial_velocity_cm_s": float(
+                        movement["radial_velocity_cm_s"].abs().median()
+                    ) if "radial_velocity_cm_s" in movement.columns else np.nan,
+                    "mean_abs_tangential_velocity_cm_s": float(
+                        movement["tangential_velocity_cm_s"].abs().median()
+                    ) if "tangential_velocity_cm_s" in movement.columns else np.nan,
                     "dominant_movement_angle_deg": dominant_angle,
-                    "dominant_movement_direction": _direction_label(dominant_angle),
+                    "dominant_movement_angle_cm_deg": dominant_angle_cm,
+                    "dominant_movement_direction": _direction_label(dominant_angle_cm),
                     "movement_direction_resultant_length": _resultant_length(
+                        movement["movement_angle_cm_deg"], movement["speed_cm_s"].fillna(0)
+                    ) if {"movement_angle_cm_deg", "speed_cm_s"}.issubset(movement.columns) else _resultant_length(
                         movement["movement_angle_deg"], movement["speed_px_s"].fillna(0)
                     ),
                     "movement_direction_entropy_bits": entropy,
@@ -2834,6 +3094,19 @@ def compute_tracking_kinematics(
                 y_workspace_cm=("y_workspace_cm", "median"),
                 r_workspace_cm=("r_workspace_cm", "median"),
                 r_workspace_normalized=("r_workspace_normalized", "median"),
+                vx_cm_s=("vx_cm_s", "median"),
+                vy_cm_s=("vy_cm_s", "median"),
+                speed_cm_s=("speed_cm_s", "median"),
+                ax_cm_s2=("ax_cm_s2", "median"),
+                ay_cm_s2=("ay_cm_s2", "median"),
+                acceleration_cm_s2=("acceleration_cm_s2", "median"),
+                curvature_1_cm=("curvature_1_cm", "median"),
+                jx_cm_s3=("jx_cm_s3", "median"),
+                jy_cm_s3=("jy_cm_s3", "median"),
+                jerk_cm_s3=("jerk_cm_s3", "median"),
+                radial_velocity_cm_s=("radial_velocity_cm_s", "median"),
+                tangential_velocity_cm_s=("tangential_velocity_cm_s", "median"),
+                movement_angle_cm_deg=("movement_angle_cm_deg", lambda s: _circ_mean_deg(s)),
                 workspace_setup=("workspace_setup", "first"),
                 workspace_label=("workspace_label", "first"),
                 workspace_width_cm=("workspace_width_cm", "first"),
@@ -2852,6 +3125,7 @@ def compute_tracking_kinematics(
                 thumb_active_dx_px=("thumb_active_dx_px", "median"),
                 thumb_active_dy_px=("thumb_active_dy_px", "median"),
                 thumb_active_span_px=("thumb_active_span_px", "median"),
+                thumb_active_span_cm=("thumb_active_span_cm", "median"),
                 hand_orientation_xy_deg=(
                     "hand_orientation_xy_deg",
                     lambda s: _circ_mean_deg(s),
@@ -2901,6 +3175,21 @@ def compute_tracking_kinematics(
             "y_workspace_cm",
             "r_workspace_cm",
             "r_workspace_normalized",
+            "position_angle_cm_deg",
+            "vx_cm_s",
+            "vy_cm_s",
+            "speed_cm_s",
+            "movement_angle_cm_deg",
+            "movement_direction_cm",
+            "ax_cm_s2",
+            "ay_cm_s2",
+            "acceleration_cm_s2",
+            "curvature_1_cm",
+            "jx_cm_s3",
+            "jy_cm_s3",
+            "jerk_cm_s3",
+            "radial_velocity_cm_s",
+            "tangential_velocity_cm_s",
             "workspace_setup",
             "workspace_label",
             "workspace_width_cm",
@@ -2917,7 +3206,9 @@ def compute_tracking_kinematics(
             "thumb_active_dx_px",
             "thumb_active_dy_px",
             "thumb_active_span_px",
+            "thumb_active_span_cm",
             "hand_orientation_xy_deg",
+            "hand_orientation_xy_cm_deg",
             "hand_midpoint_x_centered_px",
             "hand_midpoint_y_centered_px",
             "x_lpf_px",
@@ -3208,9 +3499,12 @@ def _z_tracking_rows_for_segment(
     selected = _sample_side_z_rows(selected, samples_per_video)
     selected["side_video_file"] = str(video)
     selected["side_video_warning"] = ""
-    for col, val in meta.items():
-        if col not in selected.columns:
-            selected[col] = val
+    missing_meta = {col: val for col, val in meta.items() if col not in selected.columns}
+    if missing_meta:
+        selected = pd.concat(
+            [selected, pd.DataFrame(missing_meta, index=selected.index)],
+            axis=1,
+        )
     return selected
 
 
@@ -3236,6 +3530,7 @@ def _finalize_side_sample_values(vals: pd.DataFrame) -> pd.DataFrame:
     vals["side_z_velocity_px_s"] = (
         pd.to_numeric(vals["side_z_lift_px"], errors="coerce").diff().divide(dt)
     )
+    vals = add_workspace_normalization_columns(vals)
     if {
         "side_lateral_velocity_raw_px_s",
         "side_z_velocity_px_s",
@@ -3312,6 +3607,7 @@ def _summarize_side_z_by_stiffness(side_trial_summary: pd.DataFrame) -> pd.DataF
     """
     if side_trial_summary is None or side_trial_summary.empty:
         return pd.DataFrame()
+    side_trial_summary = add_workspace_normalization_columns(side_trial_summary)
     return (
         side_trial_summary.groupby(["stiffness_value"], dropna=False)
         .agg(
@@ -3320,8 +3616,15 @@ def _summarize_side_z_by_stiffness(side_trial_summary: pd.DataFrame) -> pd.DataF
             mean_side_z_lift_px=("mean_side_z_lift_px", "median"),
             sem_side_z_lift_px=("mean_side_z_lift_px", _sem),
             max_side_z_lift_px=("max_side_z_lift_px", "mean"),
+            mean_side_z_lift_cm=("mean_side_z_lift_cm", "median"),
+            sem_side_z_lift_cm=("mean_side_z_lift_cm", _sem),
+            max_side_z_lift_cm=("max_side_z_lift_cm", "mean"),
             mean_side_x_from_center_camera_corrected_px=(
                 "mean_side_x_from_center_camera_corrected_px",
+                "median",
+            ),
+            mean_side_x_from_center_camera_corrected_cm=(
+                "mean_side_x_from_center_camera_corrected_cm",
                 "median",
             ),
             mean_side_lift_lateral_angle_camera_corrected_deg=(
@@ -3361,11 +3664,17 @@ def estimate_side_video_z(
     participant x stiffness, matching the top-view kinematic outputs.
     """
     sample_frames: list[pd.DataFrame] = []
-    selected = (
-        trial_summary[trial_summary.get("side_video_exists", False).astype(bool)]
-        .copy()
-        .sort_values(["subject_id", "trial_index_raw"])
-    )
+    if trial_summary is None or trial_summary.empty:
+        selected = pd.DataFrame()
+    else:
+        if "side_video_exists" in trial_summary.columns:
+            side_video_mask = trial_summary["side_video_exists"].fillna(False).astype(bool)
+        else:
+            side_video_mask = pd.Series(False, index=trial_summary.index)
+        selected = trial_summary.loc[side_video_mask].copy()
+        sort_cols = [c for c in ["subject_id", "trial_index_raw"] if c in selected.columns]
+        if sort_cols:
+            selected = selected.sort_values(sort_cols)
     selected = add_workspace_normalization_columns(selected)
     if max_trials is not None:
         selected = selected.head(max_trials)
@@ -3426,8 +3735,42 @@ def estimate_side_video_z(
     )
 
     base_keys = ["subject_id", "trial_index_raw"]
+    for key in base_keys:
+        if key not in side_samples.columns:
+            side_samples[key] = np.nan
     if "stiffness_segment_id" in side_samples.columns:
         base_keys.append("stiffness_segment_id")
+    # Some historical/filtered trial summaries do not carry all metadata columns.
+    # Add nullable placeholders so the side-Z cell returns complete tables instead
+    # of failing before the user can inspect missing-data warnings.
+    for optional_col in [
+        "subject_group",
+        EXPERIMENT_GROUP_COLUMN,
+        "finger_condition",
+        "stiffness_value",
+        "stiffness_order_in_trial",
+        "comparison_value",
+        "standard_value",
+        "signed_stiffness_delta",
+        "correct_response",
+        "side_video_file",
+        "z_tracking_file",
+        "z_tracking_warning",
+        "missing_z_tracking_csv",
+        "side_camera_side",
+        "side_camera_view_sign",
+        "frame_index",
+        "side_detected",
+        "side_z_lift_px",
+        "side_x_from_frame_center_px",
+        "side_x_from_center_camera_corrected_px",
+        "side_lift_lateral_angle_raw_deg",
+        "side_lift_lateral_angle_camera_corrected_deg",
+        "side_motion_direction_camera_corrected_deg",
+        "side_mask_area_px",
+    ]:
+        if optional_col not in side_samples.columns:
+            side_samples[optional_col] = np.nan
     side_trial_summary = (
         side_samples.groupby(base_keys, dropna=False)
         .agg(
@@ -3477,6 +3820,10 @@ def estimate_side_video_z(
         )
         .reset_index()
     )
+    # The trial summary is built from pixel aggregates; normalize it before any
+    # downstream cm aggregation (e.g. side_subject_stiffness_summary) so notebook
+    # calls do not fail with missing mean_side_z_lift_cm/max_side_z_lift_cm.
+    side_trial_summary = add_workspace_normalization_columns(side_trial_summary)
     side_samples = add_success_label_column(
         add_protocol_demographic_factors(add_workspace_normalization_columns(side_samples))
     )
@@ -3513,6 +3860,8 @@ def estimate_side_video_z(
             side_trial_time_fraction=("side_trial_time_fraction", "mean"),
             mean_side_z_lift_px=("side_z_lift_px", "median"),
             sem_side_z_lift_px=("side_z_lift_px", _sem),
+            mean_side_z_lift_cm=("side_z_lift_cm", "median"),
+            sem_side_z_lift_cm=("side_z_lift_cm", _sem),
             mean_side_x_from_center_camera_corrected_px=(
                 "side_x_from_center_camera_corrected_px",
                 "median",
@@ -3545,6 +3894,9 @@ def estimate_side_video_z(
             mean_side_z_lift_px=("mean_side_z_lift_px", "median"),
             sem_side_z_lift_px=("mean_side_z_lift_px", _sem),
             max_side_z_lift_px=("max_side_z_lift_px", "mean"),
+            mean_side_z_lift_cm=("mean_side_z_lift_cm", "median"),
+            sem_side_z_lift_cm=("mean_side_z_lift_cm", _sem),
+            max_side_z_lift_cm=("max_side_z_lift_cm", "mean"),
             mean_side_x_from_center_camera_corrected_px=(
                 "mean_side_x_from_center_camera_corrected_px",
                 "median",
@@ -3598,6 +3950,7 @@ def summarize_kinematics(
     ts = trial_summary.copy()
     for optional_metric in [
         "mean_curvature_1_px",
+        "mean_curvature_1_cm",
         "speed_curvature_power_law_slope",
         "speed_curvature_power_law_r2",
     ]:
@@ -3611,7 +3964,10 @@ def summarize_kinematics(
             errors="coerce",
         )
 
-    for col in ["mean_jerk_px_s3", "max_jerk_px_s3", "normalized_jerk_cost"]:
+    for col in [
+        "mean_jerk_px_s3", "max_jerk_px_s3", "normalized_jerk_cost",
+        "mean_jerk_cm_s3", "max_jerk_cm_s3", "normalized_jerk_cost_cm",
+    ]:
         if col not in ts.columns:
             ts[col] = np.nan
 
@@ -3650,7 +4006,15 @@ def summarize_kinematics(
     }.issubset(ts.columns):
         half_diag = np.hypot(ts["workspace_width_cm"] / 2.0, ts["workspace_height_cm"] / 2.0)
         ts["mean_r_workspace_normalized"] = ts["mean_r_workspace_cm"] / half_diag
-    for optional_col in ["mean_thumb_active_span_px", "mean_hand_orientation_xy_deg"]:
+    for optional_col in [
+        "mean_thumb_active_span_px", "mean_thumb_active_span_cm",
+        "mean_hand_orientation_xy_deg", "mean_hand_orientation_xy_cm_deg",
+        "max_r_workspace_cm", "path_length_cm", "net_displacement_cm",
+        "straightness_index_cm", "mean_speed_cm_s", "max_speed_cm_s",
+        "mean_acceleration_cm_s2", "max_acceleration_cm_s2",
+        "mean_abs_radial_velocity_cm_s", "mean_abs_tangential_velocity_cm_s",
+        "mean_side_z_lift_cm", "max_side_z_lift_cm",
+    ]:
         if optional_col not in ts.columns:
             ts[optional_col] = np.nan
     direction_cols = _present_group_cols(
@@ -3672,6 +4036,12 @@ def summarize_kinematics(
         .agg(
             n_trials=("trial_index_raw", "count"),
             success_rate=("correct_response", "mean"),
+            mean_x_workspace_cm=("mean_x_workspace_cm", "median"),
+            mean_y_workspace_cm=("mean_y_workspace_cm", "median"),
+            mean_speed_cm_s=("mean_speed_cm_s", "median"),
+            mean_r_workspace_cm=("mean_r_workspace_cm", "median"),
+            mean_path_length_cm=("path_length_cm", "median"),
+            # Raw pixel columns are retained after cm metrics for traceability.
             mean_x_centered_px=("mean_x_centered_px", "median"),
             mean_y_centered_px=("mean_y_centered_px", "median"),
             mean_speed_px_s=("mean_speed_px_s", "median"),
@@ -3696,9 +4066,9 @@ def summarize_kinematics(
 
     quantile_groups = _present_group_cols(ts, ["subject_id", "stiffness_value"])
     ts["distance_quantile"] = (
-        ts.groupby(quantile_groups)["max_r_center_px"].transform(_quartile)
-        if quantile_groups
-        else _quartile(ts["max_r_center_px"])
+        ts.groupby(quantile_groups)["max_r_workspace_cm"].transform(_quartile)
+        if quantile_groups and "max_r_workspace_cm" in ts.columns
+        else _quartile(ts["max_r_workspace_cm"] if "max_r_workspace_cm" in ts.columns else ts["max_r_center_px"])
     )
     distance_cols = _present_group_cols(
         ts,
@@ -3718,8 +4088,11 @@ def summarize_kinematics(
         ts.groupby(distance_cols, dropna=False)
         .agg(
             n_trials=("trial_index_raw", "count"),
-            mean_max_r_center_px=("max_r_center_px", "median"),
+            mean_max_r_workspace_cm=("max_r_workspace_cm", "median"),
             success_rate=("correct_response", "mean"),
+            mean_speed_cm_s=("mean_speed_cm_s", "median"),
+            # Raw pixel columns are retained after cm metrics for traceability.
+            mean_max_r_center_px=("max_r_center_px", "median"),
             mean_speed_px_s=("mean_speed_px_s", "median"),
         )
         .reset_index()
@@ -3750,30 +4123,47 @@ def summarize_kinematics(
             mean_r_workspace_cm=("mean_r_workspace_cm", "median"),
             mean_r_workspace_normalized=("mean_r_workspace_normalized", "median"),
             mean_max_r_center_px=("max_r_center_px", "median"),
+            mean_max_r_workspace_cm=("max_r_workspace_cm", "median"),
             mean_thumb_active_span_px=("mean_thumb_active_span_px", "median"),
+            mean_thumb_active_span_cm=("mean_thumb_active_span_cm", "median"),
             mean_hand_orientation_xy_deg=(
                 "mean_hand_orientation_xy_deg",
                 lambda s: _circ_mean_deg(s),
             ),
+            mean_hand_orientation_xy_cm_deg=(
+                "mean_hand_orientation_xy_cm_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
             mean_vx_px_s=("mean_vx_px_s", "median"),
             mean_vy_px_s=("mean_vy_px_s", "median"),
+            mean_vx_cm_s=("mean_vx_cm_s", "median"),
+            mean_vy_cm_s=("mean_vy_cm_s", "median"),
             mean_speed_px_s=("mean_speed_px_s", "median"),
+            mean_speed_cm_s=("mean_speed_cm_s", "median"),
             mean_ax_px_s2=("mean_ax_px_s2", "median"),
             mean_ay_px_s2=("mean_ay_px_s2", "median"),
+            mean_ax_cm_s2=("mean_ax_cm_s2", "median"),
+            mean_ay_cm_s2=("mean_ay_cm_s2", "median"),
             mean_acceleration_px_s2=("mean_acceleration_px_s2", "median"),
+            mean_acceleration_cm_s2=("mean_acceleration_cm_s2", "median"),
             mean_jerk_px_s3=("mean_jerk_px_s3", "median"),
+            mean_jerk_cm_s3=("mean_jerk_cm_s3", "median"),
             mean_normalized_jerk_cost=("normalized_jerk_cost", "median"),
+            mean_normalized_jerk_cost_cm=("normalized_jerk_cost_cm", "median"),
             mean_curvature_1_px=("mean_curvature_1_px", "median"),
+            mean_curvature_1_cm=("mean_curvature_1_cm", "median"),
             speed_curvature_power_law_slope=("speed_curvature_power_law_slope", "mean"),
             speed_curvature_power_law_r2=("speed_curvature_power_law_r2", "mean"),
             mean_path_length_px=("path_length_px", "median"),
+            mean_path_length_cm=("path_length_cm", "median"),
             mean_straightness_index=("straightness_index", "median"),
+            mean_straightness_index_cm=("straightness_index_cm", "median"),
             circular_mean_direction_deg=(
                 "dominant_movement_angle_deg",
                 lambda s: _circ_mean_deg(s),
             ),
             movement_direction_resultant_length=(
-                "dominant_movement_angle_deg",
+                "dominant_movement_angle_cm_deg",
                 lambda s: _resultant_length(s),
             ),
         )
@@ -3795,19 +4185,36 @@ def summarize_kinematics(
             mean_vy_px_s=("mean_vy_px_s", "median"),
             sem_vx_px_s=("mean_vx_px_s", _sem),
             sem_vy_px_s=("mean_vy_px_s", _sem),
+            mean_vx_cm_s=("mean_vx_cm_s", "median"),
+            mean_vy_cm_s=("mean_vy_cm_s", "median"),
+            sem_vx_cm_s=("mean_vx_cm_s", _sem),
+            sem_vy_cm_s=("mean_vy_cm_s", _sem),
             mean_speed_px_s=("mean_speed_px_s", "median"),
             sem_speed_px_s=("mean_speed_px_s", _sem),
+            mean_speed_cm_s=("mean_speed_cm_s", "median"),
+            sem_speed_cm_s=("mean_speed_cm_s", _sem),
             mean_ax_px_s2=("mean_ax_px_s2", "median"),
             mean_ay_px_s2=("mean_ay_px_s2", "median"),
             sem_ax_px_s2=("mean_ax_px_s2", _sem),
             sem_ay_px_s2=("mean_ay_px_s2", _sem),
+            mean_ax_cm_s2=("mean_ax_cm_s2", "median"),
+            mean_ay_cm_s2=("mean_ay_cm_s2", "median"),
+            sem_ax_cm_s2=("mean_ax_cm_s2", _sem),
+            sem_ay_cm_s2=("mean_ay_cm_s2", _sem),
             mean_acceleration_px_s2=("mean_acceleration_px_s2", "median"),
             sem_acceleration_px_s2=("mean_acceleration_px_s2", _sem),
+            mean_acceleration_cm_s2=("mean_acceleration_cm_s2", "median"),
+            sem_acceleration_cm_s2=("mean_acceleration_cm_s2", _sem),
             mean_jerk_px_s3=("mean_jerk_px_s3", "median"),
             sem_jerk_px_s3=("mean_jerk_px_s3", _sem),
+            mean_jerk_cm_s3=("mean_jerk_cm_s3", "median"),
+            sem_jerk_cm_s3=("mean_jerk_cm_s3", _sem),
             mean_normalized_jerk_cost=("normalized_jerk_cost", "median"),
             sem_normalized_jerk_cost=("normalized_jerk_cost", _sem),
+            mean_normalized_jerk_cost_cm=("normalized_jerk_cost_cm", "median"),
+            sem_normalized_jerk_cost_cm=("normalized_jerk_cost_cm", _sem),
             mean_path_length_px=("path_length_px", "median"),
+            mean_path_length_cm=("path_length_cm", "median"),
             circular_mean_direction_deg=(
                 "dominant_movement_angle_deg",
                 lambda s: _circ_mean_deg(s),
@@ -3822,6 +4229,7 @@ def summarize_kinematics(
         )
         if "az_px_s2" not in tb.columns:
             tb["az_px_s2"] = np.nan
+        tb = add_workspace_normalization_columns(tb)
         if "stiffness_value" not in tb.columns:
             tb["stiffness_value"] = pd.to_numeric(
                 tb.get("comparison_value", np.nan), errors="coerce"
@@ -3852,28 +4260,49 @@ def summarize_kinematics(
                 mean_y_centered_px=("y_centered_px", "median"),
                 mean_x_workspace_cm=("x_workspace_cm", "median"),
                 mean_y_workspace_cm=("y_workspace_cm", "median"),
+                mean_r_workspace_cm=("r_workspace_cm", "median"),
                 mean_r_workspace_normalized=("r_workspace_normalized", "median"),
                 sem_x_centered_px=("x_centered_px", _sem),
                 sem_y_centered_px=("y_centered_px", _sem),
+                sem_x_workspace_cm=("x_workspace_cm", _sem),
+                sem_y_workspace_cm=("y_workspace_cm", _sem),
                 mean_r_center_px=("r_center_px", "median"),
                 sem_r_center_px=("r_center_px", _sem),
+                sem_r_workspace_cm=("r_workspace_cm", _sem),
                 mean_vx_px_s=("vx_px_s", "median"),
                 mean_vy_px_s=("vy_px_s", "median"),
                 sem_vx_px_s=("vx_px_s", _sem),
                 sem_vy_px_s=("vy_px_s", _sem),
+                mean_vx_cm_s=("vx_cm_s", "median"),
+                mean_vy_cm_s=("vy_cm_s", "median"),
+                sem_vx_cm_s=("vx_cm_s", _sem),
+                sem_vy_cm_s=("vy_cm_s", _sem),
                 mean_speed_px_s=("speed_px_s", "median"),
                 sem_speed_px_s=("speed_px_s", _sem),
+                mean_speed_cm_s=("speed_cm_s", "median"),
+                sem_speed_cm_s=("speed_cm_s", _sem),
                 mean_ax_px_s2=("ax_px_s2", "median"),
                 mean_ay_px_s2=("ay_px_s2", "median"),
                 mean_az_px_s2=("az_px_s2", "median"),
                 sem_ax_px_s2=("ax_px_s2", _sem),
                 sem_ay_px_s2=("ay_px_s2", _sem),
+                mean_ax_cm_s2=("ax_cm_s2", "median"),
+                mean_ay_cm_s2=("ay_cm_s2", "median"),
+                mean_az_cm_s2=("az_cm_s2", "median"),
+                sem_ax_cm_s2=("ax_cm_s2", _sem),
+                sem_ay_cm_s2=("ay_cm_s2", _sem),
                 mean_acceleration_px_s2=("acceleration_px_s2", "median"),
                 sem_acceleration_px_s2=("acceleration_px_s2", _sem),
+                mean_acceleration_cm_s2=("acceleration_cm_s2", "median"),
+                sem_acceleration_cm_s2=("acceleration_cm_s2", _sem),
                 mean_jerk_px_s3=("jerk_px_s3", "median"),
                 sem_jerk_px_s3=("jerk_px_s3", _sem),
+                mean_jerk_cm_s3=("jerk_cm_s3", "median"),
+                sem_jerk_cm_s3=("jerk_cm_s3", _sem),
                 mean_radial_velocity_px_s=("radial_velocity_px_s", "median"),
                 mean_tangential_velocity_px_s=("tangential_velocity_px_s", "median"),
+                mean_radial_velocity_cm_s=("radial_velocity_cm_s", "median"),
+                mean_tangential_velocity_cm_s=("tangential_velocity_cm_s", "median"),
             )
             .reset_index()
         )
@@ -3887,12 +4316,20 @@ def summarize_kinematics(
                 mean_y_centered_px=("y_centered_px", "median"),
                 mean_vx_px_s=("vx_px_s", "median"),
                 mean_vy_px_s=("vy_px_s", "median"),
+                mean_vx_cm_s=("vx_cm_s", "median"),
+                mean_vy_cm_s=("vy_cm_s", "median"),
                 mean_speed_px_s=("speed_px_s", "median"),
+                mean_speed_cm_s=("speed_cm_s", "median"),
                 mean_ax_px_s2=("ax_px_s2", "median"),
                 mean_ay_px_s2=("ay_px_s2", "median"),
                 mean_az_px_s2=("az_px_s2", "median"),
+                mean_ax_cm_s2=("ax_cm_s2", "median"),
+                mean_ay_cm_s2=("ay_cm_s2", "median"),
+                mean_az_cm_s2=("az_cm_s2", "median"),
                 mean_acceleration_px_s2=("acceleration_px_s2", "median"),
+                mean_acceleration_cm_s2=("acceleration_cm_s2", "median"),
                 mean_jerk_px_s3=("jerk_px_s3", "median"),
+                mean_jerk_cm_s3=("jerk_cm_s3", "median"),
             )
             .reset_index()
         )
@@ -3917,28 +4354,26 @@ def summarize_kinematics(
 
 KINEMATIC_GROUP_METRICS = [
     "success_rate",
-    "mean_x_centered_px",
-    "mean_y_centered_px",
     "mean_x_workspace_cm",
     "mean_y_workspace_cm",
     "mean_r_workspace_cm",
     "mean_r_workspace_normalized",
-    "mean_max_r_center_px",
-    "mean_thumb_active_span_px",
-    "mean_hand_orientation_xy_deg",
-    "mean_vx_px_s",
-    "mean_vy_px_s",
-    "mean_speed_px_s",
-    "mean_ax_px_s2",
-    "mean_ay_px_s2",
-    "mean_acceleration_px_s2",
-    "mean_jerk_px_s3",
-    "mean_normalized_jerk_cost",
-    "mean_curvature_1_px",
+    "mean_max_r_workspace_cm",
+    "mean_thumb_active_span_cm",
+    "mean_hand_orientation_xy_cm_deg",
+    "mean_vx_cm_s",
+    "mean_vy_cm_s",
+    "mean_speed_cm_s",
+    "mean_ax_cm_s2",
+    "mean_ay_cm_s2",
+    "mean_acceleration_cm_s2",
+    "mean_jerk_cm_s3",
+    "mean_normalized_jerk_cost_cm",
+    "mean_curvature_1_cm",
     "speed_curvature_power_law_slope",
     "speed_curvature_power_law_r2",
-    "mean_path_length_px",
-    "mean_straightness_index",
+    "mean_path_length_cm",
+    "mean_straightness_index_cm",
     "movement_direction_resultant_length",
 ]
 
@@ -4086,7 +4521,7 @@ def compute_expanded_kinematic_scope_tables(
         ("all", None, "all_participants"),
         ("protocol", "protocol_factor", "protocol 1/2/3/4 if present/inferred"),
         ("E_vs_P", "subject_group", "E vs P"),
-        ("N_vs_L_workspace", "workspace_setup", "N=40x50 cm vs L=60x60 cm"),
+        ("N_vs_L_workspace", "workspace_setup", "N=60x45 cm vs L=80x60 cm"),
         ("side_camera", "side_camera_side", "right-side L vs left-side N camera"),
         ("experiment_group", EXPERIMENT_GROUP_COLUMN, "N_E/L_E/L_P exact group"),
         ("sex", "sex_factor", "male vs female if present"),
@@ -4950,10 +5385,10 @@ def save_motor_control_figures(
     fig_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     selected_metrics = metrics or [
-        "mean_speed_px_s",
-        "mean_acceleration_px_s2",
-        "mean_path_length_px",
-        "mean_straightness_index",
+        "mean_speed_cm_s",
+        "mean_acceleration_cm_s2",
+        "mean_path_length_cm",
+        "mean_straightness_index_cm",
     ]
 
     def _scope_subsets(df: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
@@ -5201,7 +5636,7 @@ def compute_success_kinematic_z_analysis(
     )
     df["correct_response"] = pd.to_numeric(df["correct_response"], errors="coerce")
     if side_z_trial_summary is not None and not side_z_trial_summary.empty:
-        side = side_z_trial_summary.copy()
+        side = add_workspace_normalization_columns(side_z_trial_summary.copy())
         if "finger_condition" in side.columns:
             side["finger_condition"] = side["finger_condition"].map(
                 normalize_finger_condition
@@ -5223,6 +5658,9 @@ def compute_success_kinematic_z_analysis(
                 "side_detection_rate",
                 "mean_side_z_lift_px",
                 "max_side_z_lift_px",
+                "mean_side_z_lift_cm",
+                "max_side_z_lift_cm",
+                "mean_side_x_from_center_camera_corrected_cm",
                 "mean_side_mask_area_px",
             ]
             if c in side.columns
@@ -5234,6 +5672,7 @@ def compute_success_kinematic_z_analysis(
                 how="left",
                 suffixes=("", "_side"),
             )
+    df = add_workspace_normalization_columns(df)
 
     metrics = _available_metric_columns(df, metric_columns or TRIAL_SUCCESS_METRICS)
     if not metrics:
@@ -5363,18 +5802,43 @@ def compute_trajectory_similarity_analysis(
             mean_r_center_px=("r_center_px", "median")
             if "r_center_px" in tb.columns
             else ("x_centered_px", "mean"),
+            mean_x_workspace_cm=("x_workspace_cm", "mean")
+            if "x_workspace_cm" in tb.columns
+            else ("x_centered_px", "mean"),
+            mean_y_workspace_cm=("y_workspace_cm", "mean")
+            if "y_workspace_cm" in tb.columns
+            else ("y_centered_px", "mean"),
+            sd_x_workspace_cm=("x_workspace_cm", "std")
+            if "x_workspace_cm" in tb.columns
+            else ("x_centered_px", "std"),
+            sd_y_workspace_cm=("y_workspace_cm", "std")
+            if "y_workspace_cm" in tb.columns
+            else ("y_centered_px", "std"),
+            mean_r_workspace_cm=("r_workspace_cm", "median")
+            if "r_workspace_cm" in tb.columns
+            else ("r_center_px", "mean"),
             mean_speed_px_s=("speed_px_s", "median")
             if "speed_px_s" in tb.columns
             else ("x_centered_px", "mean"),
+            mean_speed_cm_s=("speed_cm_s", "median")
+            if "speed_cm_s" in tb.columns
+            else ("speed_px_s", "mean"),
             sd_speed_px_s=("speed_px_s", "std")
             if "speed_px_s" in tb.columns
             else ("x_centered_px", "std"),
+            sd_speed_cm_s=("speed_cm_s", "std")
+            if "speed_cm_s" in tb.columns
+            else ("speed_px_s", "std"),
         )
         .reset_index()
     )
     subject_finger_trajectory["xy_variability_px"] = np.hypot(
         subject_finger_trajectory["sd_x_centered_px"],
         subject_finger_trajectory["sd_y_centered_px"],
+    )
+    subject_finger_trajectory["xy_variability_cm"] = np.hypot(
+        subject_finger_trajectory["sd_x_workspace_cm"],
+        subject_finger_trajectory["sd_y_workspace_cm"],
     )
 
     variability = (
@@ -5384,9 +5848,13 @@ def compute_trajectory_similarity_analysis(
         .agg(
             n_time_bins=("trajectory_time_bin", "count"),
             mean_xy_variability_px=("xy_variability_px", "median"),
+            mean_xy_variability_cm=("xy_variability_cm", "median"),
             max_xy_variability_px=("xy_variability_px", "max"),
+            max_xy_variability_cm=("xy_variability_cm", "max"),
             mean_speed_variability_px_s=("sd_speed_px_s", "median"),
+            mean_speed_variability_cm_s=("sd_speed_cm_s", "median"),
             mean_trajectory_radius_px=("mean_r_center_px", "median"),
+            mean_trajectory_radius_cm=("mean_r_workspace_cm", "median"),
         )
         .reset_index()
     )
@@ -5409,22 +5877,17 @@ def compute_trajectory_similarity_analysis(
     ):
         for i, finger_a in enumerate(fingers_seen):
             for finger_b in fingers_seen[i + 1 :]:
-                a = s_df[s_df["finger_condition"] == finger_a][
-                    [
-                        "trajectory_time_bin",
-                        "mean_x_centered_px",
-                        "mean_y_centered_px",
-                        "mean_speed_px_s",
-                    ]
+                trajectory_compare_cols = [
+                    "trajectory_time_bin",
+                    "mean_x_centered_px",
+                    "mean_y_centered_px",
+                    "mean_speed_px_s",
+                    "mean_x_workspace_cm",
+                    "mean_y_workspace_cm",
+                    "mean_speed_cm_s",
                 ]
-                b = s_df[s_df["finger_condition"] == finger_b][
-                    [
-                        "trajectory_time_bin",
-                        "mean_x_centered_px",
-                        "mean_y_centered_px",
-                        "mean_speed_px_s",
-                    ]
-                ]
+                a = s_df[s_df["finger_condition"] == finger_a][trajectory_compare_cols]
+                b = s_df[s_df["finger_condition"] == finger_b][trajectory_compare_cols]
                 merged = a.merge(b, on="trajectory_time_bin", suffixes=("_a", "_b"))
                 if merged.empty:
                     continue
@@ -5432,7 +5895,12 @@ def compute_trajectory_similarity_analysis(
                     merged["mean_x_centered_px_b"] - merged["mean_x_centered_px_a"],
                     merged["mean_y_centered_px_b"] - merged["mean_y_centered_px_a"],
                 )
+                xy_dist_cm = np.hypot(
+                    merged["mean_x_workspace_cm_b"] - merged["mean_x_workspace_cm_a"],
+                    merged["mean_y_workspace_cm_b"] - merged["mean_y_workspace_cm_a"],
+                )
                 speed_diff = merged["mean_speed_px_s_b"] - merged["mean_speed_px_s_a"]
+                speed_diff_cm = merged["mean_speed_cm_s_b"] - merged["mean_speed_cm_s_a"]
                 pair_rows.append(
                     {
                         "subject_id": subject,
@@ -5442,11 +5910,18 @@ def compute_trajectory_similarity_analysis(
                         "comparison": f"{finger_b} - {finger_a}",
                         "n_matched_time_bins": int(len(merged)),
                         "mean_xy_trajectory_distance_px": float(np.nanmean(xy_dist)),
+                        "mean_xy_trajectory_distance_cm": float(np.nanmean(xy_dist_cm)),
                         "rms_xy_trajectory_distance_px": float(
                             np.sqrt(np.nanmean(np.square(xy_dist)))
                         ),
+                        "rms_xy_trajectory_distance_cm": float(
+                            np.sqrt(np.nanmean(np.square(xy_dist_cm)))
+                        ),
                         "speed_profile_rmse_px_s": float(
                             np.sqrt(np.nanmean(np.square(speed_diff)))
+                        ),
+                        "speed_profile_rmse_cm_s": float(
+                            np.sqrt(np.nanmean(np.square(speed_diff_cm)))
                         ),
                     }
                 )
@@ -5458,9 +5933,9 @@ def compute_trajectory_similarity_analysis(
             "comparison", dropna=False
         ):
             for metric in [
-                "mean_xy_trajectory_distance_px",
-                "rms_xy_trajectory_distance_px",
-                "speed_profile_rmse_px_s",
+                "mean_xy_trajectory_distance_cm",
+                "rms_xy_trajectory_distance_cm",
+                "speed_profile_rmse_cm_s",
             ]:
                 vals = pd.to_numeric(g[metric], errors="coerce").dropna()
                 summary_rows.append(
@@ -5492,6 +5967,11 @@ def compute_trajectory_similarity_analysis(
             .agg(
                 x_centered_px=("x_centered_px", "median"),
                 y_centered_px=("y_centered_px", "median"),
+                x_workspace_cm=("x_workspace_cm", "median"),
+                y_workspace_cm=("y_workspace_cm", "median"),
+                speed_cm_s=("speed_cm_s", "median")
+                if "speed_cm_s" in tb.columns
+                else ("speed_px_s", "mean"),
                 speed_px_s=("speed_px_s", "median")
                 if "speed_px_s" in tb.columns
                 else ("x_centered_px", "mean"),
@@ -5512,7 +5992,12 @@ def compute_trajectory_similarity_analysis(
                 merged["x_centered_px_success"] - merged["x_centered_px_failure"],
                 merged["y_centered_px_success"] - merged["y_centered_px_failure"],
             )
+            xy_dist_cm = np.hypot(
+                merged["x_workspace_cm_success"] - merged["x_workspace_cm_failure"],
+                merged["y_workspace_cm_success"] - merged["y_workspace_cm_failure"],
+            )
             speed_diff = merged["speed_px_s_success"] - merged["speed_px_s_failure"]
+            speed_diff_cm = merged["speed_cm_s_success"] - merged["speed_cm_s_failure"]
             success_rows.append(
                 {
                     "subject_id": subject,
@@ -5520,11 +6005,18 @@ def compute_trajectory_similarity_analysis(
                     "stiffness_value": stiffness,
                     "n_matched_time_bins": int(len(merged)),
                     "success_failure_mean_xy_distance_px": float(np.nanmean(xy_dist)),
+                    "success_failure_mean_xy_distance_cm": float(np.nanmean(xy_dist_cm)),
                     "success_failure_rms_xy_distance_px": float(
                         np.sqrt(np.nanmean(np.square(xy_dist)))
                     ),
+                    "success_failure_rms_xy_distance_cm": float(
+                        np.sqrt(np.nanmean(np.square(xy_dist_cm)))
+                    ),
                     "success_failure_speed_rmse_px_s": float(
                         np.sqrt(np.nanmean(np.square(speed_diff)))
+                    ),
+                    "success_failure_speed_rmse_cm_s": float(
+                        np.sqrt(np.nanmean(np.square(speed_diff_cm)))
                     ),
                 }
             )
@@ -5536,9 +6028,9 @@ def compute_trajectory_similarity_analysis(
             "finger_condition", dropna=False
         ):
             for metric in [
-                "success_failure_mean_xy_distance_px",
-                "success_failure_rms_xy_distance_px",
-                "success_failure_speed_rmse_px_s",
+                "success_failure_mean_xy_distance_cm",
+                "success_failure_rms_xy_distance_cm",
+                "success_failure_speed_rmse_cm_s",
             ]:
                 vals = pd.to_numeric(g[metric], errors="coerce").dropna()
                 sf_summary_rows.append(
@@ -5576,12 +6068,12 @@ def save_advanced_kinematic_figures(
 
     success_summary = success_results.get("success_contrast_summary", pd.DataFrame())
     success_metrics = [
-        "mean_speed_px_s",
-        "path_length_px",
-        "straightness_index",
-        "mean_acceleration_px_s2",
-        "mean_side_z_lift_px",
-        "max_side_z_lift_px",
+        "mean_speed_cm_s",
+        "path_length_cm",
+        "straightness_index_cm",
+        "mean_acceleration_cm_s2",
+        "mean_side_z_lift_cm",
+        "max_side_z_lift_cm",
     ]
     if not success_summary.empty:
         sub = success_summary[success_summary["metric"].isin(success_metrics)].copy()
@@ -5613,7 +6105,7 @@ def save_advanced_kinematic_figures(
     )
     if not traj_summary.empty:
         sub = traj_summary[
-            traj_summary["metric"] == "mean_xy_trajectory_distance_px"
+            traj_summary["metric"] == "mean_xy_trajectory_distance_cm"
         ].copy()
         if not sub.empty:
             fig, ax = plt.subplots(figsize=(7.5, 4.5))
@@ -5663,7 +6155,7 @@ def save_advanced_kinematic_figures(
                     )
             ax.set_xticks(x)
             ax.set_xticklabels(sub["comparison"].astype(str), rotation=30, ha="right")
-            ax.set_ylabel("Mean XY trajectory distance (px)")
+            ax.set_ylabel("Mean XY trajectory distance (cm)")
             ax.set_xlabel("Finger comparison")
             ax.set_title(
                 "Paired between-finger trajectory separation\n"
@@ -5682,7 +6174,7 @@ def save_advanced_kinematic_figures(
     )
     if not sf_summary.empty:
         sub = sf_summary[
-            sf_summary["metric"] == "success_failure_mean_xy_distance_px"
+            sf_summary["metric"] == "success_failure_mean_xy_distance_cm"
         ].copy()
         if not sub.empty:
             present = set(sub["finger_condition"])
@@ -5704,7 +6196,7 @@ def save_advanced_kinematic_figures(
                 color=colors,
                 alpha=0.85,
             )
-            ax.set_ylabel("Success vs failure trajectory distance (px)")
+            ax.set_ylabel("Success vs failure trajectory distance (cm)")
             ax.set_xlabel("Finger")
             ax.set_title("Trajectory templates separating correct and incorrect trials")
             ax.grid(axis="y", alpha=0.25)
@@ -6331,7 +6823,7 @@ def add_side_z_velocity_acceleration_to_time_bins(
             + np.square(out["ay_3d_px_s2"])
             + np.square(out["az_3d_proxy_px_s2"])
         )
-    return out
+    return add_workspace_normalization_columns(out)
 
 
 
@@ -6435,7 +6927,17 @@ def compute_subject_velocity_acceleration_analysis(
         "y_centered_px",
         "z_lift_px",
         "movement_angle_deg",
+        "movement_angle_cm_deg",
         "correct_response",
+        "vx_cm_s", "vy_cm_s", "vz_cm_s",
+        "vx_3d_cm_s", "vy_3d_cm_s", "vz_3d_proxy_cm_s",
+        "speed_cm_s", "speed_3d_proxy_cm_s",
+        "ax_cm_s2", "ay_cm_s2", "az_cm_s2",
+        "ax_3d_cm_s2", "ay_3d_cm_s2", "az_3d_proxy_cm_s2",
+        "acceleration_cm_s2", "acceleration_3d_proxy_cm_s2",
+        "jx_cm_s3", "jy_cm_s3", "jerk_cm_s3",
+        "radial_velocity_cm_s", "tangential_velocity_cm_s",
+        "x_workspace_cm", "y_workspace_cm", "z_lift_cm",
     ]
     for col in numeric_cols:
         if col in tb.columns:
@@ -6450,6 +6952,12 @@ def compute_subject_velocity_acceleration_analysis(
         tb["abs_y_centered_px"] = tb["y_centered_px"].abs()
     if "z_lift_px" in tb.columns:
         tb["abs_z_lift_px"] = tb["z_lift_px"].abs()
+    if "x_workspace_cm" in tb.columns:
+        tb["abs_x_workspace_cm"] = tb["x_workspace_cm"].abs()
+    if "y_workspace_cm" in tb.columns:
+        tb["abs_y_workspace_cm"] = tb["y_workspace_cm"].abs()
+    if "z_lift_cm" in tb.columns:
+        tb["abs_z_lift_cm"] = tb["z_lift_cm"].abs()
 
     # Fill derivative magnitudes if a caller provides only components.
     if "speed_px_s" not in tb.columns and {"vx_px_s", "vy_px_s"}.issubset(tb.columns):
@@ -6476,6 +6984,7 @@ def compute_subject_velocity_acceleration_analysis(
             + np.square(tb["ay_px_s2"])
             + np.square(tb["az_3d_proxy_px_s2"])
         )
+    tb = add_workspace_normalization_columns(tb)
 
     group_cols = [
         "subject_id",
@@ -6510,6 +7019,17 @@ def compute_subject_velocity_acceleration_analysis(
     if "sampling_rate_hz" in tb.columns:
         agg_spec["sampling_rate_hz"] = ("sampling_rate_hz", "median")
     for col in [
+        "vx_cm_s", "vy_cm_s", "vz_cm_s",
+        "vx_3d_cm_s", "vy_3d_cm_s", "vz_3d_proxy_cm_s",
+        "speed_cm_s", "speed_3d_proxy_cm_s",
+        "ax_cm_s2", "ay_cm_s2", "az_cm_s2",
+        "ax_3d_cm_s2", "ay_3d_cm_s2", "az_3d_proxy_cm_s2",
+        "acceleration_cm_s2", "acceleration_3d_proxy_cm_s2",
+        "jx_cm_s3", "jy_cm_s3", "jerk_cm_s3",
+        "radial_velocity_cm_s", "tangential_velocity_cm_s",
+        "x_workspace_cm", "y_workspace_cm", "z_lift_cm",
+        "abs_x_workspace_cm", "abs_y_workspace_cm", "abs_z_lift_cm",
+        # Raw pixel columns are retained after cm metrics for audit/traceability.
         "vx_px_s",
         "vy_px_s",
         "vz_px_s",
@@ -6552,13 +7072,25 @@ def compute_subject_velocity_acceleration_analysis(
         profile["velocity_heading_deg"] = np.degrees(
             np.arctan2(profile["vy_px_s"], profile["vx_px_s"])
         )
+    if {"vx_cm_s", "vy_cm_s"}.issubset(profile.columns):
+        profile["velocity_heading_cm_deg"] = np.degrees(
+            np.arctan2(profile["vy_cm_s"], profile["vx_cm_s"])
+        )
     if {"ax_px_s2", "ay_px_s2"}.issubset(profile.columns):
         profile["acceleration_heading_deg"] = np.degrees(
             np.arctan2(profile["ay_px_s2"], profile["ax_px_s2"])
         )
+    if {"ax_cm_s2", "ay_cm_s2"}.issubset(profile.columns):
+        profile["acceleration_heading_cm_deg"] = np.degrees(
+            np.arctan2(profile["ay_cm_s2"], profile["ax_cm_s2"])
+        )
     if {"speed_px_s", "acceleration_px_s2"}.issubset(profile.columns):
         profile["speed_acceleration_product"] = (
             profile["speed_px_s"] * profile["acceleration_px_s2"]
+        )
+    if {"speed_cm_s", "acceleration_cm_s2"}.issubset(profile.columns):
+        profile["speed_acceleration_product_cm"] = (
+            profile["speed_cm_s"] * profile["acceleration_cm_s2"]
         )
 
     summary_rows: list[dict[str, Any]] = []
@@ -6595,6 +7127,15 @@ def compute_subject_velocity_acceleration_analysis(
                 pd.to_numeric(g["success_rate"], errors="coerce").mean()
             )
         for col in [
+            "vx_cm_s", "vy_cm_s", "vz_cm_s",
+            "vx_3d_cm_s", "vy_3d_cm_s", "vz_3d_proxy_cm_s",
+            "speed_3d_proxy_cm_s", "speed_cm_s",
+            "ax_cm_s2", "ay_cm_s2", "az_cm_s2",
+            "ax_3d_cm_s2", "ay_3d_cm_s2", "az_3d_proxy_cm_s2",
+            "acceleration_3d_proxy_cm_s2", "acceleration_cm_s2",
+            "jx_cm_s3", "jy_cm_s3", "jerk_cm_s3",
+            "radial_velocity_cm_s", "tangential_velocity_cm_s",
+            # Raw pixel columns are retained after cm metrics for audit/traceability.
             "vx_px_s",
             "vy_px_s",
             "vz_px_s",
@@ -6632,6 +7173,30 @@ def compute_subject_velocity_acceleration_analysis(
                 row[f"time_fraction_peak_abs_{col}"] = float(
                     g.loc[idx, "time_fraction"]
                 )
+        if "speed_cm_s" in g.columns:
+            speed_cm = pd.to_numeric(g["speed_cm_s"], errors="coerce")
+            row["early_mean_speed_cm_s"] = float(
+                speed_cm.iloc[: max(1, len(speed_cm) // 3)].mean()
+            )
+            row["late_mean_speed_cm_s"] = float(
+                speed_cm.iloc[-max(1, len(speed_cm) // 3) :].mean()
+            )
+            row["late_minus_early_speed_cm_s"] = (
+                row["late_mean_speed_cm_s"] - row["early_mean_speed_cm_s"]
+            )
+        if "acceleration_cm_s2" in g.columns:
+            acc_cm = pd.to_numeric(g["acceleration_cm_s2"], errors="coerce")
+            row["early_mean_acceleration_cm_s2"] = float(
+                acc_cm.iloc[: max(1, len(acc_cm) // 3)].mean()
+            )
+            row["late_mean_acceleration_cm_s2"] = float(
+                acc_cm.iloc[-max(1, len(acc_cm) // 3) :].mean()
+            )
+            row["late_minus_early_acceleration_cm_s2"] = (
+                row["late_mean_acceleration_cm_s2"]
+                - row["early_mean_acceleration_cm_s2"]
+            )
+        # Raw pixel early/late values are retained after cm metrics for traceability.
         if "speed_px_s" in g.columns:
             speed = pd.to_numeric(g["speed_px_s"], errors="coerce")
             row["early_mean_speed_px_s"] = float(
@@ -6677,6 +7242,20 @@ def compute_subject_velocity_acceleration_analysis(
                 cols = ["trajectory_time_bin"] + [
                     c
                     for c in [
+                        "vx_cm_s",
+                        "vy_cm_s",
+                        "vz_3d_proxy_cm_s",
+                        "speed_cm_s",
+                        "speed_3d_proxy_cm_s",
+                        "ax_cm_s2",
+                        "ay_cm_s2",
+                        "az_3d_proxy_cm_s2",
+                        "acceleration_cm_s2",
+                        "acceleration_3d_proxy_cm_s2",
+                        "jx_cm_s3",
+                        "jy_cm_s3",
+                        "jerk_cm_s3",
+                        # Raw pixel columns are retained after cm metrics for audit/traceability.
                         "vx_px_s",
                         "vy_px_s",
                         "vz_3d_proxy_px_s",
@@ -6706,6 +7285,109 @@ def compute_subject_velocity_acceleration_analysis(
                     "comparison": f"{finger_b} - {finger_a}",
                     "n_matched_time_bins": int(len(merged)),
                 }
+                if {"vx_cm_s_a", "vy_cm_s_a", "vx_cm_s_b", "vy_cm_s_b"}.issubset(
+                    merged.columns
+                ):
+                    vdist_cm = np.hypot(
+                        merged["vx_cm_s_b"] - merged["vx_cm_s_a"],
+                        merged["vy_cm_s_b"] - merged["vy_cm_s_a"],
+                    )
+                    row["mean_velocity_vector_distance_cm_s"] = float(np.nanmean(vdist_cm))
+                    row["rms_velocity_vector_distance_cm_s"] = float(
+                        np.sqrt(np.nanmean(np.square(vdist_cm)))
+                    )
+                if {
+                    "vx_cm_s_a",
+                    "vy_cm_s_a",
+                    "vz_3d_proxy_cm_s_a",
+                    "vx_cm_s_b",
+                    "vy_cm_s_b",
+                    "vz_3d_proxy_cm_s_b",
+                }.issubset(merged.columns):
+                    vdist3_cm = np.sqrt(
+                        np.square(merged["vx_cm_s_b"] - merged["vx_cm_s_a"])
+                        + np.square(merged["vy_cm_s_b"] - merged["vy_cm_s_a"])
+                        + np.square(
+                            merged["vz_3d_proxy_cm_s_b"]
+                            - merged["vz_3d_proxy_cm_s_a"]
+                        )
+                    )
+                    row["mean_velocity_vector_distance_3d_proxy_cm_s"] = float(
+                        np.nanmean(vdist3_cm)
+                    )
+                    row["rms_velocity_vector_distance_3d_proxy_cm_s"] = float(
+                        np.sqrt(np.nanmean(np.square(vdist3_cm)))
+                    )
+                if {"ax_cm_s2_a", "ay_cm_s2_a", "ax_cm_s2_b", "ay_cm_s2_b"}.issubset(
+                    merged.columns
+                ):
+                    adist_cm = np.hypot(
+                        merged["ax_cm_s2_b"] - merged["ax_cm_s2_a"],
+                        merged["ay_cm_s2_b"] - merged["ay_cm_s2_a"],
+                    )
+                    row["mean_acceleration_vector_distance_cm_s2"] = float(
+                        np.nanmean(adist_cm)
+                    )
+                    row["rms_acceleration_vector_distance_cm_s2"] = float(
+                        np.sqrt(np.nanmean(np.square(adist_cm)))
+                    )
+                if {
+                    "ax_cm_s2_a",
+                    "ay_cm_s2_a",
+                    "az_3d_proxy_cm_s2_a",
+                    "ax_cm_s2_b",
+                    "ay_cm_s2_b",
+                    "az_3d_proxy_cm_s2_b",
+                }.issubset(merged.columns):
+                    adist3_cm = np.sqrt(
+                        np.square(merged["ax_cm_s2_b"] - merged["ax_cm_s2_a"])
+                        + np.square(merged["ay_cm_s2_b"] - merged["ay_cm_s2_a"])
+                        + np.square(
+                            merged["az_3d_proxy_cm_s2_b"]
+                            - merged["az_3d_proxy_cm_s2_a"]
+                        )
+                    )
+                    row["mean_acceleration_vector_distance_3d_proxy_cm_s2"] = float(
+                        np.nanmean(adist3_cm)
+                    )
+                    row["rms_acceleration_vector_distance_3d_proxy_cm_s2"] = float(
+                        np.sqrt(np.nanmean(np.square(adist3_cm)))
+                    )
+                if {"speed_cm_s_a", "speed_cm_s_b"}.issubset(merged.columns):
+                    sdiff_cm = merged["speed_cm_s_b"] - merged["speed_cm_s_a"]
+                    row["speed_profile_rmse_cm_s"] = float(
+                        np.sqrt(np.nanmean(np.square(sdiff_cm)))
+                    )
+                if {"speed_3d_proxy_cm_s_a", "speed_3d_proxy_cm_s_b"}.issubset(
+                    merged.columns
+                ):
+                    sdiff3_cm = (
+                        merged["speed_3d_proxy_cm_s_b"]
+                        - merged["speed_3d_proxy_cm_s_a"]
+                    )
+                    row["speed_profile_rmse_3d_proxy_cm_s"] = float(
+                        np.sqrt(np.nanmean(np.square(sdiff3_cm)))
+                    )
+                if {"acceleration_cm_s2_a", "acceleration_cm_s2_b"}.issubset(
+                    merged.columns
+                ):
+                    accdiff_cm = (
+                        merged["acceleration_cm_s2_b"] - merged["acceleration_cm_s2_a"]
+                    )
+                    row["acceleration_profile_rmse_cm_s2"] = float(
+                        np.sqrt(np.nanmean(np.square(accdiff_cm)))
+                    )
+                if {
+                    "acceleration_3d_proxy_cm_s2_a",
+                    "acceleration_3d_proxy_cm_s2_b",
+                }.issubset(merged.columns):
+                    accdiff3_cm = (
+                        merged["acceleration_3d_proxy_cm_s2_b"]
+                        - merged["acceleration_3d_proxy_cm_s2_a"]
+                    )
+                    row["acceleration_profile_rmse_3d_proxy_cm_s2"] = float(
+                        np.sqrt(np.nanmean(np.square(accdiff3_cm)))
+                    )
                 if {"vx_px_s_a", "vy_px_s_a", "vx_px_s_b", "vy_px_s_b"}.issubset(
                     merged.columns
                 ):
@@ -6815,102 +7497,102 @@ def compute_subject_velocity_acceleration_analysis(
         summary,
         ["subject_id", "finger_condition"],
         [
-            "mean_vx_px_s",
-            "peak_abs_vx_px_s",
-            "mean_vy_px_s",
-            "peak_abs_vy_px_s",
-            "mean_vz_3d_proxy_px_s",
-            "peak_abs_vz_3d_proxy_px_s",
-            "mean_speed_px_s",
-            "peak_abs_speed_px_s",
-            "mean_ax_px_s2",
-            "peak_abs_ax_px_s2",
-            "mean_ay_px_s2",
-            "peak_abs_ay_px_s2",
-            "mean_az_3d_proxy_px_s2",
-            "peak_abs_az_3d_proxy_px_s2",
-            "mean_acceleration_px_s2",
-            "peak_abs_acceleration_px_s2",
-            "mean_speed_3d_proxy_px_s",
-            "peak_abs_speed_3d_proxy_px_s",
-            "mean_acceleration_3d_proxy_px_s2",
-            "peak_abs_acceleration_3d_proxy_px_s2",
-            "mean_jerk_px_s3",
-            "peak_abs_jerk_px_s3",
-            "late_minus_early_speed_px_s",
-            "late_minus_early_acceleration_px_s2",
-            "mean_radial_velocity_px_s",
-            "mean_tangential_velocity_px_s",
+            "mean_vx_cm_s",
+            "peak_abs_vx_cm_s",
+            "mean_vy_cm_s",
+            "peak_abs_vy_cm_s",
+            "mean_vz_3d_proxy_cm_s",
+            "peak_abs_vz_3d_proxy_cm_s",
+            "mean_speed_cm_s",
+            "peak_abs_speed_cm_s",
+            "mean_ax_cm_s2",
+            "peak_abs_ax_cm_s2",
+            "mean_ay_cm_s2",
+            "peak_abs_ay_cm_s2",
+            "mean_az_3d_proxy_cm_s2",
+            "peak_abs_az_3d_proxy_cm_s2",
+            "mean_acceleration_cm_s2",
+            "peak_abs_acceleration_cm_s2",
+            "mean_speed_3d_proxy_cm_s",
+            "peak_abs_speed_3d_proxy_cm_s",
+            "mean_acceleration_3d_proxy_cm_s2",
+            "peak_abs_acceleration_3d_proxy_cm_s2",
+            "mean_jerk_cm_s3",
+            "peak_abs_jerk_cm_s3",
+            "late_minus_early_speed_cm_s",
+            "late_minus_early_acceleration_cm_s2",
+            "mean_radial_velocity_cm_s",
+            "mean_tangential_velocity_cm_s",
         ],
     )
     velocity_stiffness_influence = (
         profile.groupby(["stiffness_value"], dropna=False)
         .agg(
-            n_observations=("speed_px_s", "count"),
+            n_observations=("speed_cm_s", "count"),
             n_subjects=("subject_id", "nunique"),
-            median_vx_px_s=("vx_px_s", "median"),
-            median_vy_px_s=("vy_px_s", "median"),
-            median_vz_3d_proxy_px_s=("vz_3d_proxy_px_s", "median")
-            if "vz_3d_proxy_px_s" in profile.columns
-            else ("speed_px_s", "median"),
-            mean_velocity_px_s=("speed_px_s", "median"),
-            mean_velocity_3d_proxy_px_s=("speed_3d_proxy_px_s", "median")
-            if "speed_3d_proxy_px_s" in profile.columns
-            else ("speed_px_s", "median"),
-            sem_velocity_px_s=("speed_px_s", _sem),
-            median_ax_px_s2=("ax_px_s2", "median")
-            if "ax_px_s2" in profile.columns
-            else ("speed_px_s", "median"),
-            median_ay_px_s2=("ay_px_s2", "median")
-            if "ay_px_s2" in profile.columns
-            else ("speed_px_s", "median"),
-            median_az_3d_proxy_px_s2=("az_3d_proxy_px_s2", "median")
-            if "az_3d_proxy_px_s2" in profile.columns
-            else ("speed_px_s", "median"),
-            mean_acceleration_px_s2=("acceleration_px_s2", "median"),
-            mean_acceleration_3d_proxy_px_s2=("acceleration_3d_proxy_px_s2", "median")
-            if "acceleration_3d_proxy_px_s2" in profile.columns
-            else ("acceleration_px_s2", "median"),
+            median_vx_cm_s=("vx_cm_s", "median"),
+            median_vy_cm_s=("vy_cm_s", "median"),
+            median_vz_3d_proxy_cm_s=("vz_3d_proxy_cm_s", "median")
+            if "vz_3d_proxy_cm_s" in profile.columns
+            else ("speed_cm_s", "median"),
+            mean_velocity_cm_s=("speed_cm_s", "median"),
+            mean_velocity_3d_proxy_cm_s=("speed_3d_proxy_cm_s", "median")
+            if "speed_3d_proxy_cm_s" in profile.columns
+            else ("speed_cm_s", "median"),
+            sem_velocity_cm_s=("speed_cm_s", _sem),
+            median_ax_cm_s2=("ax_cm_s2", "median")
+            if "ax_cm_s2" in profile.columns
+            else ("speed_cm_s", "median"),
+            median_ay_cm_s2=("ay_cm_s2", "median")
+            if "ay_cm_s2" in profile.columns
+            else ("speed_cm_s", "median"),
+            median_az_3d_proxy_cm_s2=("az_3d_proxy_cm_s2", "median")
+            if "az_3d_proxy_cm_s2" in profile.columns
+            else ("speed_cm_s", "median"),
+            mean_acceleration_cm_s2=("acceleration_cm_s2", "median"),
+            mean_acceleration_3d_proxy_cm_s2=("acceleration_3d_proxy_cm_s2", "median")
+            if "acceleration_3d_proxy_cm_s2" in profile.columns
+            else ("acceleration_cm_s2", "median"),
         )
         .reset_index()
-        if {"speed_px_s", "acceleration_px_s2"}.issubset(profile.columns)
+        if {"speed_cm_s", "acceleration_cm_s2"}.issubset(profile.columns)
         else pd.DataFrame()
     )
     velocity_finger_influence = (
         profile.groupby(["finger_condition"], dropna=False)
         .agg(
-            n_observations=("speed_px_s", "count"),
+            n_observations=("speed_cm_s", "count"),
             n_subjects=("subject_id", "nunique"),
-            median_vx_px_s=("vx_px_s", "median"),
-            median_vy_px_s=("vy_px_s", "median"),
-            median_vz_3d_proxy_px_s=("vz_3d_proxy_px_s", "median")
-            if "vz_3d_proxy_px_s" in profile.columns
-            else ("speed_px_s", "median"),
-            mean_velocity_px_s=("speed_px_s", "median"),
-            mean_velocity_3d_proxy_px_s=("speed_3d_proxy_px_s", "median")
-            if "speed_3d_proxy_px_s" in profile.columns
-            else ("speed_px_s", "median"),
-            sem_velocity_px_s=("speed_px_s", _sem),
-            median_ax_px_s2=("ax_px_s2", "median")
-            if "ax_px_s2" in profile.columns
-            else ("speed_px_s", "median"),
-            median_ay_px_s2=("ay_px_s2", "median")
-            if "ay_px_s2" in profile.columns
-            else ("speed_px_s", "median"),
-            median_az_3d_proxy_px_s2=("az_3d_proxy_px_s2", "median")
-            if "az_3d_proxy_px_s2" in profile.columns
-            else ("speed_px_s", "median"),
-            mean_acceleration_px_s2=("acceleration_px_s2", "median"),
-            mean_acceleration_3d_proxy_px_s2=("acceleration_3d_proxy_px_s2", "median")
-            if "acceleration_3d_proxy_px_s2" in profile.columns
-            else ("acceleration_px_s2", "median"),
+            median_vx_cm_s=("vx_cm_s", "median"),
+            median_vy_cm_s=("vy_cm_s", "median"),
+            median_vz_3d_proxy_cm_s=("vz_3d_proxy_cm_s", "median")
+            if "vz_3d_proxy_cm_s" in profile.columns
+            else ("speed_cm_s", "median"),
+            mean_velocity_cm_s=("speed_cm_s", "median"),
+            mean_velocity_3d_proxy_cm_s=("speed_3d_proxy_cm_s", "median")
+            if "speed_3d_proxy_cm_s" in profile.columns
+            else ("speed_cm_s", "median"),
+            sem_velocity_cm_s=("speed_cm_s", _sem),
+            median_ax_cm_s2=("ax_cm_s2", "median")
+            if "ax_cm_s2" in profile.columns
+            else ("speed_cm_s", "median"),
+            median_ay_cm_s2=("ay_cm_s2", "median")
+            if "ay_cm_s2" in profile.columns
+            else ("speed_cm_s", "median"),
+            median_az_3d_proxy_cm_s2=("az_3d_proxy_cm_s2", "median")
+            if "az_3d_proxy_cm_s2" in profile.columns
+            else ("speed_cm_s", "median"),
+            mean_acceleration_cm_s2=("acceleration_cm_s2", "median"),
+            mean_acceleration_3d_proxy_cm_s2=("acceleration_3d_proxy_cm_s2", "median")
+            if "acceleration_3d_proxy_cm_s2" in profile.columns
+            else ("acceleration_cm_s2", "median"),
         )
         .reset_index()
-        if {"speed_px_s", "acceleration_px_s2"}.issubset(profile.columns)
+        if {"speed_cm_s", "acceleration_cm_s2"}.issubset(profile.columns)
         else pd.DataFrame()
     )
     velocity_time_influence = pd.DataFrame()
-    if {"speed_px_s", "time_fraction"}.issubset(profile.columns):
+    if {"speed_cm_s", "time_fraction"}.issubset(profile.columns):
         temp = profile.copy()
         temp["time_third"] = pd.cut(
             pd.to_numeric(temp["time_fraction"], errors="coerce"),
@@ -6918,32 +7600,32 @@ def compute_subject_velocity_acceleration_analysis(
             labels=["early", "middle", "late"],
         )
         velocity_time_influence = (
-            temp.groupby(["time_third", "stiffness_value"], dropna=False)
+            temp.groupby(["time_third", "stiffness_value"], dropna=False, observed=False)
             .agg(
-                n_observations=("speed_px_s", "count"),
+                n_observations=("speed_cm_s", "count"),
                 n_subjects=("subject_id", "nunique"),
-                median_vx_px_s=("vx_px_s", "median")
-                if "vx_px_s" in temp.columns
-                else ("speed_px_s", "median"),
-                median_vy_px_s=("vy_px_s", "median")
-                if "vy_px_s" in temp.columns
-                else ("speed_px_s", "median"),
-                median_vz_3d_proxy_px_s=("vz_3d_proxy_px_s", "median")
-                if "vz_3d_proxy_px_s" in temp.columns
-                else ("speed_px_s", "median"),
-                mean_velocity_px_s=("speed_px_s", "median"),
-                mean_velocity_3d_proxy_px_s=("speed_3d_proxy_px_s", "median")
-                if "speed_3d_proxy_px_s" in temp.columns
-                else ("speed_px_s", "median"),
-                mean_acceleration_px_s2=("acceleration_px_s2", "median")
-                if "acceleration_px_s2" in temp.columns
-                else ("speed_px_s", "median"),
-                mean_acceleration_3d_proxy_px_s2=(
-                    "acceleration_3d_proxy_px_s2",
+                median_vx_cm_s=("vx_cm_s", "median")
+                if "vx_cm_s" in temp.columns
+                else ("speed_cm_s", "median"),
+                median_vy_cm_s=("vy_cm_s", "median")
+                if "vy_cm_s" in temp.columns
+                else ("speed_cm_s", "median"),
+                median_vz_3d_proxy_cm_s=("vz_3d_proxy_cm_s", "median")
+                if "vz_3d_proxy_cm_s" in temp.columns
+                else ("speed_cm_s", "median"),
+                mean_velocity_cm_s=("speed_cm_s", "median"),
+                mean_velocity_3d_proxy_cm_s=("speed_3d_proxy_cm_s", "median")
+                if "speed_3d_proxy_cm_s" in temp.columns
+                else ("speed_cm_s", "median"),
+                mean_acceleration_cm_s2=("acceleration_cm_s2", "median")
+                if "acceleration_cm_s2" in temp.columns
+                else ("speed_cm_s", "median"),
+                mean_acceleration_3d_proxy_cm_s2=(
+                    "acceleration_3d_proxy_cm_s2",
                     "median",
                 )
-                if "acceleration_3d_proxy_px_s2" in temp.columns
-                else ("speed_px_s", "median"),
+                if "acceleration_3d_proxy_cm_s2" in temp.columns
+                else ("speed_cm_s", "median"),
             )
             .reset_index()
         )
@@ -6960,17 +7642,19 @@ def compute_subject_velocity_acceleration_analysis(
 
 
 def add_velocity_decomposition_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Add 3D proxy speed plus radial/tangential decomposition columns.
+    """Add cm-first 3D proxy speed plus radial/tangential decomposition columns.
 
-    The 3D proxy uses the in-plane x/y movement and the side-camera z-lift when
-    present. It does not change the existing 2D velocity columns; it only adds
-    derived columns for the velocity-specific result folder.
+    Raw pixel columns are preserved for traceability, but velocity-specific result
+    tables and figures use setup-scaled cm units by default.
     """
-    out = df.copy()
+    out = add_workspace_normalization_columns(df)
     for col in [
         "x_centered_px",
         "y_centered_px",
         "z_lift_px",
+        "x_workspace_cm",
+        "y_workspace_cm",
+        "z_lift_cm",
         "vx_px_s",
         "vy_px_s",
         "vz_px_s",
@@ -6978,17 +7662,26 @@ def add_velocity_decomposition_columns(df: pd.DataFrame) -> pd.DataFrame:
         "speed_px_s",
         "radial_velocity_px_s",
         "tangential_velocity_px_s",
+        "vx_cm_s",
+        "vy_cm_s",
+        "vz_cm_s",
+        "vz_3d_proxy_cm_s",
+        "speed_cm_s",
+        "radial_velocity_cm_s",
+        "tangential_velocity_cm_s",
     ]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
-    vz_col = _first_existing_column(out, ["vz_px_s", "vz_3d_proxy_px_s"])
-    z = out["z_lift_px"] if "z_lift_px" in out.columns else 0.0
-    vz = out[vz_col] if vz_col is not None else 0.0
+
+    # Pixel decomposition remains available as an audit trail for legacy outputs.
+    vz_px_col = _first_existing_column(out, ["vz_px_s", "vz_3d_proxy_px_s"])
+    z_px = out["z_lift_px"] if "z_lift_px" in out.columns else 0.0
+    vz_px = out[vz_px_col] if vz_px_col is not None else 0.0
     if {"vx_px_s", "vy_px_s"}.issubset(out.columns):
         out["speed_3d_proxy_px_s"] = np.sqrt(
             np.square(out["vx_px_s"])
             + np.square(out["vy_px_s"])
-            + np.square(vz)
+            + np.square(vz_px)
         )
     elif "speed_px_s" in out.columns:
         out["speed_3d_proxy_px_s"] = out["speed_px_s"]
@@ -6996,31 +7689,33 @@ def add_velocity_decomposition_columns(df: pd.DataFrame) -> pd.DataFrame:
         out["velocity_x_axis_px_s"] = out["vx_px_s"]
     if "vy_px_s" in out.columns:
         out["velocity_y_axis_px_s"] = out["vy_px_s"]
-    if vz_col is not None:
-        out["velocity_z_axis_3d_proxy_px_s"] = out[vz_col]
+    if vz_px_col is not None:
+        out["velocity_z_axis_3d_proxy_px_s"] = out[vz_px_col]
     if {"x_centered_px", "y_centered_px", "vx_px_s", "vy_px_s"}.issubset(out.columns):
-        radius = np.sqrt(
+        radius_px = np.sqrt(
             np.square(out["x_centered_px"])
             + np.square(out["y_centered_px"])
-            + np.square(z)
+            + np.square(z_px)
         )
-        radial_num = (
+        radial_num_px = (
             out["x_centered_px"] * out["vx_px_s"]
             + out["y_centered_px"] * out["vy_px_s"]
-            + z * vz
+            + z_px * vz_px
         )
-        out["radial_velocity_3d_proxy_px_s"] = np.where(radius > 0, radial_num / radius, np.nan)
-        radial_unit_x = np.where(radius > 0, out["x_centered_px"] / radius, np.nan)
-        radial_unit_y = np.where(radius > 0, out["y_centered_px"] / radius, np.nan)
-        radial_unit_z = np.where(radius > 0, z / radius, np.nan)
+        out["radial_velocity_3d_proxy_px_s"] = np.where(
+            radius_px > 0, radial_num_px / radius_px, np.nan
+        )
+        radial_unit_x_px = np.where(radius_px > 0, out["x_centered_px"] / radius_px, np.nan)
+        radial_unit_y_px = np.where(radius_px > 0, out["y_centered_px"] / radius_px, np.nan)
+        radial_unit_z_px = np.where(radius_px > 0, z_px / radius_px, np.nan)
         out["radial_velocity_x_3d_proxy_px_s"] = (
-            out["radial_velocity_3d_proxy_px_s"] * radial_unit_x
+            out["radial_velocity_3d_proxy_px_s"] * radial_unit_x_px
         )
         out["radial_velocity_y_3d_proxy_px_s"] = (
-            out["radial_velocity_3d_proxy_px_s"] * radial_unit_y
+            out["radial_velocity_3d_proxy_px_s"] * radial_unit_y_px
         )
         out["radial_velocity_z_3d_proxy_px_s"] = (
-            out["radial_velocity_3d_proxy_px_s"] * radial_unit_z
+            out["radial_velocity_3d_proxy_px_s"] * radial_unit_z_px
         )
         out["tangential_velocity_x_3d_proxy_px_s"] = (
             out["vx_px_s"] - out["radial_velocity_x_3d_proxy_px_s"]
@@ -7029,16 +7724,84 @@ def add_velocity_decomposition_columns(df: pd.DataFrame) -> pd.DataFrame:
             out["vy_px_s"] - out["radial_velocity_y_3d_proxy_px_s"]
         )
         out["tangential_velocity_z_3d_proxy_px_s"] = (
-            vz - out["radial_velocity_z_3d_proxy_px_s"]
+            vz_px - out["radial_velocity_z_3d_proxy_px_s"]
         )
         if "speed_3d_proxy_px_s" in out.columns:
-            tangent_sq = np.square(out["speed_3d_proxy_px_s"]) - np.square(
+            tangent_sq_px = np.square(out["speed_3d_proxy_px_s"]) - np.square(
                 out["radial_velocity_3d_proxy_px_s"]
             )
-            out["tangential_speed_3d_proxy_px_s"] = np.sqrt(np.maximum(tangent_sq, 0.0))
+            out["tangential_speed_3d_proxy_px_s"] = np.sqrt(np.maximum(tangent_sq_px, 0.0))
     if "tangential_velocity_px_s" in out.columns:
         out["abs_tangential_velocity_px_s"] = out["tangential_velocity_px_s"].abs()
-    if {"tangential_speed_3d_proxy_px_s", "radial_velocity_3d_proxy_px_s"}.issubset(out.columns):
+
+    # cm-first decomposition for all new velocity outputs.
+    vz_cm_col = _first_existing_column(out, ["vz_cm_s", "vz_3d_proxy_cm_s"])
+    z_cm = out["z_lift_cm"] if "z_lift_cm" in out.columns else 0.0
+    vz_cm = out[vz_cm_col] if vz_cm_col is not None else 0.0
+    if {"vx_cm_s", "vy_cm_s"}.issubset(out.columns):
+        out["speed_3d_proxy_cm_s"] = np.sqrt(
+            np.square(out["vx_cm_s"])
+            + np.square(out["vy_cm_s"])
+            + np.square(vz_cm)
+        )
+    elif "speed_cm_s" in out.columns:
+        out["speed_3d_proxy_cm_s"] = out["speed_cm_s"]
+    if "vx_cm_s" in out.columns:
+        out["velocity_x_axis_cm_s"] = out["vx_cm_s"]
+    if "vy_cm_s" in out.columns:
+        out["velocity_y_axis_cm_s"] = out["vy_cm_s"]
+    if vz_cm_col is not None:
+        out["velocity_z_axis_3d_proxy_cm_s"] = out[vz_cm_col]
+    if {"x_workspace_cm", "y_workspace_cm", "vx_cm_s", "vy_cm_s"}.issubset(out.columns):
+        radius_cm = np.sqrt(
+            np.square(out["x_workspace_cm"])
+            + np.square(out["y_workspace_cm"])
+            + np.square(z_cm)
+        )
+        radial_num_cm = (
+            out["x_workspace_cm"] * out["vx_cm_s"]
+            + out["y_workspace_cm"] * out["vy_cm_s"]
+            + z_cm * vz_cm
+        )
+        out["radial_velocity_3d_proxy_cm_s"] = np.where(
+            radius_cm > 0, radial_num_cm / radius_cm, np.nan
+        )
+        radial_unit_x_cm = np.where(radius_cm > 0, out["x_workspace_cm"] / radius_cm, np.nan)
+        radial_unit_y_cm = np.where(radius_cm > 0, out["y_workspace_cm"] / radius_cm, np.nan)
+        radial_unit_z_cm = np.where(radius_cm > 0, z_cm / radius_cm, np.nan)
+        out["radial_velocity_x_3d_proxy_cm_s"] = (
+            out["radial_velocity_3d_proxy_cm_s"] * radial_unit_x_cm
+        )
+        out["radial_velocity_y_3d_proxy_cm_s"] = (
+            out["radial_velocity_3d_proxy_cm_s"] * radial_unit_y_cm
+        )
+        out["radial_velocity_z_3d_proxy_cm_s"] = (
+            out["radial_velocity_3d_proxy_cm_s"] * radial_unit_z_cm
+        )
+        out["tangential_velocity_x_3d_proxy_cm_s"] = (
+            out["vx_cm_s"] - out["radial_velocity_x_3d_proxy_cm_s"]
+        )
+        out["tangential_velocity_y_3d_proxy_cm_s"] = (
+            out["vy_cm_s"] - out["radial_velocity_y_3d_proxy_cm_s"]
+        )
+        out["tangential_velocity_z_3d_proxy_cm_s"] = (
+            vz_cm - out["radial_velocity_z_3d_proxy_cm_s"]
+        )
+        if "speed_3d_proxy_cm_s" in out.columns:
+            tangent_sq_cm = np.square(out["speed_3d_proxy_cm_s"]) - np.square(
+                out["radial_velocity_3d_proxy_cm_s"]
+            )
+            out["tangential_speed_3d_proxy_cm_s"] = np.sqrt(np.maximum(tangent_sq_cm, 0.0))
+    if "tangential_velocity_cm_s" in out.columns:
+        out["abs_tangential_velocity_cm_s"] = out["tangential_velocity_cm_s"].abs()
+    if {"tangential_speed_3d_proxy_cm_s", "radial_velocity_3d_proxy_cm_s"}.issubset(out.columns):
+        denom = out["radial_velocity_3d_proxy_cm_s"].abs()
+        out["tangential_radial_velocity_ratio_3d_proxy"] = np.where(
+            denom > 1e-9,
+            out["tangential_speed_3d_proxy_cm_s"] / denom,
+            np.nan,
+        )
+    elif {"tangential_speed_3d_proxy_px_s", "radial_velocity_3d_proxy_px_s"}.issubset(out.columns):
         denom = out["radial_velocity_3d_proxy_px_s"].abs()
         out["tangential_radial_velocity_ratio_3d_proxy"] = np.where(
             denom > 1e-9,
@@ -7050,22 +7813,22 @@ def add_velocity_decomposition_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 VELOCITY_SUGGESTION_METRICS: dict[str, list[tuple[str, str]]] = {
     "xyz_components": [
-        ("velocity_x_axis_px_s", "X-axis velocity from top camera (px/s)"),
-        ("velocity_y_axis_px_s", "Y-axis velocity from top camera (px/s)"),
-        ("velocity_z_axis_3d_proxy_px_s", "Z-axis velocity from z_tracking.csv (px/s)"),
+        ("velocity_x_axis_cm_s", "X-axis velocity from top camera (cm/s)"),
+        ("velocity_y_axis_cm_s", "Y-axis velocity from top camera (cm/s)"),
+        ("velocity_z_axis_3d_proxy_cm_s", "Z-axis velocity from z_tracking.csv (cm/s proxy)"),
     ],
     "magnitude": [
-        ("speed_px_s", "2D velocity magnitude (px/s)"),
-        ("speed_3d_proxy_px_s", "3D proxy velocity magnitude (px/s)"),
+        ("speed_cm_s", "2D velocity magnitude (cm/s)"),
+        ("speed_3d_proxy_cm_s", "3D proxy velocity magnitude (cm/s)"),
     ],
     "radial": [
-        ("radial_velocity_px_s", "2D signed radial velocity (px/s)"),
-        ("radial_velocity_3d_proxy_px_s", "3D proxy signed radial velocity (px/s)"),
+        ("radial_velocity_cm_s", "2D signed radial velocity (cm/s)"),
+        ("radial_velocity_3d_proxy_cm_s", "3D proxy signed radial velocity (cm/s)"),
     ],
     "tangential": [
-        ("tangential_velocity_px_s", "2D signed tangential velocity (px/s)"),
-        ("abs_tangential_velocity_px_s", "2D tangential velocity magnitude (px/s)"),
-        ("tangential_speed_3d_proxy_px_s", "3D proxy tangential velocity magnitude (px/s)"),
+        ("tangential_velocity_cm_s", "2D signed tangential velocity (cm/s)"),
+        ("abs_tangential_velocity_cm_s", "2D tangential velocity magnitude (cm/s)"),
+        ("tangential_speed_3d_proxy_cm_s", "3D proxy tangential velocity magnitude (cm/s)"),
     ],
 }
 
@@ -7077,25 +7840,25 @@ def velocity_interpretation_notes_table() -> pd.DataFrame:
             {
                 "topic": "magnitude_vs_velocity",
                 "note": (
-                    "speed_px_s is the 2D velocity magnitude sqrt(vx_px_s^2 + "
-                    "vy_px_s^2), while speed_3d_proxy_px_s also includes "
-                    "Z velocity from z_tracking.csv when available. Signed "
-                    "directional motion is represented by X/Y/Z component "
-                    "columns plus radial/tangential decomposition columns."
+                    "speed_cm_s is the setup-scaled 2D velocity magnitude "
+                    "sqrt(vx_cm_s^2 + vy_cm_s^2), while speed_3d_proxy_cm_s "
+                    "also includes the side-camera Z proxy when available. Raw "
+                    "pixel columns remain in the profile for traceability."
                 ),
             },
             {
                 "topic": "xyz_velocity_components",
                 "note": (
-                    "velocity_x_axis_px_s and velocity_y_axis_px_s come from "
-                    "the top-camera trajectory. velocity_z_axis_3d_proxy_px_s "
-                    "comes from z_tracking.csv-derived side-camera Z lift."
+                    "velocity_x_axis_cm_s and velocity_y_axis_cm_s come from "
+                    "the top-camera trajectory scaled by the setup field size. "
+                    "velocity_z_axis_3d_proxy_cm_s comes from z_tracking.csv-derived "
+                    "side-camera Z lift using the setup vertical scale."
                 ),
             },
             {
                 "topic": "radial_velocity_sign",
                 "note": (
-                    "radial_velocity_px_s is signed: positive means movement "
+                    "radial_velocity_cm_s is signed: positive means movement "
                     "away from the center; negative means movement toward the "
                     "center."
                 ),
@@ -7103,7 +7866,7 @@ def velocity_interpretation_notes_table() -> pd.DataFrame:
             {
                 "topic": "tangential_velocity_sign",
                 "note": (
-                    "tangential_velocity_px_s is signed around the center. "
+                    "tangential_velocity_cm_s is signed around the center. "
                     "Oscillatory X/Y movement can therefore appear above and "
                     "below zero in radial/tangential or Vx/Vy plots, while "
                     "velocity magnitude stays non-negative."
@@ -7112,10 +7875,11 @@ def velocity_interpretation_notes_table() -> pd.DataFrame:
             {
                 "topic": "s_vs_c_magnitude",
                 "note": (
-                    "standard_vs_comparison_Magnitude uses speed_px_s, the 2D "
-                    "in-plane velocity magnitude. The velocity suggestion outputs "
-                    "also report X/Y/Z component plots and speed_3d_proxy_px_s, "
-                    "which includes the side-camera Z dimension when available."
+                    "standard_vs_comparison_Magnitude uses speed_cm_s, the 2D "
+                    "in-plane velocity magnitude in centimeters per second. The "
+                    "velocity suggestion outputs also report X/Y/Z component plots "
+                    "and speed_3d_proxy_cm_s, which includes the side-camera Z proxy "
+                    "when available."
                 ),
             },
         ]
@@ -7189,29 +7953,32 @@ def compute_velocity_suggestion_tables(profile: pd.DataFrame) -> dict[str, pd.Da
             "stiffness_value",
             "trajectory_time_bin",
             "time_fraction",
+            "x_workspace_cm",
+            "y_workspace_cm",
+            "z_lift_cm",
+            "vx_cm_s",
+            "vy_cm_s",
+            "vz_cm_s",
+            "vz_3d_proxy_cm_s",
+            "velocity_x_axis_cm_s",
+            "velocity_y_axis_cm_s",
+            "velocity_z_axis_3d_proxy_cm_s",
+            "speed_cm_s",
+            "speed_3d_proxy_cm_s",
+            "radial_velocity_cm_s",
+            "radial_velocity_3d_proxy_cm_s",
+            "radial_velocity_x_3d_proxy_cm_s",
+            "radial_velocity_y_3d_proxy_cm_s",
+            "radial_velocity_z_3d_proxy_cm_s",
+            "tangential_velocity_cm_s",
+            "abs_tangential_velocity_cm_s",
+            "tangential_speed_3d_proxy_cm_s",
+            "tangential_velocity_x_3d_proxy_cm_s",
+            "tangential_velocity_y_3d_proxy_cm_s",
+            "tangential_velocity_z_3d_proxy_cm_s",
             "x_centered_px",
             "y_centered_px",
             "z_lift_px",
-            "vx_px_s",
-            "vy_px_s",
-            "vz_px_s",
-            "vz_3d_proxy_px_s",
-            "velocity_x_axis_px_s",
-            "velocity_y_axis_px_s",
-            "velocity_z_axis_3d_proxy_px_s",
-            "speed_px_s",
-            "speed_3d_proxy_px_s",
-            "radial_velocity_px_s",
-            "radial_velocity_3d_proxy_px_s",
-            "radial_velocity_x_3d_proxy_px_s",
-            "radial_velocity_y_3d_proxy_px_s",
-            "radial_velocity_z_3d_proxy_px_s",
-            "tangential_velocity_px_s",
-            "abs_tangential_velocity_px_s",
-            "tangential_speed_3d_proxy_px_s",
-            "tangential_velocity_x_3d_proxy_px_s",
-            "tangential_velocity_y_3d_proxy_px_s",
-            "tangential_velocity_z_3d_proxy_px_s",
             "tangential_radial_velocity_ratio_3d_proxy",
         ]
         if c in decomposed.columns
@@ -7243,12 +8010,12 @@ def compute_velocity_suggestion_tables(profile: pd.DataFrame) -> dict[str, pd.Da
                     "tangential_radial_velocity_ratio_3d_proxy",
                     "median",
                 ),
-                median_tangential_speed_3d_proxy_px_s=(
-                    "tangential_speed_3d_proxy_px_s",
+                median_tangential_speed_3d_proxy_cm_s=(
+                    "tangential_speed_3d_proxy_cm_s",
                     "median",
                 ),
-                median_abs_radial_velocity_3d_proxy_px_s=(
-                    "radial_velocity_3d_proxy_px_s",
+                median_abs_radial_velocity_3d_proxy_cm_s=(
+                    "radial_velocity_3d_proxy_cm_s",
                     lambda s: pd.to_numeric(s, errors="coerce").abs().median(),
                 ),
                 n_observations=("tangential_radial_velocity_ratio_3d_proxy", "count"),
@@ -7292,24 +8059,24 @@ def save_velocity_suggestion_figures(
         "stiffness_value",
         "trajectory_time_bin",
         "time_fraction",
-        "velocity_x_axis_px_s",
-        "velocity_y_axis_px_s",
-        "velocity_z_axis_3d_proxy_px_s",
-        "speed_px_s",
-        "speed_3d_proxy_px_s",
-        "radial_velocity_px_s",
-        "tangential_velocity_px_s",
+        "velocity_x_axis_cm_s",
+        "velocity_y_axis_cm_s",
+        "velocity_z_axis_3d_proxy_cm_s",
+        "speed_cm_s",
+        "speed_3d_proxy_cm_s",
+        "radial_velocity_cm_s",
+        "tangential_velocity_cm_s",
     ]:
         if col in profile.columns:
             profile[col] = pd.to_numeric(profile[col], errors="coerce")
 
     family_primary = {
-        "x_axis": ("velocity_x_axis_px_s", "X-axis velocity", "px/s"),
-        "y_axis": ("velocity_y_axis_px_s", "Y-axis velocity", "px/s"),
-        "z_axis": ("velocity_z_axis_3d_proxy_px_s", "Z-axis velocity (3D proxy)", "px/s"),
-        "magnitude": ("speed_3d_proxy_px_s", "3D proxy velocity magnitude", "px/s"),
-        "radial": ("radial_velocity_px_s", "Signed radial velocity", "px/s"),
-        "tangential": ("tangential_velocity_px_s", "Signed tangential velocity", "px/s"),
+        "x_axis": ("velocity_x_axis_cm_s", "X-axis velocity", "cm/s"),
+        "y_axis": ("velocity_y_axis_cm_s", "Y-axis velocity", "cm/s"),
+        "z_axis": ("velocity_z_axis_3d_proxy_cm_s", "Z-axis velocity (3D proxy)", "cm/s"),
+        "magnitude": ("speed_3d_proxy_cm_s", "3D proxy velocity magnitude", "cm/s"),
+        "radial": ("radial_velocity_cm_s", "Signed radial velocity", "cm/s"),
+        "tangential": ("tangential_velocity_cm_s", "Signed tangential velocity", "cm/s"),
     }
     cmap = plt.get_cmap(STIFFNESS_CMAP)
 
@@ -7377,9 +8144,9 @@ def save_velocity_suggestion_figures(
     ) -> None:
         """Save one figure that shows the X, Y, and Z velocity components."""
         component_specs = [
-            ("X-axis velocity", "velocity_x_axis_px_s", "px/s"),
-            ("Y-axis velocity", "velocity_y_axis_px_s", "px/s"),
-            ("Z-axis velocity (3D proxy)", "velocity_z_axis_3d_proxy_px_s", "px/s"),
+            ("X-axis velocity", "velocity_x_axis_cm_s", "cm/s"),
+            ("Y-axis velocity", "velocity_y_axis_cm_s", "cm/s"),
+            ("Z-axis velocity (3D proxy)", "velocity_z_axis_3d_proxy_cm_s", "cm/s"),
         ]
         if not any(
             col in frame.columns and frame[col].notna().any()
@@ -7449,10 +8216,10 @@ def save_velocity_suggestion_figures(
 
     def _save_curviness(frame: pd.DataFrame, *, title_scope: str, out_path: Path) -> None:
         radial_col = _first_existing_column(
-            frame, ["radial_velocity_3d_proxy_px_s", "radial_velocity_px_s"]
+            frame, ["radial_velocity_3d_proxy_cm_s", "radial_velocity_cm_s"]
         )
         tangential_col = _first_existing_column(
-            frame, ["tangential_speed_3d_proxy_px_s", "tangential_velocity_px_s"]
+            frame, ["tangential_speed_3d_proxy_cm_s", "tangential_velocity_cm_s"]
         )
         if radial_col is None or tangential_col is None:
             return
@@ -7479,8 +8246,8 @@ def save_velocity_suggestion_figures(
             )
         ax.axhline(0, color="0.75", linewidth=0.8)
         ax.axvline(0, color="0.75", linewidth=0.8)
-        ax.set_xlabel("Signed radial velocity (3D proxy when available, px/s)")
-        ax.set_ylabel("Tangential speed (3D proxy when available, px/s)")
+        ax.set_xlabel("Signed radial velocity (3D proxy when available, cm/s)")
+        ax.set_ylabel("Tangential speed (3D proxy when available, cm/s)")
         ax.set_title(
             "Velocity curviness proxy\n"
             f"{title_scope}; ideal straight radial motion stays near tangential=0"
@@ -7670,7 +8437,7 @@ def save_subject_velocity_acceleration_figures(
         )
         return paths
 
-    profile = subject_velocity_acceleration_profile.copy()
+    profile = add_workspace_normalization_columns(subject_velocity_acceleration_profile.copy())
     profile["finger_condition"] = profile["finger_condition"].map(
         normalize_finger_condition
     )
@@ -7679,6 +8446,20 @@ def save_subject_velocity_acceleration_figures(
         "trajectory_time_bin",
         "time_fraction",
         "sampling_rate_hz",
+        "speed_cm_s",
+        "acceleration_cm_s2",
+        "vx_cm_s",
+        "vy_cm_s",
+        "vz_cm_s",
+        "vx_3d_cm_s",
+        "vy_3d_cm_s",
+        "vz_3d_proxy_cm_s",
+        "ax_cm_s2",
+        "ay_cm_s2",
+        "az_cm_s2",
+        "ax_3d_cm_s2",
+        "ay_3d_cm_s2",
+        "az_3d_proxy_cm_s2",
         "speed_px_s",
         "acceleration_px_s2",
         "vx_px_s",
@@ -7697,21 +8478,21 @@ def save_subject_velocity_acceleration_figures(
         if col in profile.columns:
             profile[col] = pd.to_numeric(profile[col], errors="coerce")
     velocity_components = [
-        ("Vx", _first_existing_column(profile, ["vx_px_s", "vx_3d_px_s"]), "px/s"),
-        ("Vy", _first_existing_column(profile, ["vy_px_s", "vy_3d_px_s"]), "px/s"),
+        ("Vx", _first_existing_column(profile, ["vx_cm_s", "vx_3d_cm_s"]), "cm/s"),
+        ("Vy", _first_existing_column(profile, ["vy_cm_s", "vy_3d_cm_s"]), "cm/s"),
         (
             "Vz",
-            _first_existing_column(profile, ["vz_px_s", "vz_3d_proxy_px_s"]),
-            "px/s",
+            _first_existing_column(profile, ["vz_cm_s", "vz_3d_proxy_cm_s"]),
+            "cm/s",
         ),
     ]
     acceleration_components = [
-        ("Ax", _first_existing_column(profile, ["ax_px_s2", "ax_3d_px_s2"]), "px/s²"),
-        ("Ay", _first_existing_column(profile, ["ay_px_s2", "ay_3d_px_s2"]), "px/s²"),
+        ("Ax", _first_existing_column(profile, ["ax_cm_s2", "ax_3d_cm_s2"]), "cm/s^2"),
+        ("Ay", _first_existing_column(profile, ["ay_cm_s2", "ay_3d_cm_s2"]), "cm/s^2"),
         (
             "Az",
-            _first_existing_column(profile, ["az_px_s2", "az_3d_proxy_px_s2"]),
-            "px/s²",
+            _first_existing_column(profile, ["az_cm_s2", "az_3d_proxy_cm_s2"]),
+            "cm/s^2",
         ),
     ]
     subjects = sorted(profile["subject_id"].dropna().unique(), key=lambda x: str(x))
@@ -8069,19 +8850,19 @@ def save_subject_velocity_acceleration_figures(
 
         # Signed per-axis acceleration vs time, plotted as an (X, Y, Z) matrix.
         #
-        # The previous figure plotted ``acceleration_px_s2`` -- the Euclidean
+        # The previous figure plotted ``acceleration_cm_s2`` -- the Euclidean
         # magnitude ``hypot(ax, ay)`` -- on a log axis. That magnitude is always
         # >= 0, so it hides the most informative feature of a probing stroke: the
         # hand accelerates *outward* (one sign) and then *decelerates / returns
         # toward the center* (the opposite sign). Using the signed components
-        # ``ax_px_s2``/``ay_px_s2``/``az_px_s2`` on a linear axis with a zero
+        # ``ax_cm_s2``/``ay_cm_s2``/``az_cm_s2`` on a linear axis with a zero
         # reference line restores those negative phases. Az is the vertical
         # (side-camera) component and may be absent; that panel is left blank when
         # the column is missing or all-NaN.
         accel_axis_specs = [
-            ("Ax (left-right)", _first_existing_column(all_profile, ["ax_px_s2", "ax_3d_px_s2"])),
-            ("Ay (toward-away)", _first_existing_column(all_profile, ["ay_px_s2", "ay_3d_px_s2"])),
-            ("Az (vertical)", _first_existing_column(all_profile, ["az_px_s2", "az_3d_proxy_px_s2"])),
+            ("Ax (left-right)", _first_existing_column(all_profile, ["ax_cm_s2", "ax_3d_cm_s2"])),
+            ("Ay (toward-away)", _first_existing_column(all_profile, ["ay_cm_s2", "ay_3d_cm_s2"])),
+            ("Az (vertical)", _first_existing_column(all_profile, ["az_cm_s2", "az_3d_proxy_cm_s2"])),
         ]
 
         def _save_acceleration_xyz_figure(frame, *, aggregator, title_scope, filename):
@@ -8089,7 +8870,7 @@ def save_subject_velocity_acceleration_figures(
             for ax, (axis_label, col) in zip(axes, accel_axis_specs):
                 ax.axhline(0, color="0.4", linewidth=0.9)
                 ax.grid(alpha=0.25)
-                ax.set_ylabel(f"{axis_label}\nacceleration (px/s²)")
+                ax.set_ylabel(f"{axis_label}\nacceleration (cm/s^2)")
                 if col is None or not frame[col].notna().any():
                     ax.text(
                         0.5,
@@ -8201,7 +8982,7 @@ def save_subject_velocity_acceleration_figures(
                 plt.close(fig)
                 return
             ax.set_xlabel("Normalized stiffness-segment time")
-            ax.set_ylabel(f"{axis_label} acceleration (px/sֲ²)")
+            ax.set_ylabel(f"{axis_label} acceleration (cm/s^2)")
             ax.set_title(
                 f"Signed {axis_label} acceleration vs time {title_scope}\n"
                 f"thin/light = per-participant traces, thick+markers = {aggregator} by finger"
@@ -8275,20 +9056,20 @@ def save_subject_velocity_acceleration_figures(
                     g.groupby("trajectory_time_bin", as_index=False)
                     .agg(
                         time_fraction=("time_fraction", "mean"),
-                        speed_px_s=("speed_px_s", "median"),
-                        sem_speed_px_s=("speed_px_s", _sem),
+                        speed_cm_s=("speed_cm_s", "median"),
+                        sem_speed_cm_s=("speed_cm_s", _sem),
                     )
                     .sort_values("trajectory_time_bin")
                 )
                 ax.plot(
                     avg["time_fraction"],
-                    avg["speed_px_s"],
+                    avg["speed_cm_s"],
                     color=color,
                     linewidth=2.2,
                     label=f"{stiffness:g}",
                 )
             ax.set_xlabel("Normalized stiffness-segment time")
-            ax.set_ylabel("Velocity magnitude (px/s)")
+            ax.set_ylabel("Velocity magnitude (cm/s)")
             ax.set_title("Velocity vs time by stiffness value")
             ax.legend(fontsize=8, title="Stiffness")
             ax.grid(alpha=0.25)
@@ -8315,19 +9096,19 @@ def save_subject_velocity_acceleration_figures(
                         g.groupby("trajectory_time_bin", as_index=False)
                         .agg(
                             time_fraction=("time_fraction", "mean"),
-                            speed_px_s=("speed_px_s", "median"),
+                            speed_cm_s=("speed_cm_s", "median"),
                         )
                         .sort_values("trajectory_time_bin")
                     )
                     ax.plot(
                         avg["time_fraction"],
-                        avg["speed_px_s"],
+                        avg["speed_cm_s"],
                         color=color,
                         linewidth=2.2,
                         label=f"{stiffness:g}",
                     )
                 ax.set_xlabel("Normalized stiffness-segment time")
-                ax.set_ylabel("Velocity magnitude (px/s)")
+                ax.set_ylabel("Velocity magnitude (cm/s)")
                 ax.set_title(
                     "Velocity vs time by stiffness value\n"
                     f"Finger: {FINGER_LABELS.get(str(finger), str(finger))}"
@@ -8351,10 +9132,10 @@ def save_subject_velocity_acceleration_figures(
                     dropna=False,
                 )
                 .agg(
-                    mean_speed_px_s=("speed_px_s", "median"),
-                    median_speed_px_s=("speed_px_s", "median"),
-                    sem_speed_px_s=("speed_px_s", _sem),
-                    n_observations=("speed_px_s", "count"),
+                    mean_speed_cm_s=("speed_cm_s", "median"),
+                    median_speed_cm_s=("speed_cm_s", "median"),
+                    sem_speed_cm_s=("speed_cm_s", _sem),
+                    n_observations=("speed_cm_s", "count"),
                 )
                 .sort_values(["stiffness_value", "finger_condition"])
             )
@@ -8377,7 +9158,7 @@ def save_subject_velocity_acceleration_figures(
                         as_index=False,
                         dropna=False,
                     )
-                    .agg(mean_speed_px_s=("speed_px_s", "median"))
+                    .agg(mean_speed_cm_s=("speed_cm_s", "median"))
                     .sort_values(["stiffness_value", "finger_condition"])
                 )
                 for f_idx, finger in enumerate(fingers):
@@ -8399,14 +9180,14 @@ def save_subject_velocity_acceleration_figures(
                             )
                         ]
                         heights.append(
-                            float(row["median_speed_px_s"].iloc[0])
+                            float(row["median_speed_cm_s"].iloc[0])
                             if not row.empty
                             else np.nan
                         )
                         errors.append(
-                            float(row["sem_speed_px_s"].iloc[0])
+                            float(row["sem_speed_cm_s"].iloc[0])
                             if not row.empty
-                            and pd.notna(row["sem_speed_px_s"].iloc[0])
+                            and pd.notna(row["sem_speed_cm_s"].iloc[0])
                             else 0.0
                         )
                         counts.append(int(row["n_observations"].iloc[0]) if not row.empty else 0)
@@ -8450,7 +9231,7 @@ def save_subject_velocity_acceleration_figures(
                         dot_x = np.full(len(dots), x[stiffness_index] + offsets[f_idx])
                         ax.scatter(
                             dot_x,
-                            dots["mean_speed_px_s"],
+                            dots["mean_speed_cm_s"],
                             color="black",
                             s=10,
                             alpha=0.35,
@@ -8459,7 +9240,7 @@ def save_subject_velocity_acceleration_figures(
                 ax.set_xticks(x)
                 ax.set_xticklabels([f"{v:g}" for v in stiffness_axis])
                 ax.set_xlabel("Stiffness value")
-                ax.set_ylabel("Median velocity magnitude (px/s)")
+                ax.set_ylabel("Median velocity magnitude (cm/s)")
                 ax.set_title(
                     "Median velocity vs stiffness by finger\n"
                     "bars=median speed per finger, error=SEM, dots=subject medians"
@@ -8474,8 +9255,8 @@ def save_subject_velocity_acceleration_figures(
 
             if (
                 include_average_acceleration_stiffness_figure
-                and "acceleration_px_s2" in all_profile.columns
-                and all_profile["acceleration_px_s2"].notna().any()
+                and "acceleration_cm_s2" in all_profile.columns
+                and all_profile["acceleration_cm_s2"].notna().any()
             ):
                 fingers = _ordered_fingers(all_profile["finger_condition"].dropna().unique())
                 by_stiffness_finger_acc = (
@@ -8485,9 +9266,9 @@ def save_subject_velocity_acceleration_figures(
                         dropna=False,
                     )
                     .agg(
-                        mean_acceleration_px_s2=("acceleration_px_s2", "median"),
-                        sem_acceleration_px_s2=("acceleration_px_s2", _sem),
-                        n_observations=("acceleration_px_s2", "count"),
+                        mean_acceleration_cm_s2=("acceleration_cm_s2", "median"),
+                        sem_acceleration_cm_s2=("acceleration_cm_s2", _sem),
+                        n_observations=("acceleration_cm_s2", "count"),
                     )
                     .sort_values(["stiffness_value", "finger_condition"])
                 )
@@ -8510,7 +9291,7 @@ def save_subject_velocity_acceleration_figures(
                             as_index=False,
                             dropna=False,
                         )
-                        .agg(mean_acceleration_px_s2=("acceleration_px_s2", "median"))
+                        .agg(mean_acceleration_cm_s2=("acceleration_cm_s2", "median"))
                         .sort_values(["stiffness_value", "finger_condition"])
                     )
                     for f_idx, finger in enumerate(fingers):
@@ -8532,14 +9313,14 @@ def save_subject_velocity_acceleration_figures(
                                 )
                             ]
                             heights.append(
-                                float(row["mean_acceleration_px_s2"].iloc[0])
+                                float(row["mean_acceleration_cm_s2"].iloc[0])
                                 if not row.empty
                                 else np.nan
                             )
                             errors.append(
-                                float(row["sem_acceleration_px_s2"].iloc[0])
+                                float(row["sem_acceleration_cm_s2"].iloc[0])
                                 if not row.empty
-                                and pd.notna(row["sem_acceleration_px_s2"].iloc[0])
+                                and pd.notna(row["sem_acceleration_cm_s2"].iloc[0])
                                 else 0.0
                             )
                             counts.append(
@@ -8589,7 +9370,7 @@ def save_subject_velocity_acceleration_figures(
                             dot_x = np.full(len(dots), x[stiffness_index] + offsets[f_idx])
                             ax.scatter(
                                 dot_x,
-                                dots["mean_acceleration_px_s2"],
+                                dots["mean_acceleration_cm_s2"],
                                 color="black",
                                 s=10,
                                 alpha=0.35,
@@ -8598,7 +9379,7 @@ def save_subject_velocity_acceleration_figures(
                     ax.set_xticks(x)
                     ax.set_xticklabels([f"{v:g}" for v in stiffness_axis])
                     ax.set_xlabel("Stiffness value")
-                    ax.set_ylabel("Median acceleration magnitude (px/s²)")
+                    ax.set_ylabel("Median acceleration magnitude (cm/s^2)")
                     ax.set_title(
                         "Median acceleration vs stiffness by finger\n"
                         "bars=median per finger, error=SEM, dots=subject medians"
@@ -8620,34 +9401,34 @@ def save_subject_velocity_acceleration_figures(
 
 
 STANDARD_VS_COMPARISON_METRICS = [
-    ("Vx", "vx_px_s", "px/s"),
-    ("Vy", "vy_px_s", "px/s"),
-    ("Vz", "vz_px_s", "px/s"),
-    ("Ax", "ax_px_s2", "px/s^2"),
-    ("Ay", "ay_px_s2", "px/s^2"),
-    ("Az", "az_px_s2", "px/s^2"),
-    ("Magnitude", "speed_px_s", "px/s"),
-    ("AccelMag", "acceleration_px_s2", "px/s^2"),
+    ("Vx", "vx_cm_s", "cm/s"),
+    ("Vy", "vy_cm_s", "cm/s"),
+    ("Vz", "vz_cm_s", "cm/s"),
+    ("Ax", "ax_cm_s2", "cm/s^2"),
+    ("Ay", "ay_cm_s2", "cm/s^2"),
+    ("Az", "az_cm_s2", "cm/s^2"),
+    ("Magnitude", "speed_cm_s", "cm/s"),
+    ("AccelMag", "acceleration_cm_s2", "cm/s^2"),
 ]
 
 STANDARD_VS_COMPARISON_VELOCITY_FAMILIES: dict[str, list[tuple[str, str, str]]] = {
     "magnitude": [
-        ("Vx", "vx_px_s", "px/s"),
-        ("Vy", "vy_px_s", "px/s"),
-        ("Vz", "vz_px_s", "px/s"),
-        ("Magnitude", "speed_px_s", "px/s"),
+        ("Vx", "vx_cm_s", "cm/s"),
+        ("Vy", "vy_cm_s", "cm/s"),
+        ("Vz", "vz_cm_s", "cm/s"),
+        ("Magnitude", "speed_cm_s", "cm/s"),
     ],
     "radial": [
-        ("RadialX", "radial_velocity_x_3d_proxy_px_s", "px/s"),
-        ("RadialY", "radial_velocity_y_3d_proxy_px_s", "px/s"),
-        ("RadialZ", "radial_velocity_z_3d_proxy_px_s", "px/s"),
-        ("Radial", "radial_velocity_3d_proxy_px_s", "px/s"),
+        ("RadialX", "radial_velocity_x_3d_proxy_cm_s", "cm/s"),
+        ("RadialY", "radial_velocity_y_3d_proxy_cm_s", "cm/s"),
+        ("RadialZ", "radial_velocity_z_3d_proxy_cm_s", "cm/s"),
+        ("Radial", "radial_velocity_3d_proxy_cm_s", "cm/s"),
     ],
     "tangential": [
-        ("TangentialX", "tangential_velocity_x_3d_proxy_px_s", "px/s"),
-        ("TangentialY", "tangential_velocity_y_3d_proxy_px_s", "px/s"),
-        ("TangentialZ", "tangential_velocity_z_3d_proxy_px_s", "px/s"),
-        ("Tangential", "tangential_speed_3d_proxy_px_s", "px/s"),
+        ("TangentialX", "tangential_velocity_x_3d_proxy_cm_s", "cm/s"),
+        ("TangentialY", "tangential_velocity_y_3d_proxy_cm_s", "cm/s"),
+        ("TangentialZ", "tangential_velocity_z_3d_proxy_cm_s", "cm/s"),
+        ("Tangential", "tangential_speed_3d_proxy_cm_s", "cm/s"),
     ],
 }
 
@@ -9316,7 +10097,7 @@ def compute_3d_proxy_kinematics(
     ):
         return empty
 
-    s = samples.copy()
+    s = add_workspace_normalization_columns(samples.copy())
     s["finger_condition"] = s.get("finger_condition", np.nan).map(
         normalize_finger_condition
     )
@@ -9449,6 +10230,7 @@ def compute_3d_proxy_kinematics(
             g["hand_orientation_zx_deg"] = np.degrees(
                 np.arctan2(g["thumb_active_dx_px"], g["z_3d_proxy_px"])
             )
+        g = add_workspace_normalization_columns(g)
         g["r_3d_from_center_px"] = np.sqrt(
             g["x_3d_px"] ** 2 + g["y_3d_px"] ** 2 + g["z_3d_proxy_px"] ** 2
         )
@@ -9465,6 +10247,7 @@ def compute_3d_proxy_kinematics(
         g["acceleration_3d_proxy_px_s2"] = np.sqrt(
             g["ax_3d_px_s2"] ** 2 + g["ay_3d_px_s2"] ** 2 + g["az_3d_proxy_px_s2"] ** 2
         )
+        g = add_workspace_normalization_columns(g)
         rows.append(g)
 
     samples_3d = (
@@ -9474,6 +10257,7 @@ def compute_3d_proxy_kinematics(
     for key, g in samples_3d.groupby(keys, dropna=False):
         g = g.sort_values("time_s")
         valid = g[["x_3d_px", "y_3d_px", "z_3d_proxy_px"]].dropna()
+        valid_cm = g[["x_3d_cm", "y_3d_cm", "z_3d_proxy_cm"]].dropna() if {"x_3d_cm", "y_3d_cm", "z_3d_proxy_cm"}.issubset(g.columns) else pd.DataFrame()
         if valid.empty:
             continue
         dx = g["x_3d_px"].diff()
@@ -9482,6 +10266,12 @@ def compute_3d_proxy_kinematics(
         dside = g["side_lateral_camera_corrected_px"].diff()
         step_3d = np.sqrt(dx**2 + dy**2 + dz**2)
         side_view_step = np.sqrt(dside**2 + dz**2)
+        dx_cm = g["x_3d_cm"].diff() if "x_3d_cm" in g.columns else np.nan
+        dy_cm = g["y_3d_cm"].diff() if "y_3d_cm" in g.columns else np.nan
+        dz_cm = g["z_3d_proxy_cm"].diff() if "z_3d_proxy_cm" in g.columns else np.nan
+        dside_cm = g["side_lateral_camera_corrected_cm"].diff() if "side_lateral_camera_corrected_cm" in g.columns else np.nan
+        step_3d_cm = np.sqrt(dx_cm**2 + dy_cm**2 + dz_cm**2)
+        side_view_step_cm = np.sqrt(dside_cm**2 + dz_cm**2)
         x0 = valid["x_3d_px"].iloc[0]
         y0 = valid["y_3d_px"].iloc[0]
         z0 = valid["z_3d_proxy_px"].iloc[0]
@@ -9490,6 +10280,17 @@ def compute_3d_proxy_kinematics(
             + (g["y_3d_px"] - y0) ** 2
             + (g["z_3d_proxy_px"] - z0) ** 2
         )
+        if not valid_cm.empty:
+            x0_cm = valid_cm["x_3d_cm"].iloc[0]
+            y0_cm = valid_cm["y_3d_cm"].iloc[0]
+            z0_cm = valid_cm["z_3d_proxy_cm"].iloc[0]
+            excursion_from_start_cm = np.sqrt(
+                (g["x_3d_cm"] - x0_cm) ** 2
+                + (g["y_3d_cm"] - y0_cm) ** 2
+                + (g["z_3d_proxy_cm"] - z0_cm) ** 2
+            )
+        else:
+            excursion_from_start_cm = pd.Series(np.nan, index=g.index)
         row = {
             "subject_id": g["subject_id"].iloc[0],
             "subject_group": g["subject_group"].dropna().iloc[0]
@@ -9523,35 +10324,64 @@ def compute_3d_proxy_kinematics(
             else np.nan,
             "n_3d_samples": int(valid.shape[0]),
             "path_length_3d_proxy_px": float(np.nansum(step_3d)),
+            "path_length_3d_proxy_cm": float(np.nansum(step_3d_cm)),
             "max_excursion_3d_from_start_px": float(np.nanmax(excursion_from_start)),
+            "max_excursion_3d_from_start_cm": float(np.nanmax(excursion_from_start_cm)),
             "max_radius_3d_from_center_px": float(
                 pd.to_numeric(g["r_3d_from_center_px"], errors="coerce").max()
+            ),
+            "max_radius_3d_from_center_cm": float(
+                pd.to_numeric(g.get("r_3d_from_center_cm", np.nan), errors="coerce").max()
             ),
             "peak_velocity_3d_proxy_px_s": float(
                 pd.to_numeric(g["speed_3d_proxy_px_s"], errors="coerce").max()
             ),
+            "peak_velocity_3d_proxy_cm_s": float(
+                pd.to_numeric(g.get("speed_3d_proxy_cm_s", np.nan), errors="coerce").max()
+            ),
             "mean_velocity_3d_proxy_px_s": float(
                 pd.to_numeric(g["speed_3d_proxy_px_s"], errors="coerce").mean()
+            ),
+            "mean_velocity_3d_proxy_cm_s": float(
+                pd.to_numeric(g.get("speed_3d_proxy_cm_s", np.nan), errors="coerce").mean()
             ),
             "peak_acceleration_3d_proxy_px_s2": float(
                 pd.to_numeric(g["acceleration_3d_proxy_px_s2"], errors="coerce").max()
             ),
+            "peak_acceleration_3d_proxy_cm_s2": float(
+                pd.to_numeric(g.get("acceleration_3d_proxy_cm_s2", np.nan), errors="coerce").max()
+            ),
             "mean_acceleration_3d_proxy_px_s2": float(
                 pd.to_numeric(g["acceleration_3d_proxy_px_s2"], errors="coerce").mean()
+            ),
+            "mean_acceleration_3d_proxy_cm_s2": float(
+                pd.to_numeric(g.get("acceleration_3d_proxy_cm_s2", np.nan), errors="coerce").mean()
             ),
             "mean_z_lift_px": float(
                 pd.to_numeric(g["z_3d_proxy_px"], errors="coerce").mean()
             ),
+            "mean_z_lift_cm": float(
+                pd.to_numeric(g.get("z_3d_proxy_cm", np.nan), errors="coerce").mean()
+            ),
             "max_z_lift_px": float(
                 pd.to_numeric(g["z_3d_proxy_px"], errors="coerce").max()
+            ),
+            "max_z_lift_cm": float(
+                pd.to_numeric(g.get("z_3d_proxy_cm", np.nan), errors="coerce").max()
             ),
             "mean_side_lateral_camera_corrected_px": float(
                 pd.to_numeric(
                     g["side_lateral_camera_corrected_px"], errors="coerce"
                 ).mean()
             ),
+            "mean_side_lateral_camera_corrected_cm": float(
+                pd.to_numeric(g.get("side_lateral_camera_corrected_cm", np.nan), errors="coerce").mean()
+            ),
             "path_length_side_view_camera_corrected_px": float(
                 np.nansum(side_view_step)
+            ),
+            "path_length_side_view_camera_corrected_cm": float(
+                np.nansum(side_view_step_cm)
             ),
             "mean_side_lift_lateral_angle_camera_corrected_deg": _circ_mean_deg(
                 g["side_lift_lateral_angle_camera_corrected_deg"]
@@ -9571,6 +10401,11 @@ def compute_3d_proxy_kinematics(
             if row["path_length_3d_proxy_px"] > 0
             else np.nan
         )
+        row["straightness_3d_proxy_cm"] = (
+            row["max_excursion_3d_from_start_cm"] / row["path_length_3d_proxy_cm"]
+            if row["path_length_3d_proxy_cm"] > 0
+            else np.nan
+        )
         summary_rows.append(row)
     trial_3d = pd.DataFrame(summary_rows)
 
@@ -9584,25 +10419,47 @@ def compute_3d_proxy_kinematics(
                 n_trials=("trial_index_raw", "count"),
                 success_rate=("correct_response", "mean"),
                 path_length_3d_proxy_px=("path_length_3d_proxy_px", "mean"),
+                path_length_3d_proxy_cm=("path_length_3d_proxy_cm", "mean"),
                 max_excursion_3d_from_start_px=(
                     "max_excursion_3d_from_start_px",
                     "mean",
                 ),
+                max_excursion_3d_from_start_cm=(
+                    "max_excursion_3d_from_start_cm",
+                    "mean",
+                ),
                 max_radius_3d_from_center_px=("max_radius_3d_from_center_px", "mean"),
+                max_radius_3d_from_center_cm=("max_radius_3d_from_center_cm", "mean"),
                 peak_velocity_3d_proxy_px_s=("peak_velocity_3d_proxy_px_s", "mean"),
+                peak_velocity_3d_proxy_cm_s=("peak_velocity_3d_proxy_cm_s", "mean"),
                 mean_velocity_3d_proxy_px_s=("mean_velocity_3d_proxy_px_s", "median"),
+                mean_velocity_3d_proxy_cm_s=("mean_velocity_3d_proxy_cm_s", "median"),
                 peak_acceleration_3d_proxy_px_s2=(
                     "peak_acceleration_3d_proxy_px_s2",
                     "mean",
                 ),
+                peak_acceleration_3d_proxy_cm_s2=(
+                    "peak_acceleration_3d_proxy_cm_s2",
+                    "mean",
+                ),
                 mean_z_lift_px=("mean_z_lift_px", "median"),
+                mean_z_lift_cm=("mean_z_lift_cm", "median"),
                 max_z_lift_px=("max_z_lift_px", "mean"),
+                max_z_lift_cm=("max_z_lift_cm", "mean"),
                 mean_side_lateral_camera_corrected_px=(
                     "mean_side_lateral_camera_corrected_px",
                     "mean",
                 ),
+                mean_side_lateral_camera_corrected_cm=(
+                    "mean_side_lateral_camera_corrected_cm",
+                    "mean",
+                ),
                 path_length_side_view_camera_corrected_px=(
                     "path_length_side_view_camera_corrected_px",
+                    "mean",
+                ),
+                path_length_side_view_camera_corrected_cm=(
+                    "path_length_side_view_camera_corrected_cm",
                     "mean",
                 ),
                 mean_side_lift_lateral_angle_camera_corrected_deg=(
@@ -9622,6 +10479,7 @@ def compute_3d_proxy_kinematics(
                     lambda s: _circ_mean_deg(s),
                 ),
                 straightness_3d_proxy=("straightness_3d_proxy", "mean"),
+                straightness_3d_proxy_cm=("straightness_3d_proxy_cm", "mean"),
             )
             .reset_index()
         )
@@ -9637,32 +10495,32 @@ def compute_3d_proxy_kinematics(
         subject_3d,
         ["subject_id", "finger_condition"],
         [
-            "path_length_3d_proxy_px",
-            "max_excursion_3d_from_start_px",
-            "max_radius_3d_from_center_px",
-            "peak_velocity_3d_proxy_px_s",
-            "peak_acceleration_3d_proxy_px_s2",
-            "mean_z_lift_px",
-            "max_z_lift_px",
-            "mean_side_lateral_camera_corrected_px",
-            "path_length_side_view_camera_corrected_px",
+            "path_length_3d_proxy_cm",
+            "max_excursion_3d_from_start_cm",
+            "max_radius_3d_from_center_cm",
+            "peak_velocity_3d_proxy_cm_s",
+            "peak_acceleration_3d_proxy_cm_s2",
+            "mean_z_lift_cm",
+            "max_z_lift_cm",
+            "mean_side_lateral_camera_corrected_cm",
+            "path_length_side_view_camera_corrected_cm",
             "mean_side_lift_lateral_angle_camera_corrected_deg",
             "mean_hand_orientation_xy_deg",
             "mean_hand_orientation_yz_deg",
             "mean_hand_orientation_zx_deg",
-            "straightness_3d_proxy",
+            "straightness_3d_proxy_cm",
         ],
     )
     stiffness_direction_3d_metric_distribution = summarize_metric_distribution(
         trial_3d,
         ["stiffness_value", "dominant_movement_direction"],
         [
-            "path_length_3d_proxy_px",
-            "max_excursion_3d_from_start_px",
-            "max_radius_3d_from_center_px",
-            "peak_velocity_3d_proxy_px_s",
-            "peak_acceleration_3d_proxy_px_s2",
-            "path_length_side_view_camera_corrected_px",
+            "path_length_3d_proxy_cm",
+            "max_excursion_3d_from_start_cm",
+            "max_radius_3d_from_center_cm",
+            "peak_velocity_3d_proxy_cm_s",
+            "peak_acceleration_3d_proxy_cm_s2",
+            "path_length_side_view_camera_corrected_cm",
             "mean_side_lift_lateral_angle_camera_corrected_deg",
         ],
     )
@@ -10461,10 +11319,10 @@ def save_hand_orientation_plane_figures(
             ax.set_aspect("equal", adjustable="box")
             ax.grid(alpha=0.18)
             ax.set_title(FINGER_LABELS.get(str(finger), str(finger)))
-            ax.set_xlabel("Thumb→active-finger dx (px)")
-            ax.set_ylabel("Thumb→active-finger dy (px)")
+            ax.set_xlabel("Thumb-to-active-finger dx (px)")
+            ax.set_ylabel("Thumb-to-active-finger dy (px)")
         fig.suptitle(
-            f"{scope_label}: thumb→active-finger XY orientation vectors by finger\n"
+            f"{scope_label}: thumb-to-active-finger XY orientation vectors by finger\n"
             "matrix panels=fingers; colors=stiffness; "
             "faded=trials; thick=median per stiffness; "
             f"orientation span trimmed to P5-P95; source={vector_source}",
@@ -11136,14 +11994,14 @@ def _save_time_acceleration_xyz_matrix(
             side_z_samples,
             n_time_bins=n_time_bins,
         )
-        if "az_px_s2" in augmented.columns:
-            plot_time["mean_az_px_s2"] = pd.to_numeric(
-                augmented["az_px_s2"], errors="coerce"
+        if "az_cm_s2" in augmented.columns:
+            plot_time["mean_az_cm_s2"] = pd.to_numeric(
+                augmented["az_cm_s2"], errors="coerce"
             )
     axis_specs = [
-        ("X / Ax", "mean_ax_px_s2"),
-        ("Y / Ay", "mean_ay_px_s2"),
-        ("Z / Az", "mean_az_px_s2"),
+        ("X / Ax", "mean_ax_cm_s2"),
+        ("Y / Ay", "mean_ay_cm_s2"),
+        ("Z / Az", "mean_az_cm_s2"),
     ]
     fig, axes = plt.subplots(3, 1, figsize=(9.5, 10.5), sharex=True)
     axes = np.asarray(axes).reshape(3, 1)
@@ -11187,7 +12045,7 @@ def _save_time_acceleration_xyz_matrix(
             if row_idx == 0:
                 ax.set_title(f"{stat_label} acceleration")
             if col_idx == 0:
-                ax.set_ylabel(f"{axis_label}\n(px/s²)")
+                ax.set_ylabel(f"{axis_label}\n(cm/s^2)")
             if row_idx == 2:
                 ax.set_xlabel("Normalized trial time")
     handles, labels = axes[0, 0].get_legend_handles_labels()
@@ -11231,20 +12089,20 @@ def save_kinematic_figures(
     }.get(Path(output_root).name, "")
     if not group_time.empty:
         for y_col, y_label, filename in [
-            ("mean_speed_px_s", "Velocity magnitude (px/s)", "time_magnitude.png"),
+            ("mean_speed_cm_s", "Velocity magnitude (cm/s)", "time_magnitude.png"),
             (
-                "mean_acceleration_px_s2",
-                "Acceleration (px/s^2)",
+                "mean_acceleration_cm_s2",
+                "Acceleration (cm/s^2)",
                 "time_acceleration.png",
             ),
             (
-                "mean_radial_velocity_px_s",
-                "Radial velocity (px/s)",
+                "mean_radial_velocity_cm_s",
+                "Radial velocity (cm/s)",
                 "time_radial_velocity.png",
             ),
             (
-                "mean_tangential_velocity_px_s",
-                "Tangential velocity (px/s)",
+                "mean_tangential_velocity_cm_s",
+                "Tangential velocity (cm/s)",
                 "time_tangential_velocity.png",
             ),
         ]:
@@ -11375,8 +12233,11 @@ def save_kinematic_figures(
                     z=("mean_side_z_lift_px", "mean"),
                     sem=("mean_side_z_lift_px", _sem),
                 )
-                color = stiffness_colors.get(group)
-                ax.plot(gg["t"], gg["z"], marker="o", label=str(group), color=color)
+                color = stiffness_colors.get(group) or GROUP_TO_COLOR.get(str(group))
+                line = ax.plot(
+                    gg["t"], gg["z"], marker="o", label=str(group), color=color
+                )[0]
+                color = line.get_color()
                 if gg["sem"].notna().any():
                     ax.fill_between(
                         gg["t"],
@@ -11807,3 +12668,4 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
             "path": [str(output_root / x) for x in expected],
         }
     )
+

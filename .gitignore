@@ -210,6 +210,9 @@ cython_debug/
 *.xlsx
 *.mp4
 *.json
+*.xml
+*.SLDASM
+*.SLDPRT
 *.svg
 *.md
 *.txt
@@ -281,3 +284,7 @@ paper/
 # which are tracked golden fixtures (see _perf/.gitignore).
 **/*_[Rr]esults/
 analysis/**/plots/
+
+# Report generation artifacts
+paper/report_script/
+*.3mf
