@@ -92,11 +92,9 @@ class StudyConfig:
     stiffness_value: float = 1.0
     hand_orientation: HandOrientation = HandOrientation.NOT_MIRRORED
 
-    #: When True, additionally run every (quantisation, model) combination, not
-    #: just the four the named strategies occupy. That grid is what lets the
-    #: quantisation effect and the model effect be separated; the four named
-    #: strategies alone cover only four of its six cells.
-    run_ingredient_grid: bool = True
+    #: Held fixed for every strategy, so the comparison is strategy against
+    #: strategy on one mechanism.
+    kinematic_model: KinematicModel = KinematicModel.IK
 
     # Commanded path: line out, one full circle, line back.
     outward_fraction_of_half_width: float = 0.5
@@ -357,83 +355,38 @@ def run_metrics(samples: pd.DataFrame, config: StudyConfig) -> pd.DataFrame:
 
 
 def run_study(config: StudyConfig | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run the four named strategies, plus the ingredient grid.
-
-    Returns (samples, metrics). Rows whose `run` equals a strategy name are the
-    device's actual conditions; rows named ``"<quantisation>+<model>"`` are the
-    grid used to attribute a difference to one ingredient.
-    """
+    """Run the four movement strategies on the configured kinematic model."""
     config = config or StudyConfig()
     path = build_commanded_path(config)
-    frames: list[pd.DataFrame] = []
-
-    # The strategies as the device actually runs them.
-    for strategy in config.strategies:
-        frames.append(
-            simulate_run(strategy.value, _make_controller(config, strategy), path, config)
-        )
-
-    # Every ingredient combination, including the two no named strategy uses.
-    if config.run_ingredient_grid:
-        for quantisation in Quantisation:
-            for kinematic_model in KinematicModel:
-                frames.append(
-                    simulate_run(
-                        f"{quantisation.value}+{kinematic_model.value}",
-                        _make_controller(
-                            config,
-                            MovementStrategy.FREE_FORM,
-                            quantisation=quantisation,
-                            kinematic_model=kinematic_model,
-                        ),
-                        path,
-                        config,
-                    )
-                )
-
-    samples = pd.concat(frames, ignore_index=True)
+    samples = pd.concat(
+        [
+            simulate_run(
+                strategy.value,
+                _make_controller(config, strategy, kinematic_model=config.kinematic_model),
+                path,
+                config,
+            )
+            for strategy in config.strategies
+        ],
+        ignore_index=True,
+    )
     return samples, run_metrics(samples, config)
 
 
-def named_strategy_table(metrics: pd.DataFrame, config: StudyConfig) -> pd.DataFrame:
-    """The four device conditions, with the ingredients each is built from."""
+def comparison_table(metrics: pd.DataFrame, config: StudyConfig) -> pd.DataFrame:
+    """The headline strategy comparison, in controller units."""
     names = [strategy.value for strategy in config.strategies]
     columns = [
         "quantisation",
-        "kinematic_model",
+        "total_rms",
+        "total_max",
         "quantisation_rms",
         "execution_rms",
-        "total_rms",
         "rms_command",
         "max_step_jump",
+        "closure_error",
     ]
     return metrics.loc[names, columns]
-
-
-def ingredient_grid(metrics: pd.DataFrame, column: str = "total_rms") -> pd.DataFrame:
-    """`column` as quantisation (rows) x kinematic model (columns).
-
-    Reading down a column isolates the quantisation effect; reading across a
-    row isolates the model effect. Two strategies sitting on a diagonal of this
-    grid differ in BOTH ingredients, so a difference between them cannot be
-    attributed to either one.
-    """
-    grid = metrics.loc[[label for label in metrics.index if "+" in label]]
-    return grid.pivot(index="quantisation", columns="kinematic_model", values=column)
-
-
-def strategy_positions(config: StudyConfig) -> pd.DataFrame:
-    """Where each named strategy sits in the ingredient grid."""
-    return pd.DataFrame(
-        [
-            {
-                "strategy": strategy.value,
-                "quantisation": STRATEGY_DEFINITIONS[strategy][0].value,
-                "kinematic_model": STRATEGY_DEFINITIONS[strategy][1].value,
-            }
-            for strategy in config.strategies
-        ]
-    ).set_index("strategy")
 
 
 if __name__ == "__main__":
@@ -443,15 +396,8 @@ if __name__ == "__main__":
     pd.set_option("display.width", 220)
     pd.set_option("display.max_columns", 50)
 
-    print("The four movement strategies, and what each is built from:\n")
-    print(strategy_positions(study_config).to_string())
-
-    print("\n\nResults per strategy (controller units):\n")
-    print(named_strategy_table(study_metrics, study_config).round(3).to_string())
-
-    print("\n\nIngredient grid - total RMS error")
-    print("(quantisation down, kinematic model across)\n")
-    print(ingredient_grid(study_metrics, "total_rms").round(2).to_string())
-
-    print("\n\nIngredient grid - RMS motor command\n")
-    print(ingredient_grid(study_metrics, "rms_command").round(2).to_string())
+    print(
+        f"Four movement strategies on the {study_config.kinematic_model.value} model, "
+        f"radius {study_config.radius:.0f} controller units.\n"
+    )
+    print(comparison_table(study_metrics, study_config).round(3).to_string())

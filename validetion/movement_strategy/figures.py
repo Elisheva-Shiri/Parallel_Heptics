@@ -14,15 +14,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from analysis import CIRCLE_SEGMENT, StudyConfig, ingredient_grid, strategy_positions
+from analysis import CIRCLE_SEGMENT, StudyConfig
 
 FIGURE_DIR = Path(__file__).resolve().parent / "figures"
 
 STRATEGY_STYLE: dict[str, dict[str, object]] = {
-    "cardinal": {"color": "#d7191c", "label": "Cardinal\n(4-way, planar)"},
-    "cardinal_diagonal": {"color": "#fdae61", "label": "Cardinal-diagonal\n(8-way, planar)"},
-    "free_form": {"color": "#2c7bb6", "label": "Free-form\n(continuous, planar)"},
-    "ik": {"color": "#1a9641", "label": "IK\n(continuous, 3-D mechanism)"},
+    "cardinal": {"color": "#d7191c", "label": "Cardinal\n(4-way)"},
+    "cardinal_diagonal": {"color": "#fdae61", "label": "Cardinal-diagonal\n(8-way)"},
+    "free_form": {"color": "#2c7bb6", "label": "Free-form\n(continuous)"},
+    "ik": {"color": "#1a9641", "label": "IK\n(continuous)"},
 }
 COMMANDED_STYLE = {"color": "0.45", "linestyle": "--", "linewidth": 2.0}
 
@@ -43,11 +43,7 @@ def plot_reconstructed_paths(
     config: StudyConfig,
     output_dir: Path | None = None,
 ) -> Path:
-    """Commanded circle vs reconstruction, one panel per movement strategy.
-
-    Each strategy runs exactly as the device defines it, so this is the four
-    experimental conditions side by side.
-    """
+    """Commanded circle vs reconstruction, one panel per movement strategy."""
     strategies = [strategy.value for strategy in config.strategies]
     fig, axes = plt.subplots(1, len(strategies), figsize=(5.0 * len(strategies), 5.8))
     marker_steps = np.linspace(0, config.circle_steps - 1, 12, dtype=int)
@@ -108,7 +104,7 @@ def plot_reconstructed_paths(
         axis.legend(loc="upper right", fontsize=8)
 
     fig.suptitle(
-        "The four movement strategies on the same commanded circle.\n"
+        "The four movement strategies on the 3-D mechanism model, same commanded circle.\n"
         "Every reconstructed point lands on the commanded radius, so shape metrics score all "
         "four as near-perfect circles;\nthe tie lines and the reachable-point count show the "
         "along-path error those metrics cannot see.",
@@ -165,79 +161,11 @@ def plot_strategy_comparison(
     ax_effort.set_xticks(positions)
     ax_effort.set_xticklabels(labels, fontsize=8)
     ax_effort.set_ylabel("RMS motor command (controller units)")
-    ax_effort.set_title(
-        "Command effort\n"
-        "IK is the only strategy on the 3-D mechanism model - that, not its\n"
-        "continuous direction, is what sets it apart here"
-    )
+    ax_effort.set_title("Command effort")
     ax_effort.grid(True, alpha=0.3, axis="y")
 
     fig.tight_layout()
     return _save(fig, "strategy_comparison.png", output_dir)
-
-
-def plot_ingredient_grids(
-    metrics: pd.DataFrame,
-    config: StudyConfig,
-    output_dir: Path | None = None,
-) -> Path:
-    """Attribution grids, with each named strategy marked at its own cell.
-
-    Reading down a column isolates the direction-quantisation ingredient;
-    reading across a row isolates the kinematic-model ingredient. The marked
-    cells show that cardinal-diagonal and IK sit on a diagonal - they differ in
-    both ingredients, which is why comparing only those two cannot attribute a
-    result to either.
-    """
-    positions = strategy_positions(config)
-    panels = [
-        ("total_rms", "Total RMS error", "Reds"),
-        ("rms_command", "RMS motor command", "Purples"),
-    ]
-    fig, axes = plt.subplots(1, len(panels), figsize=(7.6 * len(panels), 5.4))
-
-    for axis, (column, title, cmap) in zip(np.atleast_1d(axes), panels):
-        grid = ingredient_grid(metrics, column)
-        image = axis.imshow(grid.to_numpy(float), cmap=cmap, aspect="auto")
-
-        for row_index, quantisation in enumerate(grid.index):
-            for column_index, model in enumerate(grid.columns):
-                value = grid.iloc[row_index, column_index]
-                occupants = positions.index[
-                    positions["quantisation"].eq(quantisation)
-                    & positions["kinematic_model"].eq(model)
-                ].tolist()
-                caption = f"{value:.2f}"
-                if occupants:
-                    caption += "\n" + "\n".join(occupants)
-                axis.text(
-                    column_index,
-                    row_index,
-                    caption,
-                    ha="center",
-                    va="center",
-                    fontsize=9,
-                    color="black",
-                    bbox={"facecolor": "white", "alpha": 0.55, "edgecolor": "none", "pad": 2},
-                )
-
-        axis.set_xticks(range(len(grid.columns)))
-        axis.set_xticklabels(grid.columns)
-        axis.set_yticks(range(len(grid.index)))
-        axis.set_yticklabels(grid.index)
-        axis.set_xlabel("Kinematic model")
-        axis.set_ylabel("Direction quantisation")
-        axis.set_title(f"{title} (controller units)")
-        fig.colorbar(image, ax=axis, shrink=0.85)
-
-    fig.suptitle(
-        "Attributing a strategy difference to one ingredient.\n"
-        "Named strategies are labelled at the cell they occupy; two strategies on a diagonal "
-        "differ in both ingredients.",
-        fontsize=11,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.90))
-    return _save(fig, "ingredient_grids.png", output_dir)
 
 
 def plot_motor_commands(
@@ -269,9 +197,8 @@ def plot_motor_commands(
 
     np.atleast_1d(axes)[-1].set_xlabel("Path step")
     fig.suptitle(
-        "Motor commands, one panel per movement strategy (shared y axis).\n"
-        "Amplitude is set by the kinematic model; the quantisation ingredient shows up as the "
-        "discontinuous jump when a direction snaps to a new sector.",
+        "Motor commands on the 3-D mechanism model, one panel per movement strategy "
+        "(shared y axis).",
         fontsize=11,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.94))
@@ -287,7 +214,6 @@ def save_all(
     return [
         plot_reconstructed_paths(samples, config, output_dir),
         plot_strategy_comparison(metrics, config, output_dir),
-        plot_ingredient_grids(metrics, config, output_dir),
         plot_motor_commands(samples, config, output_dir),
     ]
 
