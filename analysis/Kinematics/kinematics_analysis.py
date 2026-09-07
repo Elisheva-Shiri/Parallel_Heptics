@@ -4880,6 +4880,9 @@ def _save_interaction_summary_block(
         save_subject_xy_trajectory_figures(
             output_root, spatial_tables["subject_xy_trajectory"], fig_dpi=fig_dpi
         )
+        save_group_xy_trajectory_figures(
+            output_root, spatial_tables["subject_xy_trajectory"], fig_dpi=fig_dpi
+        )
         save_subject_velocity_acceleration_figures(
             output_root,
             va_tables["subject_velocity_acceleration_profile"],
@@ -6681,6 +6684,295 @@ def save_subject_xy_trajectory_figures(
         output_root,
         "subject_xy_trajectory_figure_manifest.csv",
     )
+    return paths
+
+
+
+
+def _group_xy_trajectory_scopes(traj: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
+    """``[(group_label, rows)]`` for every experiment group (and combined label)
+    present in a multi-subject XY-trajectory table. Empty for one subject."""
+    if "subject_id" not in traj.columns or traj["subject_id"].dropna().nunique() <= 1:
+        return []
+    if "experiment_group" not in traj.columns:
+        return []
+    groups = traj["experiment_group"].dropna().astype(str)
+    present = sorted(groups.unique(), key=str)
+    scopes: list[tuple[str, pd.DataFrame]] = []
+    for group in present:
+        scopes.append((group, traj[groups == group]))
+    for cname, members in COMBINED_EXPERIMENT_GROUPS.items():
+        if len(present) > 1 and all(m in present for m in members):
+            scopes.append((cname, traj[groups.isin(members)]))
+    return scopes
+
+
+def align_xy_trajectories_to_subject_axis(traj: pd.DataFrame) -> pd.DataFrame:
+    """Rotate every subject's XY paths so that subject's principal movement axis is +X.
+
+    Participants explore along their own preferred axis (one moves NW-SE, another
+    N-S), so a pointwise group median of raw ``x_centered_px``/``y_centered_px``
+    cancels to the origin. This puts each subject in a common frame: the axis is the
+    first principal component of ALL that subject's centered XY samples (every
+    finger and stiffness share one rotation, so within-subject finger differences
+    are preserved), and the sign is chosen so the subject's outbound excursion (mean
+    X over the first half of the time bins) points to +X. Returns a copy with
+    ``x_centered_px``/``y_centered_px`` replaced by the aligned coordinates and the
+    rotation stored in ``subject_axis_angle_rad``.
+    """
+    out = traj.copy()
+    out["subject_axis_angle_rad"] = np.nan
+    x_all = pd.to_numeric(out["x_centered_px"], errors="coerce").to_numpy(dtype=float, copy=True)
+    y_all = pd.to_numeric(out["y_centered_px"], errors="coerce").to_numpy(dtype=float, copy=True)
+    bins = pd.to_numeric(out["trajectory_time_bin"], errors="coerce").to_numpy(dtype=float)
+    subjects = out["subject_id"].astype(str).to_numpy()
+    for sid in np.unique(subjects):
+        idx = np.flatnonzero(subjects == sid)
+        x, y = x_all[idx], y_all[idx]
+        ok = np.isfinite(x) & np.isfinite(y)
+        if ok.sum() < 3:
+            continue
+        cov = np.cov(np.vstack([x[ok], y[ok]]))
+        if not np.all(np.isfinite(cov)):
+            continue
+        evals, evecs = np.linalg.eigh(cov)
+        axis = evecs[:, int(np.argmax(evals))]
+        theta = float(np.arctan2(axis[1], axis[0]))
+        c, s = np.cos(-theta), np.sin(-theta)
+        xr = c * x - s * y
+        yr = s * x + c * y
+        first_half = ok & (bins[idx] <= np.nanmedian(bins[idx]))
+        if first_half.any() and np.nanmean(xr[first_half]) < 0:
+            xr, yr = -xr, -yr
+            theta += np.pi
+        x_all[idx], y_all[idx] = xr, yr
+        out.iloc[idx, out.columns.get_loc("subject_axis_angle_rad")] = theta
+    out["x_centered_px"] = x_all
+    out["y_centered_px"] = y_all
+    return out
+
+
+def save_group_xy_trajectory_figures(
+    output_root: Path,
+    subject_xy_trajectory: pd.DataFrame,
+    *,
+    fig_dpi: int = 160,
+    fig_dir: Optional[Path] = None,
+    include_aligned: bool = True,
+) -> list[Path]:
+    """Group-level counterparts of the per-subject movement-orientation XY figures.
+
+    :func:`save_subject_xy_trajectory_figures` draws, for ONE subject,
+    ``median_xy_trajectory_by_finger_subject_<id>.png`` (thin=stiffness paths,
+    thick=finger median) and, for the whole selection,
+    ``all_xy_trajectories_with_{finger,stiffness}_average.png``. This writes the
+    same three views once per experiment group (``L_E``/``N_E``) and once per
+    combined label whose members are all present (``L_N_E``):
+
+    * ``all_xy_trajectories_with_finger_average_experiment_group_<G>.png``
+      thin = every subject x stiffness path, thick = group median per finger.
+    * ``all_xy_trajectories_with_stiffness_average_experiment_group_<G>.png``
+      same, coloured by stiffness (thick = group median per stiffness).
+    * ``median_xy_trajectory_by_finger_experiment_group_<G>.png`` -- the group
+      analogue of the subject figure: thin = each subject's finger-median path,
+      thick = the group median of those per-subject medians (equal weight per
+      participant). o=start, X=end.
+
+    In the raw camera frame the group medians collapse to the origin because each
+    participant moves along a different axis, so with ``include_aligned`` the same
+    three figures are also written with an ``_aligned`` infix after rotating every
+    subject onto their principal movement axis
+    (:func:`align_xy_trajectories_to_subject_axis`); those show the group's typical
+    excursion shape/extent along and across the movement axis.
+
+    Axes are shared across every figure of one frame so the groups compare
+    directly. Figures land in ``results/<LABEL>/figures/<G>/`` (``group_figure_path``)
+    and are sorted into ``figures/trajectories/movement_orientation`` by
+    :func:`organize_kinematic_results_tree`; pass ``fig_dir`` to write somewhere
+    else directly. No-op for a single-subject selection.
+    """
+    paths: list[Path] = []
+    if subject_xy_trajectory is None or subject_xy_trajectory.empty:
+        return paths
+    traj = subject_xy_trajectory.copy()
+    traj["finger_condition"] = traj["finger_condition"].map(normalize_finger_condition)
+    for col in ["stiffness_value", "trajectory_time_bin", "x_centered_px", "y_centered_px"]:
+        traj[col] = pd.to_numeric(traj[col], errors="coerce")
+    traj = traj.dropna(subset=["x_centered_px", "y_centered_px", "trajectory_time_bin"])
+    if not _group_xy_trajectory_scopes(traj):
+        return paths
+    base_fig_dir = _figures_base(output_root) / "subject_xy_trajectories"
+
+    def _out(group: str, filename: str) -> Path:
+        if fig_dir is not None:
+            Path(fig_dir).mkdir(parents=True, exist_ok=True)
+            return Path(fig_dir) / filename
+        return group_figure_path(base_fig_dir, group, filename)
+
+    def _median_path(df: pd.DataFrame) -> pd.DataFrame:
+        return (
+            df.groupby("trajectory_time_bin", as_index=False)
+            .agg(x=("x_centered_px", "median"), y=("y_centered_px", "median"))
+            .sort_values("trajectory_time_bin")
+        )
+
+    def _mark_ends(ax: plt.Axes, avg: pd.DataFrame, color: Any) -> None:
+        ax.scatter(
+            avg["x"].iloc[0], avg["y"].iloc[0],
+            color=color, edgecolor="black", s=45, marker="o", zorder=5,
+        )
+        ax.scatter(
+            avg["x"].iloc[-1], avg["y"].iloc[-1],
+            color=color, edgecolor="black", s=55, marker="X", zorder=5,
+        )
+
+    frames: list[tuple[str, pd.DataFrame]] = [("", traj)]
+    if include_aligned:
+        frames.append(("aligned_", align_xy_trajectories_to_subject_axis(traj)))
+
+    for frame_tag, frame in frames:
+        xy_limits = _centered_limits_from_columns(frame, ["x_centered_px", "y_centered_px"])
+        if frame_tag:
+            xlabel = "Along subject movement axis (px)"
+            ylabel = "Across subject movement axis (px)"
+            frame_note = "each participant rotated onto their principal movement axis"
+        else:
+            xlabel = "X from workspace center (px)"
+            ylabel = "Y from workspace center (px)"
+            frame_note = "camera XY frame"
+
+        def _finish(ax: plt.Axes, title: str, subtitle: str, legend_title: Optional[str]) -> None:
+            ax.axhline(0, color="0.65", linewidth=0.8)
+            ax.axvline(0, color="0.65", linewidth=0.8)
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_xlim(*xy_limits)
+            ax.set_ylim(*xy_limits)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"{title}\n{subtitle}\n{frame_note}", fontsize=10)
+            ax.legend(loc="best", fontsize=8, title=legend_title)
+            ax.grid(alpha=0.2)
+
+        for group, g_rows in _group_xy_trajectory_scopes(frame):
+            if g_rows.empty:
+                continue
+            n_subjects = int(g_rows["subject_id"].nunique())
+            tag = f"{frame_tag}experiment_group_{sanitize_name(group)}"
+            head = f"Group {group} (n={n_subjects} participants)"
+
+            # 1-2. All subject x stiffness paths with the group median, by finger / stiffness.
+            for scope_name, group_col, filename, title in [
+                (
+                    "finger",
+                    "finger_condition",
+                    f"all_xy_trajectories_with_finger_average_{tag}.png",
+                    f"{head}: all XY trajectories by finger",
+                ),
+                (
+                    "stiffness",
+                    "stiffness_value",
+                    f"all_xy_trajectories_with_stiffness_average_{tag}.png",
+                    f"{head}: all XY trajectories by stiffness",
+                ),
+            ]:
+                fig, ax = plt.subplots(figsize=(7.6, 7.2))
+                if scope_name == "finger":
+                    values = _ordered_fingers(g_rows[group_col].dropna().unique())
+                else:
+                    values = sorted(g_rows[group_col].dropna().unique())
+                cmap = plt.get_cmap(STIFFNESS_CMAP)
+                for i, value in enumerate(values):
+                    g_scope = g_rows[g_rows[group_col] == value]
+                    if g_scope.empty:
+                        continue
+                    color = (
+                        FINGER_TO_COLOR.get(str(value), "#777777")
+                        if scope_name == "finger"
+                        else cmap(i / max(1, len(values) - 1))
+                    )
+                    for _, g in g_scope.groupby(
+                        ["subject_id", "stiffness_value", "finger_condition"], dropna=False
+                    ):
+                        g = g.sort_values("trajectory_time_bin")
+                        ax.plot(
+                            g["x_centered_px"], g["y_centered_px"],
+                            color=color, alpha=0.06, linewidth=0.7,
+                        )
+                    avg = _median_path(g_scope)
+                    if avg.empty:
+                        continue
+                    label = (
+                        FINGER_LABELS.get(str(value), str(value))
+                        if scope_name == "finger"
+                        else f"{float(value):g}"
+                    )
+                    ax.plot(avg["x"], avg["y"], color=color, linewidth=3.0, label=label)
+                    _mark_ends(ax, avg, color)
+                _finish(
+                    ax,
+                    title,
+                    "thin=participant x stiffness paths, thick=group median; o=start, X=end",
+                    scope_name,
+                )
+                fig.tight_layout()
+                out = _out(group, filename)
+                fig.savefig(out, dpi=fig_dpi)
+                plt.close(fig)
+                paths.append(out)
+
+            # 3. Group analogue of the per-subject "median XY trajectory by finger":
+            #    thin = each subject's finger median, thick = median across subjects.
+            fig, ax = plt.subplots(figsize=(7.2, 7.2))
+            for finger in _ordered_fingers(g_rows["finger_condition"].dropna().unique()):
+                f_df = g_rows[g_rows["finger_condition"] == finger]
+                color = FINGER_TO_COLOR.get(str(finger), "#777777")
+                per_subject: list[pd.DataFrame] = []
+                for sid, s in f_df.groupby("subject_id"):
+                    avg_s = _median_path(s)
+                    if avg_s.empty:
+                        continue
+                    per_subject.append(avg_s.assign(subject_id=sid))
+                    ax.plot(avg_s["x"], avg_s["y"], color=color, alpha=0.22, linewidth=1.0)
+                    ax.scatter(
+                        avg_s["x"].iloc[0], avg_s["y"].iloc[0],
+                        color=color, alpha=0.25, s=14, marker="o",
+                    )
+                    ax.scatter(
+                        avg_s["x"].iloc[-1], avg_s["y"].iloc[-1],
+                        color=color, alpha=0.25, s=18, marker="x",
+                    )
+                if not per_subject:
+                    continue
+                stacked = pd.concat(per_subject, ignore_index=True)
+                avg = (
+                    stacked.groupby("trajectory_time_bin", as_index=False)
+                    .agg(x=("x", "median"), y=("y", "median"))
+                    .sort_values("trajectory_time_bin")
+                )
+                ax.plot(
+                    avg["x"], avg["y"],
+                    color=color, linewidth=3.0,
+                    label=FINGER_LABELS.get(str(finger), str(finger)),
+                )
+                _mark_ends(ax, avg, color)
+            _finish(
+                ax,
+                f"{head}: median XY trajectory by finger",
+                "thin=per-participant finger median, thick=group median; o=start, X=end",
+                None,
+            )
+            fig.tight_layout()
+            out = _out(group, f"median_xy_trajectory_by_finger_{tag}.png")
+            fig.savefig(out, dpi=fig_dpi)
+            plt.close(fig)
+            paths.append(out)
+
+    if paths:
+        save_csv(
+            pd.DataFrame({"figure": [str(p) for p in paths]}),
+            output_root,
+            "group_xy_trajectory_figure_manifest.csv",
+        )
     return paths
 
 
