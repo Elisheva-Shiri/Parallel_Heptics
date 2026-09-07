@@ -9,7 +9,7 @@ analysis notebooks::
         csv/hysteresis/hysteresis_table.csv    return-to-zero offset by approach direction
         csv/resolution/resolution_table.csv    tick -> deg -> mm at the spool
         csv/summary/motor_validation_table.csv one merged table, one row per amplitude
-        csv/summary/motor_validation_table.tex the same table as a booktabs tabular
+        csv/summary/motor_validation_table.tex the same table as an in-column IEEEtran float
         csv/summary/calibration.json           gain, R^2, quantisation step, runs used
         figures/review/motor_validation_review_figure.{png,svg}
         figures/review/panel_{A,B,C}_*.{png,svg}
@@ -160,23 +160,47 @@ def merged_table(t: pd.DataFrame, h: pd.DataFrame, radius_mm: float) -> pd.DataF
     return m[cols].rename(columns={"offset": "hysteresis_deg", "offset_se": "hysteresis_se"})
 
 
-def merged_table_latex(m: pd.DataFrame) -> str:
-    """booktabs tabular for the merged table (needs \\usepackage{booktabs})."""
+def _tex_num(value: float, fmt: str) -> str:
+    """Format a number for LaTeX with a typographic minus."""
+    text = format(value, fmt)
+    return "$-$" + text[1:] if text.startswith("-") else text
+
+
+def merged_table_latex(m: pd.DataFrame, radius_mm: float = DEFAULT_SPOOL_RADIUS_MM,
+                       n_per_direction: int = 18, label: str = "tab:motor_validation") -> str:
+    """The merged table as a single-column IEEEtran float (needs booktabs + array).
+
+    Single-column on purpose: in two-column mode a ``table*`` can only sit at the
+    top of a page and never on the page it is written on, so it always drifts to
+    the next page. This form stays next to the paragraph that cites it.
+    """
     lines = [
-        r"\begin{tabular}{r r r@{\,$\pm$\,}l r@{\,$\pm$\,}l r r r@{\,$\pm$\,}l r}",
+        r"\begin{table}[!h]",
+        r"\centering",
+        r"\fontsize{7.5}{9}\selectfont",
+        r"\caption{Motor validation pooled over three runs ($n = " + str(n_per_direction)
+        + r"$ per direction and amplitude). $+\Delta$/$-\Delta$: trial-local rotation, mean\,$\pm$\,SD. "
+        + r"Error: $|\bar\theta|$ vs.\ the nominal $0.09^\circ$/tick scale. "
+        + r"Hyst.: angle at commanded 0 after $+\Delta$ minus after $-\Delta$, mean\,$\pm$\,SE. "
+        + r"Cable: $|\bar\theta|$ as cable displacement at the " + f"{radius_mm:g}" + r"\,mm spool. "
+        + r"The 1000-tick row is a range check at the detector's orientation limit.}\label{" + label + "}",
+        r"\setlength{\tabcolsep}{2.5pt}",
+        r"\renewcommand{\arraystretch}{1.05}",
+        r"\begin{tabular}{@{}r r r@{\,$\pm$\,}l r@{\,$\pm$\,}l r r r@{\,$\pm$\,}l r@{}}",
         r"\toprule",
-        r"$\Delta$ & Nominal & \multicolumn{2}{c}{$+\Delta$} & \multicolumn{2}{c}{$-\Delta$} "
-        r"& $|\bar\theta|$ & Error & \multicolumn{2}{c}{Hysteresis} & Cable \\",
+        r"$\Delta$ & Nom. & \multicolumn{2}{c}{$+\Delta$} & \multicolumn{2}{c}{$-\Delta$} "
+        r"& $|\bar\theta|$ & Error & \multicolumn{2}{c}{Hyst.} & Cable \\",
         r"(ticks) & ($^\circ$) & \multicolumn{2}{c}{($^\circ$)} & \multicolumn{2}{c}{($^\circ$)} "
         r"& ($^\circ$) & (\%) & \multicolumn{2}{c}{($^\circ$)} & (mm) \\",
         r"\midrule",
     ]
     for r in m.itertuples(index=False):
         lines.append(
-            f"{r.delta} & {r.nominal_deg:.2f} & {r.pos_mean:.2f} & {r.pos_sd:.2f} & {r.neg_mean:.2f} & {r.neg_sd:.2f} "
-            f"& {r.mean_abs:.2f} & {r.error_pct:.1f} & {r.hysteresis_deg:+.2f} & {r.hysteresis_se:.2f} & {r.cable_mm:.3f} \\\\"
+            f"{r.delta} & {r.nominal_deg:.2f} & {_tex_num(r.pos_mean, '.2f')} & {r.pos_sd:.2f} "
+            f"& {_tex_num(r.neg_mean, '.2f')} & {r.neg_sd:.2f} & {r.mean_abs:.2f} & {r.error_pct:.1f} "
+            f"& {_tex_num(r.hysteresis_deg, '+.2f')} & {r.hysteresis_se:.2f} & {r.cable_mm:.3f} \\\\"
         )
-    lines += [r"\bottomrule", r"\end{tabular}"]
+    lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
     return "\n".join(lines)
 
 
@@ -303,7 +327,7 @@ def run(
     k, r2 = fit_gain(t)
     res = resolution_table(t, k, spool_radius_mm)
     m = merged_table(t, h, spool_radius_mm)
-    latex = merged_table_latex(m)
+    latex = merged_table_latex(m, spool_radius_mm, int(t["n_pos"].iloc[0]))
 
     out = results_root / selection
     csv = out / "csv"
