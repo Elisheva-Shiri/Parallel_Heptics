@@ -190,10 +190,25 @@ def _style_paper_panel(axis) -> None:
     axis.grid(True, alpha=PAPER_GRID_ALPHA)
 
 
+def _command_scale(part: pd.DataFrame) -> float:
+    """Peak |command| across the three motors, used to normalise a method.
+
+    Dividing by this maps a method's commands onto [-1, 1] while keeping zero
+    at zero and preserving sign - which a (v - min) / (max - min) mapping would
+    not, because the two methods are not symmetric about zero to the same
+    degree (planar reaches +/-160, the 3-D mechanism -53 to +37). The residual
+    asymmetry stays visible after normalisation, which is intended.
+    """
+    values = part[["motor_0", "motor_1", "motor_2"]].to_numpy(float)
+    peak = float(np.abs(values).max())
+    return peak if peak > 0.0 else 1.0
+
+
 def plot_cd_vs_ik_paper_figure(
     samples: pd.DataFrame,
     config: StudyConfig,
     output_dir: Path | None = None,
+    normalise_commands: bool = False,
 ) -> Path:
     """Paper-facing cardinal-diagonal vs IK comparison (two equal-height panels).
 
@@ -243,23 +258,31 @@ def plot_cd_vs_ik_paper_figure(
         fontsize=PAPER_LEGEND_FS, frameon=False, handlelength=1.25, columnspacing=0.55,
     )
 
+    ik_scale = _command_scale(ik) if normalise_commands else 1.0
+    cd_scale = _command_scale(cd) if normalise_commands else 1.0
+
     ax_motor.axhline(0.0, color="0.25", lw=1.6, alpha=0.6)
     for motor_index in range(3):
         ax_motor.plot(
-            ik["step"], ik[f"motor_{motor_index}"], "-",
+            ik["step"], ik[f"motor_{motor_index}"] / ik_scale, "-",
             color=IK_MOTOR_COLORS[motor_index], lw=PAPER_LINE_W + 0.2, alpha=0.82,
             label=f"IK M{motor_index}", zorder=2,
         )
     for motor_index in range(3):
         ax_motor.plot(
-            cd["step"], cd[f"motor_{motor_index}"], "--",
+            cd["step"], cd[f"motor_{motor_index}"] / cd_scale, "--",
             color=CD_MOTOR_COLORS[motor_index], lw=PAPER_LINE_W + 0.2,
             label=f"CD M{motor_index}", zorder=3,
         )
     ax_motor.set_title("Motor commands")
     ax_motor.set_xlabel("Step")
-    ax_motor.set_ylabel("Command", labelpad=4)
-    ax_motor.set_yticks(np.arange(-150, 151, 50))
+    if normalise_commands:
+        ax_motor.set_ylabel("Normalised command", labelpad=4)
+        ax_motor.set_yticks(np.arange(-1.0, 1.01, 0.5))
+        ax_motor.set_ylim(-1.1, 1.1)
+    else:
+        ax_motor.set_ylabel("Command", labelpad=4)
+        ax_motor.set_yticks(np.arange(-150, 151, 50))
     _style_paper_panel(ax_motor)
     ax_motor.legend(
         loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=6,
@@ -268,7 +291,10 @@ def plot_cd_vs_ik_paper_figure(
 
     fig.align_labels()
     fig.subplots_adjust(left=0.055, right=0.99, bottom=0.25, top=0.86, wspace=0.18)
-    return _save(fig, "cardinal_diagonal_vs_ik_circle_and_motor_commands.png", output_dir)
+    suffix = "_normalised" if normalise_commands else ""
+    return _save(
+        fig, f"cardinal_diagonal_vs_ik_circle_and_motor_commands{suffix}.png", output_dir
+    )
 
 
 def plot_motor_commands(
@@ -318,6 +344,7 @@ def save_all(
     return [
         plot_reconstructed_paths(samples, config, output_dir),
         plot_cd_vs_ik_paper_figure(samples, config, output_dir),
+        plot_cd_vs_ik_paper_figure(samples, config, output_dir, normalise_commands=True),
         plot_strategy_comparison(metrics, config, output_dir),
         plot_motor_commands(samples, config, output_dir),
     ]
