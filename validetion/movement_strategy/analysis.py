@@ -1,31 +1,56 @@
-"""Movement-strategy validation: what does direction quantisation cost?
+"""Movement-strategy validation: planar model vs 3-D mechanism.
 
 SCOPE - this study is standalone and concerns the control strategy only.
 
-    One kinematic model is held fixed; the only thing that varies is how
-    coarsely a `MovementStrategy` quantises the commanded direction. Every
-    quantity is reported in controller units (dimensionless command counts).
-    Actuator calibration - servo ticks, spool radius, dead zone, latency - is
-    deliberately OUT of scope and lives in `validetion/Servomotor` and
-    `validetion/Servo+thimble`. Do not mix those numbers into this study.
+    Every quantity is reported in controller units (dimensionless command
+    counts). Actuator calibration - servo ticks, spool radius, dead zone,
+    latency - is deliberately OUT of scope and lives in `validetion/Servomotor`
+    and `validetion/Servo+thimble`. Do not mix those numbers into this study.
+
+THE FOUR STRATEGIES
+
+    Each runs exactly as the device defines it, with its own solver:
+
+        cardinal            4 directions    planar model
+        cardinal_diagonal   8 directions    planar model
+        free_form           any direction   planar model
+        ik                  any direction   3-D mechanism model
+
+THE TWO KINEMATIC MODELS
+
+    Both act on the SAME anchor triangle, which is isosceles, not equilateral:
+    base 24.2, equal sides 28.6, apex height 25.9 (model units, mm).
+
+    planar - each cable is a straight line from its anchor to the tactor,
+        in 2-D. Cable delta is simply the change in that distance, so cable
+        travel is assumed equal to tactor travel.
+
+    3-D mechanism - solves the full leg mechanism: link lengths d1=4.0,
+        d2=11.0, d3=9.5, legs rotated +/-120 degrees, tactor rest height
+        z=6.0, Bowden cable attached at the midpoint of the first link. The
+        cable displaces considerably less than the tactor moves, which is why
+        its commands are roughly 3.8x smaller for the same commanded path.
 
 WHY A FORWARD MODEL IS NEEDED
 
     The controller's only output is three cable deltas. To ask whether the
     commanded motion is reproduced, those deltas must be decoded back into a
-    tactor position - that is the forward model. Because the same mechanism
-    model both encodes and decodes, this measures strategy-induced path error,
-    NOT physical mechanism accuracy. FK inverting the controller's IK path is
-    itself verified in `tests/test_wire_forward_kinematics.py`.
+    tactor position - that is the forward model. Each model is decoded by its
+    own inverse: least-squares trilateration for the planar model, wire FK for
+    the 3-D mechanism. So this measures internal consistency and command cost,
+    NOT measured mechanism accuracy - deciding which model better describes the
+    real device needs a measured tactor position, which is the Servo+thimble
+    study. That the wire FK genuinely inverts the controller's IK path is
+    verified in `tests/test_wire_forward_kinematics.py`.
 
 ERROR DECOMPOSITION
 
-    ideal target ---(strategy quantisation)---> quantised target
-                 ---(model + integer truncation)---> reconstructed point
+    ideal target ---(strategy direction resolution)---> quantised target
+                 ---(model + integer truncation)-----> reconstructed point
 
     reported as `quantisation`, `execution` and `total` error respectively.
-    Splitting them is what makes the comparison interpretable: quantisation is
-    the strategy's intrinsic cost, execution is the shared noise floor.
+    Direction resolution dominates path error; the model choice dominates
+    command amplitude.
 """
 
 from __future__ import annotations
