@@ -168,6 +168,109 @@ def plot_strategy_comparison(
     return _save(fig, "strategy_comparison.png", output_dir)
 
 
+#: Publication styling for the paper-facing CD-vs-IK figure. These sizes are
+#: tuned for a two-column figure at ICRA scale; do not shrink them casually.
+PAPER_TITLE_FS = 48
+PAPER_LABEL_FS = 45
+PAPER_TICK_FS = 45
+PAPER_LEGEND_FS = 45
+PAPER_LINE_W = 2.8
+PAPER_GRID_ALPHA = 0.28
+PAPER_FIGSIZE = (42, 14)
+
+IK_MOTOR_COLORS = {0: "#ff6b35", 1: "#d7191c", 2: "#67000d"}
+CD_MOTOR_COLORS = {0: "#f6c85f", 1: "#ff9f1c", 2: "#cc5500"}
+
+
+def _style_paper_panel(axis) -> None:
+    axis.tick_params(axis="both", labelsize=PAPER_TICK_FS)
+    axis.title.set_fontsize(PAPER_TITLE_FS)
+    axis.xaxis.label.set_size(PAPER_LABEL_FS)
+    axis.yaxis.label.set_size(PAPER_LABEL_FS)
+    axis.grid(True, alpha=PAPER_GRID_ALPHA)
+
+
+def plot_cd_vs_ik_paper_figure(
+    samples: pd.DataFrame,
+    config: StudyConfig,
+    output_dir: Path | None = None,
+) -> Path:
+    """Paper-facing cardinal-diagonal vs IK comparison (two equal-height panels).
+
+    Left: the circular reconstruction, commanded path overlaid with CD and IK.
+    Right: all six motor-command traces, IK solid and CD dashed.
+
+    Note on the right panel: CD runs the planar model and IK the 3-D mechanism,
+    so the two express cable deltas differently and share a y axis only for
+    layout. Their amplitudes are not directly comparable - see the model note
+    in `analysis.py`.
+    """
+    cd = samples.loc[samples["run"].eq("cardinal_diagonal")].reset_index(drop=True)
+    ik = samples.loc[samples["run"].eq("ik")].reset_index(drop=True)
+    on_circle = cd["segment"].eq(CIRCLE_SEGMENT)
+
+    fig, (ax_circle, ax_motor) = plt.subplots(
+        1,
+        2,
+        figsize=PAPER_FIGSIZE,
+        gridspec_kw={"width_ratios": [0.90, 1.20], "wspace": 0.18},
+        constrained_layout=False,
+    )
+
+    commanded_handle, = ax_circle.plot(
+        ik.loc[on_circle, "ideal_x"], ik.loc[on_circle, "ideal_y"],
+        "--", color="0.45", lw=PAPER_LINE_W, label="Commanded", zorder=1,
+    )
+    ik_handle, = ax_circle.plot(
+        ik.loc[on_circle, "reconstructed_x"], ik.loc[on_circle, "reconstructed_y"],
+        "-", color="firebrick", lw=PAPER_LINE_W + 0.6, alpha=0.82, label="IK", zorder=2,
+    )
+    cd_handle, = ax_circle.plot(
+        cd.loc[on_circle, "reconstructed_x"], cd.loc[on_circle, "reconstructed_y"],
+        "-", color="darkorange", lw=PAPER_LINE_W + 0.2, label="CD", zorder=3,
+    )
+    ax_circle.set_title("Circular reconstruction")
+    ax_circle.set_xlabel("X")
+    ax_circle.set_ylabel("Y")
+    ax_circle.set_yticks(np.arange(-150, 151, 50))
+    ax_circle.set_aspect("equal", "box")
+    ax_circle.set_anchor("E")
+    _style_paper_panel(ax_circle)
+    ax_circle.legend(
+        [commanded_handle, ik_handle, cd_handle],
+        [handle.get_label() for handle in (commanded_handle, ik_handle, cd_handle)],
+        loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3,
+        fontsize=PAPER_LEGEND_FS, frameon=False, handlelength=1.25, columnspacing=0.55,
+    )
+
+    ax_motor.axhline(0.0, color="0.25", lw=1.6, alpha=0.6)
+    for motor_index in range(3):
+        ax_motor.plot(
+            ik["step"], ik[f"motor_{motor_index}"], "-",
+            color=IK_MOTOR_COLORS[motor_index], lw=PAPER_LINE_W + 0.2, alpha=0.82,
+            label=f"IK M{motor_index}", zorder=2,
+        )
+    for motor_index in range(3):
+        ax_motor.plot(
+            cd["step"], cd[f"motor_{motor_index}"], "--",
+            color=CD_MOTOR_COLORS[motor_index], lw=PAPER_LINE_W + 0.2,
+            label=f"CD M{motor_index}", zorder=3,
+        )
+    ax_motor.set_title("Motor commands")
+    ax_motor.set_xlabel("Step")
+    ax_motor.set_ylabel("Command", labelpad=4)
+    ax_motor.set_yticks(np.arange(-150, 151, 50))
+    _style_paper_panel(ax_motor)
+    ax_motor.legend(
+        loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=6,
+        fontsize=PAPER_LEGEND_FS, frameon=False, handlelength=1.25, columnspacing=0.55,
+    )
+
+    fig.align_labels()
+    fig.subplots_adjust(left=0.055, right=0.99, bottom=0.25, top=0.86, wspace=0.18)
+    return _save(fig, "cardinal_diagonal_vs_ik_circle_and_motor_commands.png", output_dir)
+
+
 def plot_motor_commands(
     samples: pd.DataFrame,
     config: StudyConfig,
@@ -214,6 +317,7 @@ def save_all(
 ) -> list[Path]:
     return [
         plot_reconstructed_paths(samples, config, output_dir),
+        plot_cd_vs_ik_paper_figure(samples, config, output_dir),
         plot_strategy_comparison(metrics, config, output_dir),
         plot_motor_commands(samples, config, output_dir),
     ]

@@ -76,6 +76,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from consts import EDGE_THRESHOLD, TOP_HEIGHT, TOP_WIDTH  # noqa: E402
+from haptic_mapping import map_object_displacement_to_tactor  # noqa: E402
 from kinematics import unified_ik_starter as ik_module  # noqa: E402
 from kinematics import wire_forward_kinematics as wire_fk  # noqa: E402
 from motor_controller import (  # noqa: E402
@@ -116,6 +117,13 @@ class StudyConfig:
     diagonal_threshold: float = 0.5
     stiffness_value: float = 1.0
     hand_orientation: HandOrientation = HandOrientation.NOT_MIRRORED
+
+    #: Mirrors `backend.MOTOR_OPPOSES_OBJECT_MOTION`. The backend maps object
+    #: displacement to a tactor target with `map_object_displacement_to_tactor`
+    #: BEFORE calling the controller, and the controller then applies its own
+    #: actuator polarity flip. This study reproduces that call pattern exactly
+    #: so it represents the device rather than an idealised version of it.
+    oppose_object_motion: bool = True
 
     #: Leave as None so every strategy uses the solver it is actually defined
     #: with (planar for cardinal / cardinal-diagonal / free-form, the 3-D
@@ -244,15 +252,19 @@ def simulate_run(
     rows: list[dict[str, float | str | bool]] = []
 
     for record in path.itertuples(index=False):
+        # Same two-step mapping the backend performs (backend.py:1123-1137).
+        tactor_x, tactor_y = map_object_displacement_to_tactor(
+            obj_x=record.x, obj_y=record.y, oppose_motion=config.oppose_object_motion
+        )
         ideal, quantised = controller.resolve_target_point(
-            obj_x=record.x, obj_y=record.y, stiffness_value=config.stiffness_value
+            obj_x=tactor_x, obj_y=tactor_y, stiffness_value=config.stiffness_value
         )
 
         for movement in controller.calculate_motor_movements(
             motor_set_id=MotorSetId.MOTORS_0_2,
             stiffness_value=config.stiffness_value,
-            obj_x=record.x,
-            obj_y=record.y,
+            obj_x=tactor_x,
+            obj_y=tactor_y,
             motors_enabled=True,
             reset_to_origin=False,
         ):
