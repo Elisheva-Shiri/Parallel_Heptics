@@ -169,8 +169,8 @@ def _tex_num(value: float, fmt: str) -> str:
 def merged_table_latex(m: pd.DataFrame, n_per_direction: int = 18, label: str = "tab:motor_validation") -> str:
     """The merged table as a single-column IEEEtran float (needs booktabs + array).
 
-    The caption is deliberately one line; the column definitions belong in the
-    body text (see README, section 5).
+    The caption stays short but names what the +/- values are, so the table is
+    self-contained; the remaining column definitions belong in the body text.
 
     Single-column on purpose: in two-column mode a ``table*`` can only sit at the
     top of a page and never on the page it is written on, so it always drifts to
@@ -181,7 +181,8 @@ def merged_table_latex(m: pd.DataFrame, n_per_direction: int = 18, label: str = 
         r"\centering",
         r"\fontsize{7.5}{9}\selectfont",
         r"\caption{Motor validation: measured spool rotation per command amplitude, "
-        r"pooled over three runs ($n = " + str(n_per_direction) + r"$ per direction).}"
+        r"pooled over three runs ($n = " + str(n_per_direction) + r"$ per direction). "
+        r"Values are mean\,$\pm$\,SD; hysteresis is mean\,$\pm$\,SE.}"
         + r"\label{" + label + "}",
         r"\setlength{\tabcolsep}{2.5pt}",
         r"\renewcommand{\arraystretch}{1.05}",
