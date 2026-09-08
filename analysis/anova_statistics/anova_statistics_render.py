@@ -376,22 +376,52 @@ def dataframe_to_image(df: pd.DataFrame, out_path: str,
     return out_path
 
 
+def _finite(v) -> bool:
+    return isinstance(v, (int, float, np.floating)) and np.isfinite(v)
+
+
+def _gg_epsilon(aov: pd.DataFrame) -> float:
+    """Greenhouse-Geisser epsilon reported by pingouin on the within row.
+
+    The same epsilon corrects every effect that involves the within factor
+    (Finger main effect and the System x Finger interaction).
+    """
+    if "eps" not in aov.columns:
+        return np.nan
+    eps = aov["eps"].dropna()
+    return float(eps.iloc[0]) if len(eps) else np.nan
+
+
 def mixed_summary_frame(results: dict, key: str, *, ctx: RenderContext) -> pd.DataFrame:
-    """Tidy Bias+JND mixed-ANOVA summary for image rendering."""
+    """Tidy Bias+JND mixed-ANOVA summary for image rendering.
+
+    Effects involving the within factor (Finger, Interaction) also report the
+    Greenhouse-Geisser epsilon and the epsilon-corrected degrees of freedom,
+    so the table is self-contained about the sphericity correction.
+    """
     rows = []
     sig = []
     for dv in ("Bias", "JND"):
         aov = results[key][dv]["aov"]
+        eps = _gg_epsilon(aov)
         for _, r in aov.iterrows():
             p = ctx.get_p(r)
+            df1 = r.get("DF1", r.get("ddof1", np.nan))
+            df2 = r.get("DF2", r.get("ddof2", np.nan))
+            within = str(r.get("Source", "")) != "System"
+            has_eps = within and _finite(eps)
+            p_gg = r.get("p_GG_corr", np.nan)
             rows.append({
                 "DV": dv,
                 "Effect": r.get("Source", ""),
                 "F": f"{float(r.get('F', np.nan)):.3f}",
-                "df1": r.get("DF1", r.get("ddof1", "")),
-                "df2": r.get("DF2", r.get("ddof2", "")),
+                "df1": df1,
+                "df2": df2,
+                "eps (GG)": f"{eps:.3f}" if has_eps else "-",
+                "df1 (GG)": f"{float(df1) * eps:.2f}" if has_eps else "-",
+                "df2 (GG)": f"{float(df2) * eps:.2f}" if has_eps else "-",
                 "p": ctx.fmt_p(p),
-                "p_GG": ctx.fmt_p(r.get("p_GG_corr", np.nan)),
+                "p_GG": ctx.fmt_p(p_gg) if _finite(p_gg) else "-",
                 "np2": f"{float(r.get('np2', np.nan)):.3f}",
                 "N": results[key][dv].get("n_subjects", ""),
             })
@@ -402,6 +432,12 @@ def mixed_summary_frame(results: dict, key: str, *, ctx: RenderContext) -> pd.Da
 
 
 def descriptives_frame(df: pd.DataFrame, *, ctx: RenderContext) -> pd.DataFrame:
+    """Condition descriptives per Finger x System: mean +/- SD and median [IQR].
+
+    The median [Q1, Q3] column is reported next to the mean because a few
+    off-scale psychometric fits inflate the SD of some cells; the median shows
+    the typical participant.
+    """
     rows = []
     for f in ctx.finger_levels:
         row = {"Finger": f"{f} ({ctx.finger_fullnames[f]})"}
@@ -409,9 +445,14 @@ def descriptives_frame(df: pd.DataFrame, *, ctx: RenderContext) -> pd.DataFrame:
             sub = df[df["Finger"] == f]
             for s in ctx.system_levels:
                 v = sub.loc[sub["System"] == s, dv].dropna()
-                row[f"{dv}_{s}_mean"] = f"{v.mean():.2f}" if len(v) else "-"
-                row[f"{dv}_{s}_sd"] = f"{v.std(ddof=1):.2f}" if len(v) > 1 else "-"
-                row[f"{dv}_{s}_n"] = int(len(v))
+                if len(v) > 1:
+                    q1, med, q3 = np.percentile(v, [25, 50, 75])
+                    row[f"{dv} {s} mean +/- SD"] = f"{v.mean():.2f} +/- {v.std(ddof=1):.2f}"
+                    row[f"{dv} {s} median [IQR]"] = f"{med:.2f} [{q1:.2f}, {q3:.2f}]"
+                else:
+                    row[f"{dv} {s} mean +/- SD"] = "-"
+                    row[f"{dv} {s} median [IQR]"] = "-"
+                row[f"n {s}"] = int(len(v))
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -456,20 +497,33 @@ def assumption_checks_frame(df: pd.DataFrame, results: dict, *, ctx: RenderConte
             lev_p = float(stats.levene(l_values, n_values, center="median").pvalue)
         except Exception:
             lev_p = np.nan
-        sph = results["mixed"][dv].get("sphericity_note", "")
+        mixed_dv = results["mixed"][dv]
+        sph = mixed_dv.get("sphericity_note", "")
+        sph_obj = mixed_dv.get("sphericity")
+        eps = _gg_epsilon(mixed_dv["aov"])
         normal_ok = np.isfinite(sh_p) and sh_p >= 0.05
         var_ok = np.isfinite(lev_p) and lev_p >= 0.05
+        sph_met = ("sphericity=met" in sph) or ("='met'" in sph)
+        sph_violated = "VIOLATED" in sph
+        if sph_obj is not None and hasattr(sph_obj, "W"):
+            mauchly_w = f"{float(sph_obj.W):.4f}"
+            mauchly_chi2 = f"{float(sph_obj.chi2):.2f} ({int(sph_obj.dof)})"
+            mauchly_p = ctx.fmt_p(float(sph_obj.pval))
+        else:
+            mauchly_w = mauchly_chi2 = mauchly_p = "-"
         rows.append({
             "DV": dv,
             "Normality (Shapiro p)": ctx.fmt_p(sh_p),
             "Normality OK?": "yes" if normal_ok else "NO",
             "Equal var (Levene p)": ctx.fmt_p(lev_p),
             "Equal var OK?": "yes" if var_ok else "NO",
-            "Sphericity (Mauchly)": "met" if "sphericity=met" in sph
-                                    or "='met'" in sph else
-                                    ("VIOLATED" if "VIOLATED" in sph else "-"),
+            "Mauchly W": mauchly_w,
+            "chi2 (dof)": mauchly_chi2,
+            "Mauchly p": mauchly_p,
+            "eps (GG)": f"{eps:.3f}" if _finite(eps) else "-",
+            "Sphericity": "met" if sph_met else ("VIOLATED" if sph_violated else "-"),
         })
-        sig.append(not (normal_ok and var_ok))
+        sig.append(not (normal_ok and var_ok) or sph_violated)
     out = pd.DataFrame(rows)
     out.attrs["sig_mask"] = np.array(sig)
     return out
@@ -496,7 +550,7 @@ def render_summary_tables(df: pd.DataFrame, results: dict, out_dir: str, *,
     desc_tbl = descriptives_frame(df, ctx=ctx)
     paths["descriptives"] = dataframe_to_image(
         desc_tbl, os.path.join(out_dir, "descriptives.png"),
-        title="Descriptives: Bias and JND by System x Finger (mean +/- SD)",
+        title="Descriptives: Bias and JND by System x Finger (mean +/- SD, median [IQR])",
         col_scale=1.15)
 
     ct_tbl = contrasts_summary_frame(results, ctx=ctx)

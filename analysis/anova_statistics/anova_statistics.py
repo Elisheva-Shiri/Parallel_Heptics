@@ -1080,6 +1080,9 @@ def build_report(validation: ValidationReport,
         # Mixed ANOVA (main).
         ma = results["mixed"][dv]
         aov = ma["aov"]
+        eps_gg = np.nan
+        if "eps" in aov.columns and aov["eps"].notna().any():
+            eps_gg = float(aov["eps"].dropna().iloc[0])
         lines.append("MAIN mixed-design ANOVA "
                      f"(method: {ma['method']}; "
                      f"N subjects = {ma['n_subjects']}):")
@@ -1095,9 +1098,17 @@ def build_report(validation: ValidationReport,
             if isinstance(p_gg, (int, float)) and not (
                     isinstance(p_gg, float) and np.isnan(p_gg)):
                 gg_txt = f", p_GG = {_fmt_p(p_gg)}"
+            # Greenhouse-Geisser epsilon corrects every effect involving the
+            # within factor (Finger and the interaction), so report the
+            # epsilon-corrected df next to the uncorrected ones.
+            eps_txt = ""
+            if src != "System" and isinstance(eps_gg, float) and np.isfinite(eps_gg):
+                eps_txt = (f", eps_GG = {eps_gg:.3f}, "
+                           f"df_GG = ({float(ddof1) * eps_gg:.2f}, "
+                           f"{float(ddof2) * eps_gg:.2f})")
             lines.append(
                 f"   {src:<18} F({ddof1},{ddof2}) = "
-                f"{f:.3f}, p = {_fmt_p(p)}{gg_txt}, np2 = {np2:.3f}"
+                f"{f:.3f}, p = {_fmt_p(p)}{gg_txt}{eps_txt}, np2 = {np2:.3f}"
             )
         lines.append(f"   Sphericity (Finger): {ma['sphericity_note']}")
         if ma["dropped_subjects"]:

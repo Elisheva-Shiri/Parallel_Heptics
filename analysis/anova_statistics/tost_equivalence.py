@@ -22,7 +22,17 @@ WHAT IT TESTS
   (A) One-sample TOST per finger: is that finger's mean PSE bias within +/-5 of 0?
   (B) Paired TOST for every finger pair: is the per-subject PSE-bias difference
       within +/-5?
-Both are run twice:
+  (C) Welch two-sample TOST for Setup (L = air-slide vs N = natural), Lakens
+      2017 eq. 3-4: is the L - N difference in bias and in JND within the
+      equivalence bounds? Run on the per-subject mean over fingers (one value
+      per participant, so the test unit matches the ANOVA) and within each
+      finger. Reported at two pre-specified bounds: the primary +/-5 mm/m band
+      and a secondary +/-10 mm/m band (a difference smaller than the 12 mm/m
+      spacing between adjacent comparison stimuli). A Bayes factor (BF10,
+      JZS default prior via pingouin, when installed) is given next to each
+      TOST so frequentist and Bayesian evidence for the null sit side by side,
+      as Lakens recommends.
+All are run twice:
   - "all"   : every subject x finger fit, including degenerate ones.
   - "clean" : dropping fits flagged excluded_from_group_analysis, and PSE biases
               outside the tested comparison range (|bias| > 60 mm/m), which are
@@ -34,10 +44,12 @@ INPUT  : analysis/anova_statistics/results/oneway/subjects/csv/*__pse_jnd_by_fin
 OUTPUT : analysis/anova_statistics/results/equivalence/
            tost_bias_one_sample.csv
            tost_bias_pairwise.csv
+           tost_setup_L_vs_N.csv
            per_finger_bias_descriptives.csv
          and a printed summary.
 
-Dependencies: numpy, pandas, scipy (same stack as anova_statistics.py).
+Dependencies: numpy, pandas, scipy (same stack as anova_statistics.py);
+pingouin is optional and only adds the BF10 column.
 Run:  uv run python analysis/anova_statistics/tost_equivalence.py
 """
 
@@ -59,10 +71,17 @@ SUBJECT_CSV_GLOB = os.path.join(
 OUT_DIR = os.path.join(HERE, "results", "equivalence")
 
 SESOI = 5.0          # smallest effect size of interest, mm/m (the +/-5 band)
+SESOI_SETUP = (5.0, 10.0)  # Setup L-vs-N bounds: primary +/-5, secondary +/-10 mm/m
 ALPHA = 0.05         # equivalence declared if max(p_lower, p_upper) < ALPHA
 BIAS_VALID_ABS = 60.0  # |bias| beyond the tested +/-60 mm/m range = off-scale fit
 FINGERS = ["I", "M", "R", "P"]
 FINGER_NAME = {"I": "Index", "M": "Middle", "R": "Ring", "P": "Pinky"}
+SYSTEMS = ("L", "N")   # L = air-slide (device), N = natural
+
+try:  # optional: Bayes factor for the Setup comparison
+    import pingouin as _pg
+except Exception:  # pragma: no cover - pingouin is not in every environment
+    _pg = None
 
 
 def load_long() -> pd.DataFrame:
@@ -110,6 +129,69 @@ def tost_one_sample(x: np.ndarray, sesoi: float):
                 p_lower=p_lower, p_upper=p_upper, p_tost=p_tost,
                 ci90_lo=ci_lo, ci90_hi=ci_hi,
                 equivalent=bool(p_tost < ALPHA))
+
+
+def tost_welch_two_sample(a: np.ndarray, b: np.ndarray, sesoi: float):
+    """Two-sample TOST of mean(a) - mean(b) against (-sesoi, +sesoi).
+
+    Welch's unequal-variance form (Lakens 2017, eq. 3) with Satterthwaite
+    degrees of freedom (eq. 4). Lakens recommends this form by default because
+    the two groups need not share a variance.
+    """
+    a = np.asarray(a, float); a = a[np.isfinite(a)]
+    b = np.asarray(b, float); b = b[np.isfinite(b)]
+    n1, n2 = a.size, b.size
+    diff = float(np.mean(a) - np.mean(b))
+    v1, v2 = a.var(ddof=1) / n1, b.var(ddof=1) / n2
+    se = float(np.sqrt(v1 + v2))
+    df = (v1 + v2) ** 2 / (v1 ** 2 / (n1 - 1) + v2 ** 2 / (n2 - 1))
+    t_lower = (diff + sesoi) / se            # H0_lower: diff <= -sesoi
+    t_upper = (diff - sesoi) / se            # H0_upper: diff >= +sesoi
+    p_lower = stats.t.sf(t_lower, df)
+    p_upper = stats.t.cdf(t_upper, df)
+    p_tost = max(p_lower, p_upper)
+    tcrit = stats.t.ppf(1 - ALPHA, df)
+    ci_lo, ci_hi = diff - tcrit * se, diff + tcrit * se
+    # Companion NHST (Welch t-test) so the four Lakens outcomes can be named.
+    t_nhst = diff / se
+    p_nhst = 2 * stats.t.sf(abs(t_nhst), df)
+    return dict(n_L=n1, n_N=n2, mean_L=float(np.mean(a)), mean_N=float(np.mean(b)),
+                sd_L=float(a.std(ddof=1)), sd_N=float(b.std(ddof=1)),
+                diff=diff, se=se, df_welch=float(df),
+                t_lower=float(t_lower), t_upper=float(t_upper),
+                p_lower=float(p_lower), p_upper=float(p_upper), p_tost=float(p_tost),
+                ci90_lo=float(ci_lo), ci90_hi=float(ci_hi),
+                t_nhst=float(t_nhst), p_nhst=float(p_nhst),
+                equivalent=bool(p_tost < ALPHA),
+                different=bool(p_nhst < ALPHA))
+
+
+def bayes_factor_10(a: np.ndarray, b: np.ndarray) -> float:
+    """BF10 for an independent-samples Welch t-test (JZS default prior).
+
+    Values below 1 favour the null; 1/3 to 1 is anecdotal, 1/10 to 1/3
+    moderate evidence for no difference. NaN when pingouin is unavailable.
+    """
+    if _pg is None:
+        return float("nan")
+    a = np.asarray(a, float); a = a[np.isfinite(a)]
+    b = np.asarray(b, float); b = b[np.isfinite(b)]
+    try:
+        res = _pg.ttest(a, b, paired=False, correction=True)
+        return float(res["BF10"].iloc[0])
+    except Exception:  # pragma: no cover - defensive
+        return float("nan")
+
+
+def lakens_outcome(row) -> str:
+    """Name the outcome using Lakens (2017) Figure 1 scenarios."""
+    if row["equivalent"] and not row["different"]:
+        return "A: equivalent, not different"
+    if not row["equivalent"] and row["different"]:
+        return "B: not equivalent, different"
+    if row["equivalent"] and row["different"]:
+        return "C: equivalent AND different (trivially small effect)"
+    return "D: undetermined (neither)"
 
 
 def run():
@@ -163,6 +245,36 @@ def run():
     pair = pd.DataFrame(pair_rows)
     pair.to_csv(os.path.join(OUT_DIR, "tost_bias_pairwise.csv"), index=False)
 
+    # --- (C) Welch two-sample TOST: Setup L vs N ---------------------------
+    setup_rows = []
+    for label, d in datasets.items():
+        for dv in ("Bias", "JND"):
+            # Unit = participant: mean over the four fingers. Only participants
+            # with all four fingers are kept, matching the complete-case rule
+            # of the mixed-design ANOVA (so N matches the ANOVA table).
+            wide = d.pivot_table(index=["Subject", "System"], columns="Finger",
+                                 values=dv)
+            complete = wide.dropna(subset=[f for f in FINGERS if f in wide])
+            subj_mean = complete.mean(axis=1).reset_index(name=dv)
+            groups = {"subject_mean": subj_mean}
+            for f in FINGERS:
+                groups[f] = d.loc[d["Finger"] == f, ["System", dv]]
+            for unit, g in groups.items():
+                a = g.loc[g["System"] == SYSTEMS[0], dv].to_numpy(float)
+                b = g.loc[g["System"] == SYSTEMS[1], dv].to_numpy(float)
+                if np.isfinite(a).sum() < 2 or np.isfinite(b).sum() < 2:
+                    continue
+                bf10 = bayes_factor_10(a, b)
+                for sesoi in SESOI_SETUP:
+                    res = tost_welch_two_sample(a, b, sesoi)
+                    res["outcome"] = lakens_outcome(res)
+                    setup_rows.append(dict(
+                        dataset=label, DV=dv, unit=unit,
+                        name=FINGER_NAME.get(unit, "mean over fingers"),
+                        sesoi=sesoi, BF10=bf10, **res))
+    setup = pd.DataFrame(setup_rows)
+    setup.to_csv(os.path.join(OUT_DIR, "tost_setup_L_vs_N.csv"), index=False)
+
     # --- summary ----------------------------------------------------------
     def show(title, frame, key):
         print(f"\n=== {title} ===")
@@ -180,10 +292,20 @@ def run():
          one, "name")
     show("(B) Paired TOST: finger-pair bias difference within +/-5 mm/m",
          pair, "pair")
+    print("\n=== (C) Welch TOST: Setup L - N (Lakens 2017 eq. 3-4), "
+          "with BF10 (JZS; <1 favours no difference) ===")
+    with pd.option_context("display.width", 200, "display.max_columns", 30,
+                           "display.float_format", lambda v: f"{v:8.3f}"):
+        cols = ["dataset", "DV", "unit", "sesoi", "n_L", "n_N", "diff",
+                "ci90_lo", "ci90_hi", "p_tost", "equivalent", "p_nhst",
+                "BF10", "outcome"]
+        print(setup[cols].to_string(index=False))
     print("\nDescriptives:")
     print(desc.to_string(index=False,
                          float_format=lambda v: f"{v:8.3f}"))
     print(f"\nWrote CSVs to {OUT_DIR}")
+    return {"one_sample": one, "pairwise": pair, "setup": setup,
+            "descriptives": desc}
 
 
 if __name__ == "__main__":
