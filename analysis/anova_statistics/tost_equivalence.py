@@ -40,7 +40,9 @@ All are run twice:
               Statistical-analysis OPEN note). This mirrors the ANOVA sensitivity
               analysis and is the intended primary reading.
 
-INPUT  : analysis/anova_statistics/results/oneway/subjects/csv/*__pse_jnd_by_finger.csv
+INPUT  : the same filtered psychophysics summary the ANOVA reads
+         (analysis/psychophysics/results/L_N_E/_working/pse_jnd_by_subject_finger.csv,
+         via anova_statistics.load_data), so the cohort is identical to the ANOVA
 OUTPUT : analysis/anova_statistics/results/equivalence/
            tost_bias_one_sample.csv
            tost_bias_pairwise.csv
@@ -55,7 +57,6 @@ Run:  uv run python analysis/anova_statistics/tost_equivalence.py
 
 from __future__ import annotations
 
-import glob
 import os
 from itertools import combinations
 
@@ -65,10 +66,8 @@ from scipy import stats
 
 # --- configuration ---------------------------------------------------------
 HERE = os.path.dirname(os.path.abspath(__file__))
-SUBJECT_CSV_GLOB = os.path.join(
-    HERE, "results", "oneway", "subjects", "csv", "*__pse_jnd_by_finger.csv"
-)
 OUT_DIR = os.path.join(HERE, "results", "equivalence")
+ANOVA_DATA_SOURCE = "L_N_E"   # same psychophysics source as the ANOVA notebook
 
 SESOI = 5.0          # smallest effect size of interest, mm/m (the +/-5 band)
 SESOI_SETUP = (5.0, 10.0)  # Setup L-vs-N bounds: primary +/-5, secondary +/-10 mm/m
@@ -84,13 +83,18 @@ except Exception:  # pragma: no cover - pingouin is not in every environment
     _pg = None
 
 
-def load_long() -> pd.DataFrame:
-    """Concatenate the per-subject PSE/JND files into one long table."""
-    files = sorted(glob.glob(SUBJECT_CSV_GLOB))
-    if not files:
-        raise FileNotFoundError(f"No subject CSVs matched {SUBJECT_CSV_GLOB}")
-    frames = [pd.read_csv(f) for f in files]
-    df = pd.concat(frames, ignore_index=True)
+def load_long(source: str = ANOVA_DATA_SOURCE) -> pd.DataFrame:
+    """Load the SAME per-subject x finger summary the mixed-design ANOVA uses.
+
+    The psychophysics pipeline has already applied the participant exclusions
+    reported in the paper (incomplete sessions; fewer than two fingers with
+    >= 55% success), so "all" here is exactly the ANOVA's main cohort.
+    """
+    import anova_statistics as A
+    df = A.load_data(source)
+    cols = ["Subject", "System", "Finger", "Bias", "JND",
+            "fit_warning", "excluded_from_group_analysis"]
+    df = df[[c for c in cols if c in df.columns]].copy()
     # one fit per (Subject, Finger); keep the first if duplicated
     df = df.drop_duplicates(subset=["Subject", "Finger"], keep="first")
     df["Bias"] = pd.to_numeric(df["Bias"], errors="coerce")
