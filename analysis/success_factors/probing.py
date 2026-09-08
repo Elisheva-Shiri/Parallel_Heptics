@@ -66,6 +66,26 @@ except ModuleNotFoundError:  # pragma: no cover - p-values become unavailable wi
 DEFAULT_CENTER_RADIUS_PX = 25.0
 DEFAULT_SIDE_RADIUS_PX = 80.0
 DEFAULT_MIN_PROBE_DURATION_S = 0.05
+SETUP_DISPLAY_COLORS = {
+    "N": "#7B3294",  # N / natural / no airsled = purple
+    "N_E": "#7B3294",
+    "N_P": "#7B3294",
+    "no_airsled": "#7B3294",
+    "L": "#E78AC3",  # L / airsled = pink
+    "L_E": "#E78AC3",
+    "L_P": "#E78AC3",
+    "airsled": "#E78AC3",
+}
+SETUP_DISPLAY_LABELS = {
+    "N_E": "N",
+    "N_P": "N",
+    "no_airsled": "N",
+    "N": "N",
+    "L_E": "L",
+    "L_P": "L",
+    "airsled": "L",
+    "L": "L",
+}
 DIRECTION_LABELS_8 = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"]
 
 
@@ -732,6 +752,10 @@ def summarize_probing(probing_trial_summary: pd.DataFrame, probing_event_log: pd
             "probing_subject_finger_stiffness_probe_metrics_summary": pd.DataFrame(),
             "probing_group_finger_stiffness_probe_metrics_summary": pd.DataFrame(),
             "probing_analysis_scope_finger_stiffness_probe_metrics_summary": pd.DataFrame(),
+            "probing_direction_chosen_success_normalized_summary": pd.DataFrame(),
+            "probing_direction_per_setup_long_summary": pd.DataFrame(),
+            "probing_direction_per_setup_counts_success_differences": pd.DataFrame(),
+            "probing_per_setup_metric_summary_and_differences": pd.DataFrame(),
         }
     pts = add_experiment_group_columns(probing_trial_summary.copy())
     for col in [
@@ -851,6 +875,7 @@ def summarize_probing(probing_trial_summary: pd.DataFrame, probing_event_log: pd
     group_comparisons = compute_experiment_group_comparisons(pts)
     anova_tables = compute_success_one_way_anova_tables(pts)
     requested_probe_summaries = _compute_probe_metric_summary_tables(pts, probing_event_log)
+    reference_direction_tables = compute_reference_direction_tables(pts)
 
     return {
         "probing_subject_finger_stiffness_summary": _add_log_backtransform_columns(subject_finger_stiffness),
@@ -864,6 +889,7 @@ def summarize_probing(probing_trial_summary: pd.DataFrame, probing_event_log: pd
         **requested_probe_summaries,
         **group_comparisons,
         **anova_tables,
+        **reference_direction_tables,
     }
 
 
@@ -1202,6 +1228,1071 @@ def compute_experiment_group_comparisons(probing_trial_summary: pd.DataFrame) ->
     return {**exact_tables, **scope_tables, **setup_tables}
 
 
+def _setup_label(value: Any) -> str:
+    return SETUP_DISPLAY_LABELS.get(str(value), str(value))
+
+
+def _prepare_reference_trial_summary(probing_trial_summary: pd.DataFrame) -> pd.DataFrame:
+    """Return trial rows with compact N/L setup labels for reference figures."""
+    if probing_trial_summary.empty:
+        return pd.DataFrame()
+    pts = add_experiment_group_columns(probing_trial_summary.copy())
+    pts["setup_factor"] = pts[EXPERIMENT_GROUP_COLUMN].map(_setup_label)
+    pts = pts[pts["setup_factor"].isin(["N", "L"])].copy()
+    pts["correct_response"] = pd.to_numeric(pts.get("correct_response"), errors="coerce")
+    pts["probe_count"] = pd.to_numeric(pts.get("probe_count"), errors="coerce")
+    pts["probe_rate_per_s"] = pd.to_numeric(pts.get("probe_rate_per_s"), errors="coerce")
+    pts["center_dwell_fraction"] = pd.to_numeric(pts.get("center_dwell_fraction"), errors="coerce")
+    pts["side_dwell_fraction"] = pd.to_numeric(pts.get("side_dwell_fraction"), errors="coerce")
+    pts["dominant_probe_direction"] = pts.get("dominant_probe_direction", pd.Series(index=pts.index)).fillna("unknown").astype(str)
+    return pts
+
+
+def _probe_count_bin(value: Any) -> str:
+    count = _numeric_or_nan(value)
+    if not np.isfinite(count):
+        return "missing"
+    if count <= 0:
+        return "0"
+    if count == 1:
+        return "1"
+    if count == 2:
+        return "2"
+    if count == 3:
+        return "3"
+    return "4+"
+
+
+def compute_reference_direction_tables(probing_trial_summary: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Compute the thesis-reference setup/direction tables used by extra PNGs."""
+    pts = _prepare_reference_trial_summary(probing_trial_summary)
+    empty = {
+        "probing_direction_chosen_success_normalized_summary": pd.DataFrame(),
+        "probing_direction_per_setup_long_summary": pd.DataFrame(),
+        "probing_direction_per_setup_counts_success_differences": pd.DataFrame(),
+        "probing_per_setup_metric_summary_and_differences": pd.DataFrame(),
+    }
+    if pts.empty:
+        return empty
+
+    direction_order = DIRECTION_LABELS_8
+    pts = pts[pts["dominant_probe_direction"].isin(direction_order)].copy()
+    if pts.empty:
+        return empty
+
+    total_chosen = len(pts)
+    overall = (
+        pts.groupby("dominant_probe_direction", dropna=False)
+        .agg(
+            n_chosen=("dominant_probe_direction", "count"),
+            n_success=("correct_response", "sum"),
+            success_rate=("correct_response", "mean"),
+            n_subjects=("subject_id", "nunique"),
+        )
+        .reindex(direction_order)
+        .dropna(subset=["n_chosen"])
+        .reset_index()
+    )
+    overall["n_chosen"] = overall["n_chosen"].astype(int)
+    overall["n_success"] = pd.to_numeric(overall["n_success"], errors="coerce")
+    overall["percent_chosen"] = 100.0 * overall["n_chosen"] / total_chosen if total_chosen else np.nan
+
+    setup_totals = pts.groupby("setup_factor")["dominant_probe_direction"].count()
+    per_setup = (
+        pts.groupby(["setup_factor", "dominant_probe_direction"], dropna=False)
+        .agg(
+            n_chosen=("dominant_probe_direction", "count"),
+            n_success=("correct_response", "sum"),
+            success_rate=("correct_response", "mean"),
+            n_subjects=("subject_id", "nunique"),
+        )
+        .reset_index()
+    )
+    per_setup["percent_chosen_within_setup"] = per_setup.apply(
+        lambda row: 100.0 * row["n_chosen"] / setup_totals.get(row["setup_factor"], np.nan),
+        axis=1,
+    )
+    per_setup["success_sem_binomial"] = np.sqrt(
+        per_setup["success_rate"] * (1.0 - per_setup["success_rate"]) / per_setup["n_chosen"].clip(lower=1)
+    )
+    per_setup["success_ci95"] = 1.96 * per_setup["success_sem_binomial"]
+    per_setup["dominant_probe_direction"] = pd.Categorical(
+        per_setup["dominant_probe_direction"],
+        categories=direction_order,
+        ordered=True,
+    )
+    per_setup = per_setup.sort_values(["dominant_probe_direction", "setup_factor"]).reset_index(drop=True)
+
+    wide_rows: list[dict[str, Any]] = []
+    for direction in direction_order:
+        row: dict[str, Any] = {"dominant_probe_direction": direction}
+        for setup in ["N", "L"]:
+            g = per_setup[
+                (per_setup["setup_factor"] == setup)
+                & (per_setup["dominant_probe_direction"].astype(str) == direction)
+            ]
+            if g.empty:
+                for suffix in ["n_chosen", "percent_chosen", "n_success", "success_rate", "n_subjects"]:
+                    row[f"{setup}_{suffix}"] = np.nan
+            else:
+                item = g.iloc[0]
+                row[f"{setup}_n_chosen"] = item["n_chosen"]
+                row[f"{setup}_percent_chosen"] = item["percent_chosen_within_setup"]
+                row[f"{setup}_n_success"] = item["n_success"]
+                row[f"{setup}_success_rate"] = item["success_rate"]
+                row[f"{setup}_n_subjects"] = item["n_subjects"]
+        row["diff_percent_chosen_L_minus_N"] = row.get("L_percent_chosen", np.nan) - row.get("N_percent_chosen", np.nan)
+        row["diff_success_rate_L_minus_N"] = row.get("L_success_rate", np.nan) - row.get("N_success_rate", np.nan)
+
+        subject_share_rows: list[pd.DataFrame] = []
+        subject_success_rows: list[pd.DataFrame] = []
+        for setup, g_setup in pts.groupby("setup_factor", dropna=False):
+            subj_total = g_setup.groupby("subject_id")["dominant_probe_direction"].count()
+            subj_dir = (
+                g_setup[g_setup["dominant_probe_direction"] == direction]
+                .groupby("subject_id")
+                .agg(n_chosen=("dominant_probe_direction", "count"), success_rate=("correct_response", "mean"))
+            )
+            subj = pd.DataFrame(index=subj_total.index)
+            subj["setup_factor"] = setup
+            subj["choice_share"] = 100.0 * subj_dir["n_chosen"].reindex(subj.index).fillna(0) / subj_total
+            subj["success_rate"] = subj_dir["success_rate"].reindex(subj.index)
+            subject_share_rows.append(subj.reset_index())
+            subject_success_rows.append(subj.dropna(subset=["success_rate"]).reset_index())
+        shares = pd.concat(subject_share_rows, ignore_index=True) if subject_share_rows else pd.DataFrame()
+        successes = pd.concat(subject_success_rows, ignore_index=True) if subject_success_rows else pd.DataFrame()
+        row["p_choice_share_welch"] = _welch_pvalue_by_setup(shares, "choice_share")
+        row["p_success_rate_welch_subject_mean"] = _welch_pvalue_by_setup(successes, "success_rate")
+        wide_rows.append(row)
+    per_setup_differences = pd.DataFrame(wide_rows)
+
+    metric_specs = [
+        ("success", "correct_response", "mean", True),
+        ("count", "probe_count", "mean", False),
+        ("rate/s", "probe_rate_per_s", "mean", False),
+        ("center", "center_dwell_fraction", "mean", True),
+        ("side", "side_dwell_fraction", "mean", True),
+    ]
+    metric_rows: list[dict[str, Any]] = []
+    subject_setup = (
+        pts.groupby(["subject_id", "setup_factor"], dropna=False)
+        .agg(
+            success=("correct_response", "mean"),
+            count=("probe_count", "mean"),
+            **{
+                "rate/s": ("probe_rate_per_s", "mean"),
+                "center": ("center_dwell_fraction", "mean"),
+                "side": ("side_dwell_fraction", "mean"),
+            },
+        )
+        .reset_index()
+    )
+    for label, col, _, _is_fraction in metric_specs:
+        rec: dict[str, Any] = {"table": "setup_metric_summary", "metric": label}
+        values_by_setup: dict[str, pd.Series] = {}
+        for setup in ["N", "L"]:
+            vals = pd.to_numeric(subject_setup.loc[subject_setup["setup_factor"] == setup, label], errors="coerce").dropna()
+            values_by_setup[setup] = vals
+            rec[f"{setup}_n_subjects"] = int(len(vals))
+            rec[f"{setup}_mean"] = float(vals.mean()) if len(vals) else np.nan
+            rec[f"{setup}_sd"] = float(vals.std(ddof=1)) if len(vals) > 1 else np.nan
+            rec[f"{setup}_sem"] = _sem(vals)
+            rec[f"{setup}_ci95"] = 1.96 * _sem(vals) if len(vals) > 1 else np.nan
+        rec["diff_L_minus_N"] = rec.get("L_mean", np.nan) - rec.get("N_mean", np.nan)
+        rec["p_welch"] = _welch_pvalue(values_by_setup.get("N", pd.Series(dtype=float)), values_by_setup.get("L", pd.Series(dtype=float)))
+        rec["cohens_d"] = _pooled_cohens_d_for_values(values_by_setup.get("N", pd.Series(dtype=float)), values_by_setup.get("L", pd.Series(dtype=float)))
+        metric_rows.append(rec)
+    metric_differences = pd.DataFrame(metric_rows)
+
+    return {
+        "probing_direction_chosen_success_normalized_summary": overall,
+        "probing_direction_per_setup_long_summary": per_setup,
+        "probing_direction_per_setup_counts_success_differences": per_setup_differences,
+        "probing_per_setup_metric_summary_and_differences": metric_differences,
+    }
+
+
+def _welch_pvalue(a: pd.Series, b: pd.Series) -> float:
+    aa = pd.to_numeric(a, errors="coerce").dropna()
+    bb = pd.to_numeric(b, errors="coerce").dropna()
+    if scipy_stats is None or len(aa) < 2 or len(bb) < 2:
+        return np.nan
+    if aa.var(ddof=1) == 0 and bb.var(ddof=1) == 0:
+        return np.nan
+    return float(scipy_stats.ttest_ind(aa, bb, equal_var=False, nan_policy="omit").pvalue)
+
+
+def _welch_pvalue_by_setup(df: pd.DataFrame, value_col: str) -> float:
+    if df.empty or value_col not in df.columns or "setup_factor" not in df.columns:
+        return np.nan
+    return _welch_pvalue(
+        df.loc[df["setup_factor"] == "N", value_col],
+        df.loc[df["setup_factor"] == "L", value_col],
+    )
+
+
+def _format_p(value: Any) -> str:
+    val = _numeric_or_nan(value)
+    if not np.isfinite(val):
+        return "p=n/a"
+    return f"p={val:.3g}" if val < 0.001 else f"p={val:.3f}"
+
+
+def _format_rate(value: Any, percent: bool = False) -> str:
+    val = _numeric_or_nan(value)
+    if not np.isfinite(val):
+        return "n/a"
+    return f"{100.0 * val:.1f}%" if percent else f"{val:.2f}"
+
+
+def _reference_probe_amount_summary(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    summary = tables.get("probing_success_anova_factor_summary", pd.DataFrame())
+    if summary.empty:
+        return pd.DataFrame()
+    fdat = summary[
+        (summary["factor"] == "amount_of_probing")
+        & (summary["observation_level"] == "participant_mean")
+        & (summary[ANALYSIS_SCOPE_COLUMN] == "all")
+    ].copy()
+    if fdat.empty:
+        fdat = summary[
+            (summary["factor"] == "amount_of_probing")
+            & (summary["observation_level"] == "trial")
+            & (summary[ANALYSIS_SCOPE_COLUMN] == "all")
+        ].copy()
+    if fdat.empty:
+        return pd.DataFrame()
+    fdat["factor_level"] = pd.Categorical(fdat["factor_level"].astype(str), categories=["0", "1", "2", "3", "4+"], ordered=True)
+    return fdat.sort_values("factor_level")
+
+
+def _reference_anova_row(tables: dict[str, pd.DataFrame], factor: str) -> pd.Series:
+    anova = tables.get("probing_success_one_way_anova", pd.DataFrame())
+    if anova.empty:
+        return pd.Series(dtype=object)
+    rows = anova[
+        (anova["factor"] == factor)
+        & (anova["observation_level"] == "participant_mean")
+        & (anova[ANALYSIS_SCOPE_COLUMN] == "all")
+    ]
+    if rows.empty:
+        rows = anova[
+            (anova["factor"] == factor)
+            & (anova["observation_level"] == "trial")
+            & (anova[ANALYSIS_SCOPE_COLUMN] == "all")
+        ]
+    return rows.iloc[0] if not rows.empty else pd.Series(dtype=object)
+
+
+def _plot_probe_amount_panel(ax: Any, tables: dict[str, pd.DataFrame]) -> None:
+    amount = _reference_probe_amount_summary(tables)
+    if amount.empty:
+        ax.text(0.5, 0.5, "Probe-amount summary unavailable", ha="center", va="center")
+        ax.axis("off")
+        return
+    x = np.arange(len(amount))
+    means = pd.to_numeric(amount["mean_success_rate"], errors="coerce")
+    lower = pd.to_numeric(amount["success_rate_ci95_lower"], errors="coerce")
+    upper = pd.to_numeric(amount["success_rate_ci95_upper"], errors="coerce")
+    yerr = np.vstack([(means - lower).clip(lower=0), (upper - means).clip(lower=0)])
+    ax.bar(x, means, color="#6FA6BA", edgecolor="white")
+    ax.errorbar(x, means, yerr=yerr, fmt="none", ecolor="black", capsize=4, linewidth=1.2)
+    for xi, yi in zip(x, means):
+        if np.isfinite(yi):
+            ax.text(xi, yi + 0.015, f"{yi:.2f}", ha="center", va="bottom", fontsize=9)
+    row = _reference_anova_row(tables, "amount_of_probing")
+    label = f"Probe amount: {_format_p(row.get('p_value'))}, eta^2={_numeric_or_nan(row.get('eta_squared')):.3f}" if not row.empty else "Probe amount"
+    ax.text(0.03, 0.94, label, transform=ax.transAxes, bbox=dict(boxstyle="round", facecolor="white", edgecolor="0.75"))
+    ax.set_xticks(x)
+    ax.set_xticklabels(amount["factor_level"].astype(str))
+    ax.set_xlabel("Probe count bin")
+    ax.set_ylabel("Participant-mean success rate")
+    ax.set_ylim(0.50, 0.95)
+    ax.set_title("Probe amount is not a strong success dependency")
+    ax.grid(axis="y", alpha=0.25)
+
+
+def _plot_setup_probe_panel(ax: Any, metric_table: pd.DataFrame) -> None:
+    if metric_table.empty:
+        ax.text(0.5, 0.5, "Setup summary unavailable", ha="center", va="center")
+        ax.axis("off")
+        return
+    count = metric_table[metric_table["metric"] == "count"]
+    success = metric_table[metric_table["metric"] == "success"]
+    means = [float(count[f"{setup}_mean"].iloc[0]) if not count.empty else np.nan for setup in ["N", "L"]]
+    errs = [float(count[f"{setup}_ci95"].iloc[0]) if not count.empty else np.nan for setup in ["N", "L"]]
+    colors = [SETUP_DISPLAY_COLORS["N"], SETUP_DISPLAY_COLORS["L"]]
+    ax.bar(["N", "L"], means, yerr=errs, capsize=8, color=colors, alpha=0.95)
+    for idx, setup in enumerate(["N", "L"]):
+        mean = means[idx]
+        if np.isfinite(mean):
+            ax.text(idx, mean * 0.45, f"{mean:.2f}\nprobes", ha="center", va="center", color="white", fontsize=11, fontweight="bold")
+        if not success.empty:
+            n = int(count[f"{setup}_n_subjects"].iloc[0]) if np.isfinite(count[f"{setup}_n_subjects"].iloc[0]) else 0
+            srate = float(success[f"{setup}_mean"].iloc[0])
+            ax.text(idx, mean + 0.35, f"n={n} subjects\nsuccess={100*srate:.1f}%", ha="center", va="bottom", bbox=dict(boxstyle="round", facecolor="white", edgecolor="0.8"), fontsize=9)
+    if len(means) == 2 and all(np.isfinite(means)):
+        ax.text(0.5, 0.18, f"L - N = {means[1] - means[0]:+.2f}", ha="center", va="center", bbox=dict(boxstyle="round", facecolor="white", edgecolor="0.8"))
+    ax.set_ylabel("Mean probes per stiffness segment")
+    ax.set_title("Mean probing per setup")
+    ax.set_ylim(0, max(2.5, np.nanmax(np.array(means) + np.nan_to_num(errs, nan=0)) + 0.4))
+    ax.grid(axis="y", alpha=0.25)
+
+
+def _plot_direction_overall_panel(ax: Any, direction_summary: pd.DataFrame, overall_success: float) -> None:
+    if direction_summary.empty:
+        ax.text(0.5, 0.5, "Direction summary unavailable", ha="center", va="center")
+        ax.axis("off")
+        return
+    d = direction_summary.sort_values("n_chosen", ascending=False).copy()
+    x = np.arange(len(d))
+    colors = plt.cm.viridis(np.linspace(0.15, 0.85, len(d)))
+    left_ymax = 1.03
+    right_ymax = max(10.0, float(d["percent_chosen"].max()) * 1.25)
+    percent_on_left_axis = left_ymax * pd.to_numeric(d["percent_chosen"], errors="coerce") / right_ymax
+
+    bars = ax.bar(x, d["success_rate"], color=colors, edgecolor="white", label="_nolegend_", zorder=2)
+    ax.bar(
+        x,
+        percent_on_left_axis,
+        color="lightgray",
+        alpha=0.55,
+        width=0.82,
+        label="% chosen",
+        zorder=3,
+    )
+    ax.axhline(
+        overall_success,
+        color="0.25",
+        linestyle="--",
+        linewidth=1,
+        label=f"Overall success={100*overall_success:.1f}%",
+        zorder=4,
+    )
+    ax2 = ax.twinx()
+    ax2.set_ylabel("% chosen")
+    ax2.set_ylim(0, right_ymax)
+    ax2.grid(False)
+    ax2.set_zorder(ax.get_zorder() - 1)
+    ax2.patch.set_visible(False)
+    for bar, (_, row) in zip(bars, d.iterrows()):
+        ax.text(bar.get_x() + bar.get_width()/2, min(0.98, row["success_rate"] - 0.04), f"{100*row['success_rate']:.1f}%", ha="center", va="center", color="white", fontweight="bold", fontsize=9, zorder=5)
+        ax.text(
+            bar.get_x() + bar.get_width()/2,
+            0.035,
+            f"{int(row['n_chosen'])} chosen\n{row['percent_chosen']:.1f}%",
+            ha="center",
+            va="bottom",
+            color="0.35",
+            fontsize=7,
+            bbox=dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none", alpha=0.45),
+            zorder=6,
+        )
+    ax.set_xticks(x)
+    ax.set_xticklabels(d["dominant_probe_direction"].astype(str))
+    ax.set_xlabel("Dominant probe direction")
+    ax.set_ylabel("Normalized success rate = successes / chosen direction count")
+    ax.set_ylim(0, left_ymax)
+    ax.set_title("Direction success normalized by how often each direction was chosen")
+    ax.grid(axis="y", alpha=0.25, zorder=1)
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles, labels, fontsize=8, loc="upper right")
+
+
+def _plot_setup_direction_count_panel(ax: Any, per_setup: pd.DataFrame) -> None:
+    if per_setup.empty:
+        ax.text(0.5, 0.5, "Per-setup direction summary unavailable", ha="center", va="center")
+        ax.axis("off")
+        return
+    order = [d for d in DIRECTION_LABELS_8 if d in set(per_setup["dominant_probe_direction"].astype(str))]
+    x = np.arange(len(order))
+    width = 0.36
+    for offset, setup in [(-width/2, "N"), (width/2, "L")]:
+        g = per_setup[per_setup["setup_factor"] == setup].set_index(per_setup[per_setup["setup_factor"] == setup]["dominant_probe_direction"].astype(str))
+        vals = [g.loc[d, "percent_chosen_within_setup"] if d in g.index else 0 for d in order]
+        counts = [g.loc[d, "n_chosen"] if d in g.index else 0 for d in order]
+        ax.bar(x + offset, vals, width=width, color=SETUP_DISPLAY_COLORS[setup], alpha=0.95, label=setup)
+        for xi, val, count in zip(x + offset, vals, counts):
+            ax.text(xi, val + 0.5, f"{int(count)}\n{val:.1f}%", ha="center", va="bottom", fontsize=7)
+    ax.set_xticks(x)
+    ax.set_xticklabels(order)
+    ax.set_ylabel("% of directions chosen within setup")
+    ax.set_title("How often each dominant direction was chosen, split by setup")
+    ax.legend(title="setup", fontsize=8)
+    ax.grid(axis="y", alpha=0.25)
+
+
+def _plot_direction_difference_panel(ax: Any, differences: pd.DataFrame) -> None:
+    if differences.empty:
+        ax.text(0.5, 0.5, "Direction differences unavailable", ha="center", va="center")
+        ax.axis("off")
+        return
+    d = differences[differences["dominant_probe_direction"].isin(DIRECTION_LABELS_8)].copy()
+    order = list(d["dominant_probe_direction"])
+    y = np.arange(len(order))
+    chosen = pd.to_numeric(d["diff_percent_chosen_L_minus_N"], errors="coerce")
+    success = 100.0 * pd.to_numeric(d["diff_success_rate_L_minus_N"], errors="coerce")
+    ax.barh(y + 0.18, chosen, height=0.32, color="0.70", label="Chosen % diff (pp)")
+    ax.barh(y - 0.18, success, height=0.32, color="#74C476", label="Success diff (pp)")
+    ax.axvline(0, color="0.25", linewidth=1)
+    for yi, val in zip(y + 0.18, chosen):
+        if np.isfinite(val):
+            ax.text(val + (0.4 if val >= 0 else -0.4), yi, f"{val:+.1f}", ha="left" if val >= 0 else "right", va="center", fontsize=7, color="0.4")
+    for yi, val in zip(y - 0.18, success):
+        if np.isfinite(val):
+            ax.text(val + (0.4 if val >= 0 else -0.4), yi, f"{val:+.1f}", ha="left" if val >= 0 else "right", va="center", fontsize=7, color="#238B45")
+    ax.set_yticks(y)
+    ax.set_yticklabels(order)
+    ax.invert_yaxis()
+    ax.set_xlabel("L - N difference (percentage points)")
+    ax.set_title("Setup differences by direction")
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(axis="x", alpha=0.25)
+
+
+def _plot_setup_direction_success_panel(ax: Any, per_setup: pd.DataFrame, overall_success: float) -> None:
+    if per_setup.empty:
+        ax.text(0.5, 0.5, "Per-setup direction summary unavailable", ha="center", va="center")
+        ax.axis("off")
+        return
+    per_setup = per_setup.copy()
+    per_setup["dominant_probe_direction"] = per_setup["dominant_probe_direction"].astype(str)
+    totals = (
+        per_setup[per_setup["dominant_probe_direction"].isin(DIRECTION_LABELS_8)]
+        .groupby("dominant_probe_direction")["n_chosen"]
+        .sum()
+        .sort_values(ascending=False)
+    )
+    order = list(totals.index) if not totals.empty else [d for d in DIRECTION_LABELS_8 if d in set(per_setup["dominant_probe_direction"])]
+    x = np.arange(len(order))
+    width = 0.36
+    left_ymax = 1.05
+    right_ymax = max(10.0, float(pd.to_numeric(per_setup["percent_chosen_within_setup"], errors="coerce").max()) * 1.25)
+    ax.axhline(overall_success, color="0.25", linestyle="--", linewidth=1, label=f"overall {100*overall_success:.1f}%", zorder=4)
+    ax2 = ax.twinx()
+    ax2.set_ylabel("% chosen within setup")
+    ax2.set_ylim(0, right_ymax)
+    ax2.grid(False)
+    ax2.set_zorder(ax.get_zorder() - 1)
+    ax2.patch.set_visible(False)
+    success_label_used = False
+    for offset, setup in [(-width/2, "N"), (width/2, "L")]:
+        g = per_setup[per_setup["setup_factor"] == setup].set_index(
+            per_setup[per_setup["setup_factor"] == setup]["dominant_probe_direction"].astype(str)
+        )
+        vals = np.array([g.loc[d, "success_rate"] if d in g.index else np.nan for d in order], dtype=float)
+        err = np.array([g.loc[d, "success_ci95"] if d in g.index else np.nan for d in order], dtype=float)
+        chosen_pct = np.array([g.loc[d, "percent_chosen_within_setup"] if d in g.index else np.nan for d in order], dtype=float)
+        counts = np.array([g.loc[d, "n_chosen"] if d in g.index else np.nan for d in order], dtype=float)
+        chosen_on_left_axis = left_ymax * chosen_pct / right_ymax
+        bars = ax.bar(
+            x + offset,
+            vals,
+            yerr=err,
+            width=width,
+            color="0.72",
+            alpha=0.78,
+            capsize=3,
+            label="success rate" if not success_label_used else "_nolegend_",
+            zorder=2,
+        )
+        success_label_used = True
+        ax.bar(
+            x + offset,
+            chosen_on_left_axis,
+            width=width * 0.62,
+            color=SETUP_DISPLAY_COLORS[setup],
+            alpha=0.88,
+            label=f"{setup} % chosen",
+            zorder=3,
+        )
+        for bar, val, pct, count in zip(bars, vals, chosen_pct, counts):
+            if np.isfinite(val):
+                ax.text(
+                    bar.get_x() + bar.get_width()/2,
+                    min(1.0, max(0.11, val - 0.055)),
+                    f"{100*val:.1f}%",
+                    ha="center",
+                    va="center",
+                    color="0.15",
+                    fontsize=7,
+                    fontweight="bold",
+                    zorder=5,
+                )
+            if np.isfinite(pct) and np.isfinite(count):
+                ax.text(
+                    bar.get_x() + bar.get_width()/2,
+                    0.025,
+                    f"{int(count)}\n{pct:.1f}%",
+                    ha="center",
+                    va="bottom",
+                    color="white",
+                    fontsize=6,
+                    fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.10", facecolor=SETUP_DISPLAY_COLORS[setup], edgecolor="none", alpha=0.70),
+                    zorder=6,
+                )
+    ax.set_xticks(x)
+    ax.set_xticklabels(order)
+    ax.set_xlabel("Dominant probe direction")
+    ax.set_ylabel("Normalized success rate = successes / chosen setup-direction count")
+    ax.set_ylim(0, left_ymax)
+    ax.set_title("Direction success and chosen amount, split by setup")
+    ax.legend(fontsize=8, loc="upper right", framealpha=0.85)
+    ax.grid(axis="y", alpha=0.25, zorder=1)
+
+
+def _plot_metric_table(ax: Any, metric_table: pd.DataFrame) -> None:
+    ax.axis("off")
+    if metric_table.empty:
+        ax.text(0.5, 0.5, "Setup summary unavailable", ha="center", va="center")
+        return
+    rows = []
+    for metric in ["success", "count", "rate/s", "center", "side"]:
+        recs = metric_table[metric_table["metric"] == metric]
+        if recs.empty:
+            continue
+        row = recs.iloc[0]
+        percent = metric in {"success", "center", "side"}
+        diff = _numeric_or_nan(row.get("diff_L_minus_N"))
+        rows.append([
+            metric,
+            _format_rate(row.get("N_mean"), percent=percent),
+            _format_rate(row.get("L_mean"), percent=percent),
+            f"{100*diff:+.1f} pp" if percent and np.isfinite(diff) else f"{diff:+.2f}" if np.isfinite(diff) else "n/a",
+            _format_p(row.get("p_welch")),
+        ])
+    table = ax.table(
+        cellText=rows,
+        colLabels=["metric", "N", "L", "L-N", "Welch"],
+        cellLoc="center",
+        loc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1, 1.35)
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(weight="bold")
+            cell.set_facecolor("#F2F2F2")
+    ax.set_title("Per-setup summary values", fontsize=10)
+
+
+def save_reference_figures(output_root: Path, tables: dict[str, pd.DataFrame], fig_dpi: int = 160) -> list[Path]:
+    """Save the custom reference figures that were previously made manually."""
+    fig_dir = output_root / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+
+    direction_summary = tables.get("probing_direction_chosen_success_normalized_summary", pd.DataFrame())
+    per_setup = tables.get("probing_direction_per_setup_long_summary", pd.DataFrame())
+    differences = tables.get("probing_direction_per_setup_counts_success_differences", pd.DataFrame())
+    metric_table = tables.get("probing_per_setup_metric_summary_and_differences", pd.DataFrame())
+    trial_summary = tables.get("probing_trial_summary", pd.DataFrame())
+    stiffness = tables.get("probing_stiffness_summary", pd.DataFrame()).copy()
+    overall_success = float(pd.to_numeric(trial_summary.get("correct_response"), errors="coerce").mean()) if not trial_summary.empty else np.nan
+
+    if not stiffness.empty:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        ax = axes[0]
+        stiffness = stiffness.sort_values("stiffness_value")
+        x = pd.to_numeric(stiffness["stiffness_value"], errors="coerce")
+        y = pd.to_numeric(stiffness["success_rate"], errors="coerce")
+        lo = pd.to_numeric(stiffness.get("success_rate_ci95_lower"), errors="coerce")
+        hi = pd.to_numeric(stiffness.get("success_rate_ci95_upper"), errors="coerce")
+        probes = pd.to_numeric(stiffness["mean_probe_count"], errors="coerce")
+        ax.plot(x, y, marker="o", linewidth=2.5, color="#2C7FB8", label="Success rate")
+        if lo.notna().any() and hi.notna().any():
+            ax.fill_between(x, lo, hi, color="#2C7FB8", alpha=0.18, label="95% CI")
+        ax.set_xlabel("Stiffness value")
+        ax.set_ylabel("Success rate", color="#2C7FB8")
+        ax.tick_params(axis="y", labelcolor="#2C7FB8")
+        ax.grid(alpha=0.25)
+        ax2 = ax.twinx()
+        ax2.plot(x, probes, marker="s", linewidth=2.5, color="#D95F02", label="Mean probe count")
+        ax2.set_ylabel("Mean probe count", color="#D95F02")
+        ax2.tick_params(axis="y", labelcolor="#D95F02")
+        row = _reference_anova_row(tables, "stiffness_value")
+        if not row.empty:
+            ax.text(
+                0.02,
+                0.90,
+                f"Participant-mean ANOVA\nStiffness: {_format_p(row.get('p_value'))}, eta^2={_numeric_or_nan(row.get('eta_squared')):.3f}",
+                transform=ax.transAxes,
+                bbox=dict(boxstyle="round", facecolor="white", edgecolor="0.75"),
+                fontsize=10,
+            )
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines + lines2, labels + labels2, fontsize=8, loc="lower left")
+        ax.set_title("Success changes strongly with stiffness")
+        _plot_probe_amount_panel(axes[1], tables)
+        fig.suptitle("Probing and success dependencies: stiffness dominates, probe amount is weak", fontsize=16, fontweight="bold")
+        n_subjects = int(trial_summary["subject_id"].nunique()) if not trial_summary.empty and "subject_id" in trial_summary else 0
+        fig.text(0.5, 0.02, f"Source: {output_root}; {n_subjects} subjects, {len(trial_summary):,} stiffness-segment rows. Participant-mean ANOVA used for main inference.", ha="center", fontsize=9, color="0.35")
+        fig.tight_layout(rect=(0, 0.05, 1, 0.94))
+        out = fig_dir / "probing_success_dependency_reference.png"
+        fig.savefig(out, dpi=fig_dpi)
+        plt.close(fig)
+        paths.append(out)
+
+    if not metric_table.empty and not per_setup.empty:
+        fig = plt.figure(figsize=(17, 7))
+        gs = fig.add_gridspec(1, 2, width_ratios=[1, 2.25])
+        _plot_setup_probe_panel(fig.add_subplot(gs[0, 0]), metric_table)
+        _plot_setup_direction_success_panel(fig.add_subplot(gs[0, 1]), per_setup, overall_success)
+        fig.suptitle("Probing dependencies: setup-level probing and setup-normalized direction success", fontsize=16, fontweight="bold")
+        fig.text(0.5, 0.02, "For each direction, gray bars show successes / chosen setup-direction count; purple/pink overlays show how often that direction was chosen within N/L.", ha="center", fontsize=9, color="0.40")
+        fig.tight_layout(rect=(0, 0.05, 1, 0.94))
+        for filename in [
+            "probing_setup_direction_success_reference.png",
+            "probing_setup_direction_success_normalized_by_amount_reference.png",
+        ]:
+            out = fig_dir / filename
+            fig.savefig(out, dpi=fig_dpi)
+            paths.append(out)
+        plt.close(fig)
+
+    if not per_setup.empty:
+        fig = plt.figure(figsize=(17, 6.2))
+        gs = fig.add_gridspec(1, 2, width_ratios=[1.8, 1.2])
+        _plot_setup_direction_success_panel(fig.add_subplot(gs[0, 0]), per_setup, overall_success)
+        _plot_probe_amount_panel(fig.add_subplot(gs[0, 1]), tables)
+        fig.suptitle("Direction-specific success and probe-amount control", fontsize=16, fontweight="bold")
+        fig.text(
+            0.5,
+            0.02,
+            "B. Direction-specific success: each direction has gray N/L success bars normalized by setup-direction chosen count, with purple/pink overlays for the within-setup reference amount. "
+            "C. Probe amount and success: probe amount is weak/non-significant in the participant-mean ANOVA.",
+            ha="center",
+            fontsize=9,
+            color="0.40",
+        )
+        fig.tight_layout(rect=(0, 0.07, 1, 0.93))
+        out = fig_dir / "probing_direction_success_and_probe_amount_reference.png"
+        fig.savefig(out, dpi=fig_dpi)
+        paths.append(out)
+        plt.close(fig)
+
+    if not metric_table.empty and not per_setup.empty:
+        fig = plt.figure(figsize=(15, 13))
+        gs = fig.add_gridspec(2, 2)
+        _plot_metric_table(fig.add_subplot(gs[0, 0]), metric_table)
+        _plot_setup_direction_count_panel(fig.add_subplot(gs[0, 1]), per_setup)
+        _plot_direction_difference_panel(fig.add_subplot(gs[1, 0]), differences)
+        _plot_setup_direction_success_panel(fig.add_subplot(gs[1, 1]), per_setup, overall_success)
+        fig.suptitle("Per-setup probing and direction-success dependencies", fontsize=16, fontweight="bold")
+        fig.text(0.5, 0.02, "Gray bars show setup-direction success; purple/pink overlays show N/L chosen amount. Direction = dominant_probe_direction per stiffness segment.", ha="center", fontsize=9, color="0.40")
+        fig.tight_layout(rect=(0, 0.05, 1, 0.94))
+        out = fig_dir / "probing_per_setup_direction_success_differences_reference.png"
+        fig.savefig(out, dpi=fig_dpi)
+        plt.close(fig)
+        paths.append(out)
+
+        fig = plt.figure(figsize=(20, 8))
+        gs = fig.add_gridspec(2, 3, width_ratios=[1, 1.3, 1.8])
+        _plot_metric_table(fig.add_subplot(gs[0, 0]), metric_table)
+        _plot_setup_direction_count_panel(fig.add_subplot(gs[0, 1]), per_setup)
+        _plot_direction_difference_panel(fig.add_subplot(gs[1, 0]), differences)
+        _plot_setup_direction_success_panel(fig.add_subplot(gs[1, 1]), per_setup, overall_success)
+        _plot_probe_amount_panel(fig.add_subplot(gs[:, 2]), tables)
+        fig.suptitle("Reference figure: setup/direction dependencies beside the probe-amount control", fontsize=16, fontweight="bold")
+        fig.text(0.02, 0.02, "Direction success is shown in gray and normalized by chosen setup-direction count; N/L chosen amount is shown in purple/pink. Probe count bin shows weak/non-significant success dependency.", fontsize=9, color="0.35")
+        fig.tight_layout(rect=(0, 0.05, 1, 0.94))
+        for filename in [
+            "probing_setup_direction_plus_probe_amount_reference.png",
+            "probing_setup_direction_and_probe_amount_side_by_side.png",
+        ]:
+            out = fig_dir / filename
+            fig.savefig(out, dpi=fig_dpi)
+            paths.append(out)
+        plt.close(fig)
+
+    try:
+        paths.extend(save_direction_rose_figures(output_root, tables, fig_dpi=max(fig_dpi, 300)))
+    except Exception as exc:  # pragma: no cover - validation CSVs may be absent
+        print(f"Rose figures skipped: {exc}")
+
+    return paths
+
+
+# ---------------------------------------------------------------------------
+# Probing-direction rose figures with the device reach outline (Fig. 14 rev.)
+# ---------------------------------------------------------------------------
+#
+# Direction frame.  ``dominant_probe_direction`` is derived from
+# ``position_angle_deg = atan2(object_y - cy, object_x - cx)`` in raw tracking
+# pixels (kinematics_analysis), where +y points DOWN on the display.  The raw
+# label "N" therefore means the object moved toward the bottom of the screen.
+#
+# Both tactor validations that the paper reports as the device workspace
+# (OptiTrack 16-axis runs and the camera tactor-accuracy runs) label directions
+# in the device compass: "N" is the motor pattern M0 negative / M1, M2 positive
+# and "E" is M1 positive / M2 negative (validetion/optitrack/
+# workspace_validation.axis_endpoints).  Feeding MotorController with the study
+# settings (tactor opposes object motion, hand not mirrored) shows that an
+# object displacement of +x yields the "E" pattern and +y yields the "S"
+# pattern.  So the tactor's commanded direction for a probe is the probe
+# direction read in the ordinary screen compass (N = up, E = right), and the
+# raw labels have to be flipped N<->S to land in that compass.
+PROBE_LABEL_TO_DEVICE_COMPASS = {
+    "E": "E",
+    "NE": "SE",
+    "N": "S",
+    "NW": "SW",
+    "W": "W",
+    "SW": "NW",
+    "S": "N",
+    "SE": "NE",
+}
+DEVICE_COMPASS_ANGLE_DEG = {"E": 0.0, "NE": 45.0, "N": 90.0, "NW": 135.0, "W": 180.0, "SW": 225.0, "S": 270.0, "SE": 315.0}
+ROSE_DIRECTION_ORDER = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"]
+ROSE_SUCCESS_CMAP = "viridis"
+ROSE_SUCCESS_VMIN = 0.55
+ROSE_SUCCESS_VMAX = 0.90
+ROSE_REACH_RING_MM = 5.0  # device reach (mm) drawn at the outer ring of the rose
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def default_device_reach_paths() -> tuple[Path, Path]:
+    """Default CSVs of the two tactor-workspace validations."""
+    root = _project_root() / "validetion"
+    optitrack = root / "optitrack" / "OT-results" / "workspace_outline" / "five_small_runs_16axis_reach_mean.csv"
+    camera = (
+        root
+        / "Thimble with and without"
+        / "Priviuse"
+        / "accuracy_notebook_figures"
+        / "tactor_cardinal_gaps_per_pair_from_origin_max_mm.csv"
+    )
+    return optitrack, camera
+
+
+def load_device_reach_outline(
+    optitrack_csv: Path | None = None,
+    camera_csv: Path | None = None,
+    *,
+    camera_group: str = "with_finger",
+) -> pd.DataFrame:
+    """Per-direction device reach (mm) from both validations and their mean.
+
+    OptiTrack: mean 16-axis reach of the five small runs (no finger), reduced to
+    the eight compass directions.  Camera: from-origin max reach per pair,
+    averaged within run and then across runs (the convention used for the
+    numbers quoted in the paper), for ``camera_group``.  ``mean_mm`` averages
+    the two validations direction by direction.
+    """
+    ot_path, cam_path = default_device_reach_paths()
+    optitrack_csv = Path(optitrack_csv) if optitrack_csv else ot_path
+    camera_csv = Path(camera_csv) if camera_csv else cam_path
+
+    rows: list[dict[str, Any]] = [{"direction": d, "angle_deg": DEVICE_COMPASS_ANGLE_DEG[d]} for d in ROSE_DIRECTION_ORDER]
+    out = pd.DataFrame(rows)
+
+    if optitrack_csv.exists():
+        ot = pd.read_csv(optitrack_csv)
+        ot = ot[ot["compass"].isin(ROSE_DIRECTION_ORDER)].set_index("compass")
+        out["optitrack_mm"] = [float(ot.loc[d, "mean_reach_2d_mm"]) if d in ot.index else np.nan for d in out["direction"]]
+        out["optitrack_sd_mm"] = [float(ot.loc[d, "std_reach_2d_mm"]) if d in ot.index else np.nan for d in out["direction"]]
+    else:
+        out["optitrack_mm"] = np.nan
+        out["optitrack_sd_mm"] = np.nan
+
+    if camera_csv.exists():
+        cam = pd.read_csv(camera_csv)
+        for group_name, column in [("with_finger", "camera_with_finger_mm"), ("without_finger", "camera_without_finger_mm")]:
+            g = cam[cam["group"] == group_name]
+            if g.empty:
+                out[column] = np.nan
+                continue
+            run_means = g.groupby("run")[ROSE_DIRECTION_ORDER].mean()
+            pooled = run_means.mean(axis=0)
+            out[column] = [float(pooled.get(d, np.nan)) for d in out["direction"]]
+        out["camera_mm"] = out["camera_with_finger_mm" if camera_group == "with_finger" else "camera_without_finger_mm"]
+        out["camera_group"] = camera_group
+    else:
+        out["camera_with_finger_mm"] = np.nan
+        out["camera_without_finger_mm"] = np.nan
+        out["camera_mm"] = np.nan
+        out["camera_group"] = camera_group
+
+    out["mean_mm"] = out[["optitrack_mm", "camera_mm"]].mean(axis=1, skipna=True)
+    out["optitrack_csv"] = str(optitrack_csv)
+    out["camera_csv"] = str(camera_csv)
+    return out
+
+
+def per_setup_direction_in_device_compass(per_setup: pd.DataFrame) -> pd.DataFrame:
+    """Relabel ``dominant_probe_direction`` into the device compass."""
+    d = per_setup.copy()
+    d["probe_label_raw"] = d["dominant_probe_direction"].astype(str)
+    d["direction"] = d["probe_label_raw"].map(PROBE_LABEL_TO_DEVICE_COMPASS)
+    d = d[d["direction"].notna()].copy()
+    d["angle_deg"] = d["direction"].map(DEVICE_COMPASS_ANGLE_DEG)
+    return d
+
+
+def compute_direction_reach_relation(per_setup: pd.DataFrame, outline: pd.DataFrame) -> pd.DataFrame:
+    """Spearman rank correlations across the 8 directions: device reach vs
+    choice share and vs success, per setup.  With n = 8 this is descriptive."""
+    d = per_setup_direction_in_device_compass(per_setup)
+    reach = outline.set_index("direction")["mean_mm"]
+    rows: list[dict[str, Any]] = []
+    for setup in ["N", "L"]:
+        g = d[d["setup_factor"] == setup].set_index("direction")
+        dirs = [x for x in ROSE_DIRECTION_ORDER if x in g.index and np.isfinite(reach.get(x, np.nan))]
+        r = np.array([reach[x] for x in dirs], dtype=float)
+        for metric, col in [("percent_chosen_within_setup", "percent_chosen_within_setup"), ("success_rate", "success_rate")]:
+            v = np.array([float(g.loc[x, col]) for x in dirs], dtype=float)
+            rho, p = (np.nan, np.nan)
+            if scipy_stats is not None and len(dirs) >= 4:
+                res = scipy_stats.spearmanr(r, v)
+                rho, p = float(res.statistic), float(res.pvalue)
+            rows.append({
+                "setup_factor": setup,
+                "metric": metric,
+                "n_directions": len(dirs),
+                "spearman_rho_vs_device_reach": rho,
+                "p_value": p,
+                "directions": ",".join(dirs),
+            })
+    # Weighted by trials, pooled over setups: success vs reach.
+    pooled = d.groupby("direction").agg(n_chosen=("n_chosen", "sum"), n_success=("n_success", "sum"))
+    pooled["success_rate"] = pooled["n_success"] / pooled["n_chosen"]
+    dirs = [x for x in ROSE_DIRECTION_ORDER if x in pooled.index and np.isfinite(reach.get(x, np.nan))]
+    if scipy_stats is not None and len(dirs) >= 4:
+        res = scipy_stats.spearmanr([reach[x] for x in dirs], [pooled.loc[x, "success_rate"] for x in dirs])
+        rows.append({
+            "setup_factor": "pooled",
+            "metric": "success_rate",
+            "n_directions": len(dirs),
+            "spearman_rho_vs_device_reach": float(res.statistic),
+            "p_value": float(res.pvalue),
+            "directions": ",".join(dirs),
+        })
+    return pd.DataFrame(rows)
+
+
+def _plot_direction_rose_panel(
+    ax: Any,
+    per_setup_device: pd.DataFrame,
+    setup: str,
+    outline: pd.DataFrame | None,
+    *,
+    r_max: float = 42.0,
+    label_fontsize: float = 6.0,
+    show_success_text: bool = True,
+) -> Any:
+    """One polar rose: wedge length = % chosen within setup, wedge colour =
+    direction-specific success.  Dashed outline = device reach (mm), scaled so
+    that ``ROSE_REACH_RING_MM`` sits on the outer ring."""
+    g = per_setup_device[per_setup_device["setup_factor"] == setup].set_index("direction")
+    cmap = plt.get_cmap(ROSE_SUCCESS_CMAP)
+    norm = plt.Normalize(ROSE_SUCCESS_VMIN, ROSE_SUCCESS_VMAX)
+    theta = np.radians([DEVICE_COMPASS_ANGLE_DEG[d] for d in ROSE_DIRECTION_ORDER])
+    share = np.array([float(g.loc[d, "percent_chosen_within_setup"]) if d in g.index else 0.0 for d in ROSE_DIRECTION_ORDER])
+    succ = np.array([float(g.loc[d, "success_rate"]) if d in g.index else np.nan for d in ROSE_DIRECTION_ORDER])
+    colors = [cmap(norm(s)) if np.isfinite(s) else (0.85, 0.85, 0.85, 1.0) for s in succ]
+    ax.bar(theta, share, width=np.radians(38), bottom=0.0, color=colors, edgecolor="0.15", linewidth=0.5, zorder=3)
+    if show_success_text:
+        # Print the success only inside wedges long enough to hold it; the
+        # colour carries the value for the short ones (numbers are in the text).
+        for t, r, s in zip(theta, share, succ):
+            if not np.isfinite(s) or r < 9.0:
+                continue
+            if r >= 16.0:
+                txt_color = "white" if s < 0.72 else "0.1"
+                ax.text(t, r * 0.55, f"{100 * s:.0f}%", ha="center", va="center", fontsize=label_fontsize - 0.5, color=txt_color, zorder=5)
+            else:
+                ax.text(t, r + 5.0, f"{100 * s:.0f}%", ha="center", va="center", fontsize=label_fontsize - 1.0, color="0.1", zorder=5)
+    if outline is not None and not outline.empty and outline["mean_mm"].notna().any():
+        o = outline.set_index("direction")
+        pts = [(np.radians(DEVICE_COMPASS_ANGLE_DEG[d]), float(o.loc[d, "mean_mm"])) for d in ROSE_DIRECTION_ORDER if d in o.index and np.isfinite(o.loc[d, "mean_mm"])]
+        if pts:
+            th = np.array([p[0] for p in pts] + [pts[0][0]])
+            rr = np.array([p[1] for p in pts] + [pts[0][1]]) * (r_max / ROSE_REACH_RING_MM)
+            ax.plot(th, rr, color="0.1", linestyle="--", linewidth=0.9, zorder=4, label="device reach")
+    ax.set_theta_zero_location("E")
+    ax.set_theta_direction(1)
+    ax.set_thetagrids([DEVICE_COMPASS_ANGLE_DEG[d] for d in ROSE_DIRECTION_ORDER], ROSE_DIRECTION_ORDER, fontsize=label_fontsize + 0.5)
+    ax.set_rlim(0, r_max)
+    ax.set_rticks([20, 40])
+    ax.set_yticklabels(["20", "40%"], fontsize=label_fontsize - 1.0, color="0.35")
+    ax.set_rlabel_position(67.5)
+    ax.tick_params(axis="x", pad=-3.5)
+    ax.tick_params(axis="y", pad=0)
+    ax.grid(alpha=0.35, linewidth=0.5)
+    ax.spines["polar"].set_linewidth(0.6)
+    return plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+
+
+def _p_text(value: Any) -> str:
+    """'0.007' / '<0.001' / 'n/a' without the 'p=' prefix."""
+    v = _numeric_or_nan(value)
+    if not np.isfinite(v):
+        return "n/a"
+    return "<0.001" if v < 0.001 else f"{v:.3f}"
+
+
+def _add_success_colorbar(fig: Any, sm: Any, rect: list[float], fontsize: float = 6.0) -> Any:
+    cax = fig.add_axes(rect)
+    cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
+    cb.set_label("direction-specific success", fontsize=fontsize, labelpad=1)
+    cb.ax.tick_params(labelsize=fontsize - 0.5, length=2, pad=1)
+    cb.set_ticks([0.6, 0.7, 0.8, 0.9])
+    cb.set_ticklabels(["60%", "70%", "80%", "90%"])
+    cb.outline.set_linewidth(0.5)
+    return cb
+
+
+def _plot_direction_share_difference_panel(ax: Any, per_setup_device: pd.DataFrame, differences: pd.DataFrame | None, *, fontsize: float = 6.0) -> None:
+    """L minus N choice share per direction (pp), with Welch p on subject shares."""
+    dirs = ROSE_DIRECTION_ORDER
+    piv = per_setup_device.pivot_table(index="direction", columns="setup_factor", values="percent_chosen_within_setup", aggfunc="first")
+    diff = np.array([float(piv.loc[d, "L"] - piv.loc[d, "N"]) if d in piv.index else np.nan for d in dirs])
+    pvals: dict[str, float] = {}
+    if differences is not None and not differences.empty:
+        dd = differences.copy()
+        dd["direction"] = dd["dominant_probe_direction"].astype(str).map(PROBE_LABEL_TO_DEVICE_COMPASS)
+        for _, row in dd.iterrows():
+            pvals[str(row["direction"])] = _numeric_or_nan(row.get("p_choice_share_welch"))
+    x = np.arange(len(dirs))
+    colors = [SETUP_DISPLAY_COLORS["L"] if v >= 0 else SETUP_DISPLAY_COLORS["N"] for v in np.nan_to_num(diff)]
+    ax.bar(x, diff, color=colors, width=0.7, edgecolor="0.2", linewidth=0.4)
+    ax.axhline(0, color="0.2", linewidth=0.6)
+    for xi, v, d in zip(x, diff, dirs):
+        if not np.isfinite(v):
+            continue
+        p = pvals.get(d, np.nan)
+        star = "*" if np.isfinite(p) and p < 0.05 else ""
+        ax.text(xi, v + (0.8 if v >= 0 else -0.8), f"{v:+.0f}{star}", ha="center", va="bottom" if v >= 0 else "top", fontsize=fontsize - 0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(dirs, fontsize=fontsize)
+    ax.tick_params(axis="y", labelsize=fontsize - 0.5)
+    ax.set_ylabel("L − N share (pp)", fontsize=fontsize)
+    lim = np.nanmax(np.abs(diff)) * 1.35 if np.isfinite(diff).any() else 10
+    ax.set_ylim(-lim, lim)
+    ax.grid(axis="y", alpha=0.3, linewidth=0.4)
+    for s in ["top", "right"]:
+        ax.spines[s].set_visible(False)
+
+
+def _plot_success_vs_reach_panel(ax: Any, per_setup_device: pd.DataFrame, outline: pd.DataFrame, relation: pd.DataFrame | None, *, fontsize: float = 6.0) -> None:
+    o = outline.set_index("direction")["mean_mm"]
+    for setup in ["N", "L"]:
+        g = per_setup_device[per_setup_device["setup_factor"] == setup].set_index("direction")
+        xs, ys, ns, labels = [], [], [], []
+        for d in ROSE_DIRECTION_ORDER:
+            if d in g.index and np.isfinite(o.get(d, np.nan)):
+                xs.append(float(o[d]))
+                ys.append(100 * float(g.loc[d, "success_rate"]))
+                ns.append(float(g.loc[d, "n_chosen"]))
+                labels.append(d)
+        sizes = 6 + 40 * np.sqrt(np.array(ns) / max(ns)) if ns else []
+        ax.scatter(xs, ys, s=sizes, color=SETUP_DISPLAY_COLORS[setup], alpha=0.8, edgecolor="0.2", linewidth=0.4, label=setup, zorder=3)
+        for x, y, d in zip(xs, ys, labels):
+            ax.annotate(d, (x, y), textcoords="offset points", xytext=(3, 2), fontsize=fontsize - 1, color=SETUP_DISPLAY_COLORS[setup])
+    if relation is not None and not relation.empty:
+        lines = []
+        for setup in ["N", "L"]:
+            r = relation[(relation["setup_factor"] == setup) & (relation["metric"] == "success_rate")]
+            if not r.empty:
+                lines.append(f"{setup}: ρ={float(r.iloc[0]['spearman_rho_vs_device_reach']):+.2f}, p={_p_text(r.iloc[0]['p_value'])}")
+        if lines:
+            ax.text(0.03, 0.03, "\n".join(lines), transform=ax.transAxes, fontsize=fontsize - 0.5, va="bottom", ha="left", bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="0.8", linewidth=0.4))
+    ax.set_xlabel("device reach (mm)", fontsize=fontsize)
+    ax.set_ylabel("success (%)", fontsize=fontsize)
+    ax.tick_params(labelsize=fontsize - 0.5)
+    ax.grid(alpha=0.3, linewidth=0.4)
+    ax.legend(fontsize=fontsize - 0.5, frameon=False, loc="lower right", handletextpad=0.2, borderaxespad=0.2, markerscale=0.6)
+    for s in ["top", "right"]:
+        ax.spines[s].set_visible(False)
+
+
+def save_direction_rose_figures(
+    output_root: Path,
+    tables: dict[str, pd.DataFrame],
+    *,
+    outline: pd.DataFrame | None = None,
+    fig_dpi: int = 300,
+) -> list[Path]:
+    """Compact and extended rose figures of probing direction per setup.
+
+    Compact (``probing_direction_rose_by_setup.png``): two roses, N and L, one
+    column wide.  Extended (``..._extended.png``): adds the L−N share
+    difference and success-vs-device-reach panels.  Also writes the device
+    outline, the relabelled per-setup table and the reach relation as CSVs.
+    """
+    per_setup = tables.get("probing_direction_per_setup_long_summary", pd.DataFrame())
+    differences = tables.get("probing_direction_per_setup_counts_success_differences", pd.DataFrame())
+    if per_setup.empty:
+        return []
+    fig_dir = output_root / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    if outline is None:
+        outline = load_device_reach_outline()
+    d = per_setup_direction_in_device_compass(per_setup)
+    relation = compute_direction_reach_relation(per_setup, outline)
+    save_csv(outline, output_root, "probing_direction_device_reach_outline.csv")
+    save_csv(d.drop(columns=[], errors="ignore"), output_root, "probing_direction_per_setup_device_compass.csv")
+    save_csv(relation, output_root, "probing_direction_reach_relation.csv")
+
+    def _w_note() -> str:
+        w = d[d["direction"] == "W"].set_index("setup_factor")
+        p = np.nan
+        if not differences.empty:
+            row = differences[differences["dominant_probe_direction"].astype(str) == "W"]
+            if not row.empty:
+                p = _numeric_or_nan(row.iloc[0].get("p_choice_share_welch"))
+        if {"N", "L"} <= set(w.index):
+            return f"W: {w.loc['L', 'percent_chosen_within_setup']:.1f}% (L) vs {w.loc['N', 'percent_chosen_within_setup']:.1f}% (N), p = {_p_text(p)}"
+        return ""
+
+    paths: list[Path] = []
+    note = _w_note()
+    # ---- compact: two roses + colourbar, one column wide ---------------
+    fig = plt.figure(figsize=(3.5, 2.45))
+    axN = fig.add_axes([0.06, 0.245, 0.40, 0.62], projection="polar")
+    axL = fig.add_axes([0.54, 0.245, 0.40, 0.62], projection="polar")
+    sm = _plot_direction_rose_panel(axN, d, "N", outline)
+    _plot_direction_rose_panel(axL, d, "L", outline)
+    axN.set_title("Natural (N)", fontsize=7.5, color=SETUP_DISPLAY_COLORS["N"], pad=5)
+    axL.set_title("Air-slide (L)", fontsize=7.5, color=SETUP_DISPLAY_COLORS["L"], pad=5)
+    _add_success_colorbar(fig, sm, [0.28, 0.135, 0.44, 0.032], fontsize=5.8)
+    if note:
+        fig.text(0.5, 0.022, note, ha="center", va="bottom", fontsize=5.4, color="0.25")
+    out = fig_dir / "probing_direction_rose_by_setup.png"
+    fig.savefig(out, dpi=fig_dpi)
+    fig.savefig(out.with_suffix(".pdf"))
+    plt.close(fig)
+    paths.append(out)
+
+    # ---- extended: roses + share difference + success vs reach ---------
+    fig = plt.figure(figsize=(3.5, 4.3))
+    axN = fig.add_axes([0.06, 0.575, 0.40, 0.36], projection="polar")
+    axL = fig.add_axes([0.54, 0.575, 0.40, 0.36], projection="polar")
+    sm = _plot_direction_rose_panel(axN, d, "N", outline)
+    _plot_direction_rose_panel(axL, d, "L", outline)
+    axN.set_title("(a) Natural (N)", fontsize=7, color=SETUP_DISPLAY_COLORS["N"], pad=5)
+    axL.set_title("(b) Air-slide (L)", fontsize=7, color=SETUP_DISPLAY_COLORS["L"], pad=5)
+    _add_success_colorbar(fig, sm, [0.28, 0.515, 0.44, 0.018], fontsize=5.8)
+    ax3 = fig.add_axes([0.13, 0.10, 0.34, 0.33])
+    _plot_direction_share_difference_panel(ax3, d, differences)
+    ax3.set_title("(c) L − N share of probes", fontsize=7)
+    ax4 = fig.add_axes([0.62, 0.10, 0.35, 0.33])
+    _plot_success_vs_reach_panel(ax4, d, outline, relation)
+    ax4.set_title("(d) success vs device reach", fontsize=7)
+    out = fig_dir / "probing_direction_rose_by_setup_extended.png"
+    fig.savefig(out, dpi=fig_dpi)
+    fig.savefig(out.with_suffix(".pdf"))
+    plt.close(fig)
+    paths.append(out)
+    return paths
+
+
 def save_figures(output_root: Path, tables: dict[str, pd.DataFrame], fig_dpi: int = 160) -> list[Path]:
     fig_dir = output_root / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
@@ -1334,12 +2425,14 @@ def save_figures(output_root: Path, tables: dict[str, pd.DataFrame], fig_dpi: in
                         )
                 for group_name, g in g_finger.groupby(EXPERIMENT_GROUP_COLUMN, dropna=False):
                     g = g.sort_values("stiffness_value")
+                    group_key = str(group_name)
                     ax.plot(
                         pd.to_numeric(g["stiffness_value"], errors="coerce"),
                         pd.to_numeric(g[metric], errors="coerce"),
                         marker="o",
                         linewidth=2,
-                        label=str(group_name),
+                        color=SETUP_DISPLAY_COLORS.get(group_key),
+                        label=SETUP_DISPLAY_LABELS.get(group_key, group_key),
                     )
                 if "straightness" in metric:
                     ax.set_ylim(-0.05, 1.05)
@@ -1392,11 +2485,18 @@ def save_figures(output_root: Path, tables: dict[str, pd.DataFrame], fig_dpi: in
                 "all",
                 plot_anova[ANALYSIS_SCOPE_VALUE_COLUMN].astype(str),
             )
+            plot_anova["scope_label"] = plot_anova["scope_label"].map(
+                lambda value: SETUP_DISPLAY_LABELS.get(str(value), str(value))
+            )
             plot_anova["neg_log10_p"] = -np.log10(pd.to_numeric(plot_anova["p_value"], errors="coerce").clip(lower=1e-300))
             pivot = plot_anova.pivot_table(index="factor", columns="scope_label", values="neg_log10_p", aggfunc="first")
             if not pivot.empty:
                 fig, ax = plt.subplots(figsize=(9, 5))
-                pivot.plot(kind="bar", ax=ax)
+                pivot.plot(
+                    kind="bar",
+                    ax=ax,
+                    color=[SETUP_DISPLAY_COLORS.get(str(c), "#4C78A8") for c in pivot.columns],
+                )
                 ax.axhline(-math.log10(ANOVA_ALPHA), color="red", linestyle="--", linewidth=1, label=f"p={ANOVA_ALPHA}")
                 ax.set_xlabel("One-way ANOVA factor")
                 ax.set_ylabel("-log10(p-value)")
@@ -1420,6 +2520,9 @@ def save_figures(output_root: Path, tables: dict[str, pd.DataFrame], fig_dpi: in
                 "all",
                 summary_plot[ANALYSIS_SCOPE_VALUE_COLUMN].astype(str),
             )
+            summary_plot["scope_label"] = summary_plot["scope_label"].map(
+                lambda value: SETUP_DISPLAY_LABELS.get(str(value), str(value))
+            )
             fdat = summary_plot[summary_plot["factor"] == "amount_of_probing"].copy()
             if not fdat.empty:
                 order = ["0", "1", "2", "3", "4+"]
@@ -1428,7 +2531,11 @@ def save_figures(output_root: Path, tables: dict[str, pd.DataFrame], fig_dpi: in
                 pivot = pivot.reindex([x for x in order if x in set(fdat["factor_level"].astype(str))])
                 if not pivot.empty:
                     fig, ax = plt.subplots(figsize=(9, 5))
-                    pivot.plot(kind="bar", ax=ax)
+                    pivot.plot(
+                        kind="bar",
+                        ax=ax,
+                        color=[SETUP_DISPLAY_COLORS.get(str(c), "#4C78A8") for c in pivot.columns],
+                    )
                     ax.set_xlabel("Probe count bin")
                     ax.set_ylabel("Success rate")
                     ax.set_ylim(-0.05, 1.05)
@@ -1453,7 +2560,13 @@ def save_figures(output_root: Path, tables: dict[str, pd.DataFrame], fig_dpi: in
                     continue
                 fig, ax = plt.subplots(figsize=(10, 5))
                 for scope_label, g in fdat.groupby("scope_label", dropna=False):
-                    ax.plot(g["factor_level_numeric"], g["mean_success_rate"], marker="o", label=str(scope_label))
+                    ax.plot(
+                        g["factor_level_numeric"],
+                        g["mean_success_rate"],
+                        marker="o",
+                        color=SETUP_DISPLAY_COLORS.get(str(scope_label)),
+                        label=str(scope_label),
+                    )
                 ax.set_xlabel(xlabel)
                 ax.set_ylabel("Success rate")
                 ax.set_ylim(-0.05, 1.05)
@@ -1471,7 +2584,11 @@ def save_figures(output_root: Path, tables: dict[str, pd.DataFrame], fig_dpi: in
                 pivot = fdat.pivot_table(index="factor_level", columns="scope_label", values="mean_success_rate", aggfunc="first")
                 if not pivot.empty:
                     fig, ax = plt.subplots(figsize=(9, 5))
-                    pivot.plot(kind="bar", ax=ax)
+                    pivot.plot(
+                        kind="bar",
+                        ax=ax,
+                        color=[SETUP_DISPLAY_COLORS.get(str(c), "#4C78A8") for c in pivot.columns],
+                    )
                     ax.set_xlabel("Finger")
                     ax.set_ylabel("Success rate")
                     ax.set_ylim(-0.05, 1.05)
@@ -1530,6 +2647,7 @@ def save_figures(output_root: Path, tables: dict[str, pd.DataFrame], fig_dpi: in
     )
     if not scope_manifest.empty:
         paths.extend(Path(p) for p in scope_manifest["figure"])
+    paths.extend(save_reference_figures(output_root, tables, fig_dpi=fig_dpi))
     save_csv(pd.DataFrame({"figure": [str(p) for p in paths]}), output_root, "figure_manifest.csv")
     return paths
 
@@ -1564,6 +2682,10 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
         "probing_setup_metric_summary.csv",
         "probing_setup_condition_metric_summary.csv",
         "probing_between_setup_metric_comparisons.csv",
+        "probing_direction_chosen_success_normalized_summary.csv",
+        "probing_direction_per_setup_counts_success_differences.csv",
+        "probing_direction_per_setup_long_summary.csv",
+        "probing_per_setup_metric_summary_and_differences.csv",
         "probing_scope_figure_manifest.csv",
         "figure_manifest.csv",
     ]

@@ -235,6 +235,8 @@ uv run backend.py
 
 # Start exactly one frontend: pygame...
 uv run frontend_pygame.py
+# Bigger Pygame window, same proportions for text/cubes/bars/etc.
+uv run frontend_pygame.py --display-scale 2
 ```
 
 For VR, start Meta Horizon Link, connect the Quest, and launch
@@ -357,7 +359,7 @@ which app you launch.
   ```bash
   run_pygame.bat
   ```
-  or `uv run frontend_pygame.py`.
+  or `uv run frontend_pygame.py`. To enlarge the Pygame window while keeping all proportions the same, run `uv run frontend_pygame.py --display-scale 2` or set `PYGAME_DISPLAY_SCALE=2`.
 
 - **Unity / Quest VR:**
   1. Put on the headset, plug into the PC, and open the **Meta Quest Link**

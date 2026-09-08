@@ -350,6 +350,8 @@ def figure_category(name: str) -> str:
         "median_xy_trajectory_by_finger"
     ):
         return "movement_orientation"
+    if n.startswith("xy_occupancy_heatmap"):
+        return "movement_orientation"
     if "radiation_orientation" in n or "movement_cycle" in n:
         return "movement_orientation"
     if "hand_orientation" in n:
@@ -4883,6 +4885,12 @@ def _save_interaction_summary_block(
         save_group_xy_trajectory_figures(
             output_root, spatial_tables["subject_xy_trajectory"], fig_dpi=fig_dpi
         )
+        save_group_xy_trajectory_by_setup_figure(
+            output_root, spatial_tables["subject_xy_trajectory"], fig_dpi=fig_dpi
+        )
+        save_workspace_occupancy_figures(
+            output_root, trajectory_time_bins, fig_dpi=fig_dpi
+        )
         save_subject_velocity_acceleration_figures(
             output_root,
             va_tables["subject_velocity_acceleration_profile"],
@@ -6973,6 +6981,483 @@ def save_group_xy_trajectory_figures(
             output_root,
             "group_xy_trajectory_figure_manifest.csv",
         )
+    return paths
+
+
+
+
+
+
+def save_group_xy_trajectory_by_setup_figure(
+    output_root: Path,
+    subject_xy_trajectory: pd.DataFrame,
+    *,
+    fig_dpi: int = 160,
+    fig_dir: Optional[Path] = None,
+    aligned: bool = True,
+) -> list[Path]:
+    """N and L setups side by side in the "median XY trajectory by finger" style.
+
+    One panel per workspace setup (N left, L right), in **workspace centimetres**
+    (the two setups have different camera scales, so pixels would misrepresent
+    the size difference). Thin = each participant's finger-median path, thick =
+    group median of those per-participant medians, o = start, X = end. With
+    ``aligned`` every participant is first rotated onto their principal movement
+    axis (:func:`align_xy_trajectories_to_subject_axis`), which is what makes the
+    group median readable. A third panel pools the fingers and shows the group
+    median path per setup with the across-participant IQR of the along-axis
+    coordinate as a band, so the setup size difference is read directly.
+
+    Written as ``median_xy_trajectory_by_finger{_aligned}_by_setup.png``. No-op if
+    fewer than two setups with more than one participant are present.
+    """
+    paths: list[Path] = []
+    need = {"subject_id", "workspace_setup", "finger_condition", "trajectory_time_bin", "x_workspace_cm", "y_workspace_cm"}
+    if subject_xy_trajectory is None or subject_xy_trajectory.empty or not need.issubset(subject_xy_trajectory.columns):
+        return paths
+    traj = subject_xy_trajectory.copy()
+    traj["finger_condition"] = traj["finger_condition"].map(normalize_finger_condition)
+    for col in ["trajectory_time_bin", "x_workspace_cm", "y_workspace_cm"]:
+        traj[col] = pd.to_numeric(traj[col], errors="coerce")
+    traj = traj.dropna(subset=["x_workspace_cm", "y_workspace_cm", "trajectory_time_bin"])
+    # Work in cm under the px column names so the alignment helper can be reused.
+    traj["x_centered_px"] = traj["x_workspace_cm"]
+    traj["y_centered_px"] = traj["y_workspace_cm"]
+    if aligned:
+        traj = align_xy_trajectories_to_subject_axis(traj)
+    setups = [s for s in ["N", "L"] if s in set(traj["workspace_setup"].astype(str))]
+    setups += sorted(set(traj["workspace_setup"].astype(str)) - set(setups))
+    setups = [s for s in setups if traj.loc[traj["workspace_setup"].astype(str) == s, "subject_id"].nunique() > 1]
+    if len(setups) < 2:
+        return paths
+
+    def _median_path(df: pd.DataFrame) -> pd.DataFrame:
+        return (
+            df.groupby("trajectory_time_bin", as_index=False)
+            .agg(x=("x_centered_px", "median"), y=("y_centered_px", "median"))
+            .sort_values("trajectory_time_bin")
+        )
+
+    xy_limits = _centered_limits_from_columns(traj, ["x_centered_px", "y_centered_px"])
+    if aligned:
+        xlabel, ylabel = "Along participant movement axis (cm)", "Across participant movement axis (cm)"
+    else:
+        xlabel, ylabel = "X from workspace centre (cm)", "Y from workspace centre (cm)"
+
+    fig, axes = plt.subplots(1, len(setups) + 1, figsize=(6.4 * (len(setups) + 1), 6.6), layout="constrained")
+    pooled: dict[str, pd.DataFrame] = {}
+    for ax, setup in zip(axes[: len(setups)], setups):
+        g_rows = traj[traj["workspace_setup"].astype(str) == setup]
+        n_subjects = int(g_rows["subject_id"].nunique())
+        per_subject_all: list[pd.DataFrame] = []
+        for finger in _ordered_fingers(g_rows["finger_condition"].dropna().unique()):
+            f_df = g_rows[g_rows["finger_condition"] == finger]
+            color = FINGER_TO_COLOR.get(str(finger), "#777777")
+            per_subject: list[pd.DataFrame] = []
+            for sid, s in f_df.groupby("subject_id"):
+                avg_s = _median_path(s)
+                if avg_s.empty:
+                    continue
+                per_subject.append(avg_s.assign(subject_id=sid, finger_condition=finger))
+                ax.plot(avg_s["x"], avg_s["y"], color=color, alpha=0.22, linewidth=1.0)
+                ax.scatter(avg_s["x"].iloc[0], avg_s["y"].iloc[0], color=color, alpha=0.25, s=14, marker="o")
+                ax.scatter(avg_s["x"].iloc[-1], avg_s["y"].iloc[-1], color=color, alpha=0.25, s=18, marker="x")
+            if not per_subject:
+                continue
+            stacked = pd.concat(per_subject, ignore_index=True)
+            per_subject_all.append(stacked)
+            avg = stacked.groupby("trajectory_time_bin", as_index=False).agg(x=("x", "median"), y=("y", "median")).sort_values("trajectory_time_bin")
+            ax.plot(avg["x"], avg["y"], color=color, linewidth=3.0, label=FINGER_LABELS.get(str(finger), str(finger)))
+            ax.scatter(avg["x"].iloc[0], avg["y"].iloc[0], color=color, edgecolor="black", s=45, marker="o", zorder=5)
+            ax.scatter(avg["x"].iloc[-1], avg["y"].iloc[-1], color=color, edgecolor="black", s=55, marker="X", zorder=5)
+        if per_subject_all:
+            pooled[setup] = pd.concat(per_subject_all, ignore_index=True)
+        ax.axhline(0, color="0.65", linewidth=0.8)
+        ax.axvline(0, color="0.65", linewidth=0.8)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(*xy_limits)
+        ax.set_ylim(*xy_limits)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{setup} workspace (n={n_subjects}): median XY trajectory by finger", fontsize=10)
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(alpha=0.2)
+
+    # Pooled-over-fingers comparison: median path per setup + IQR band along the axis.
+    ax = axes[-1]
+    for setup in setups:
+        st = pooled.get(setup)
+        if st is None or st.empty:
+            continue
+        color = GROUP_TO_COLOR.get(setup, "#444444")
+        # per participant (pooling fingers) then across participants
+        per_part = st.groupby(["subject_id", "trajectory_time_bin"], as_index=False).agg(x=("x", "median"), y=("y", "median"))
+        grp = per_part.groupby("trajectory_time_bin")
+        med = grp.agg(x=("x", "median"), y=("y", "median"), x25=("x", lambda v: v.quantile(0.25)), x75=("x", lambda v: v.quantile(0.75))).sort_index()
+        ax.fill_betweenx(med["y"], med["x25"], med["x75"], color=color, alpha=0.15, lw=0)
+        ax.plot(med["x"], med["y"], color=color, linewidth=3.0, label=f"{setup} workspace (n={per_part['subject_id'].nunique()})")
+        ax.scatter(med["x"].iloc[0], med["y"].iloc[0], color=color, edgecolor="black", s=45, marker="o", zorder=5)
+        ax.scatter(med["x"].iloc[-1], med["y"].iloc[-1], color=color, edgecolor="black", s=55, marker="X", zorder=5)
+    ax.axhline(0, color="0.65", linewidth=0.8)
+    ax.axvline(0, color="0.65", linewidth=0.8)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(*xy_limits)
+    ax.set_ylim(*xy_limits)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title("Setups overlaid, fingers pooled" + chr(10) + "group median path, band = across-participant IQR along the axis", fontsize=10)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(alpha=0.2)
+
+    frame_note = "each participant rotated onto their principal movement axis; " if aligned else ""
+    fig.suptitle(
+        f"Median XY trajectory by finger, N vs L workspace (cm)\n"
+        f"{frame_note}thin = per-participant finger median, thick = group median; o = start, X = end",
+        fontsize=11,
+    )
+    fig_out = Path(fig_dir) if fig_dir is not None else _figures_base(output_root) / "subject_xy_trajectories"
+    fig_out.mkdir(parents=True, exist_ok=True)
+    out = fig_out / f"median_xy_trajectory_by_finger{'_aligned' if aligned else ''}_by_setup.png"
+    fig.savefig(out, dpi=fig_dpi)
+    plt.close(fig)
+    paths.append(out)
+    return paths
+
+
+# --- Workspace occupancy (group-level 2-D heatmaps + radial profile) -----------
+OCCUPANCY_BIN_CM = 2.0
+OCCUPANCY_HALF_EXTENT_CM = (48.0, 38.0)  # covers the 80x60 L workspace plus overshoot
+
+
+def _drop_lost_tracking_corner_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove samples that sit exactly on the bottom-left workspace corner.
+
+    A lost detection is written as raw pixel (0, 0), which after centring lands on
+    the corner (-width/2, -height/2) of the workspace; a handful of such rows per
+    group would otherwise show up as a spurious hot cell in the occupancy maps.
+    """
+    if not {"x_workspace_cm", "y_workspace_cm", "workspace_width_cm", "workspace_height_cm"}.issubset(df.columns):
+        return df
+    x = pd.to_numeric(df["x_workspace_cm"], errors="coerce")
+    y = pd.to_numeric(df["y_workspace_cm"], errors="coerce")
+    w = pd.to_numeric(df["workspace_width_cm"], errors="coerce")
+    h = pd.to_numeric(df["workspace_height_cm"], errors="coerce")
+    corner = np.isclose(x, -w / 2, atol=1e-6) & np.isclose(y, -h / 2, atol=1e-6)
+    return df[~np.asarray(corner, dtype=bool)]
+
+
+def _occupancy_grid(
+    df: pd.DataFrame, bin_cm: float, half_extent: tuple[float, float]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Participant-weighted occupancy: mean over subjects of each subject's
+    normalised 2-D histogram (each subject sums to 1). Returns (H %, xedges, yedges)."""
+    hx, hy = half_extent
+    xedges = np.arange(-hx, hx + bin_cm, bin_cm)
+    yedges = np.arange(-hy, hy + bin_cm, bin_cm)
+    grids: list[np.ndarray] = []
+    for _, s in df.groupby("subject_id"):
+        x = s["x_workspace_cm"].to_numpy(dtype=float)
+        y = s["y_workspace_cm"].to_numpy(dtype=float)
+        ok = np.isfinite(x) & np.isfinite(y)
+        if ok.sum() == 0:
+            continue
+        h, _, _ = np.histogram2d(x[ok], y[ok], bins=[xedges, yedges])
+        if h.sum() > 0:
+            grids.append(h / h.sum())
+    if not grids:
+        return np.zeros((len(xedges) - 1, len(yedges) - 1)), xedges, yedges
+    return 100.0 * np.mean(grids, axis=0), xedges, yedges
+
+
+def _participant_bin_profile(
+    df: pd.DataFrame, value_col: str, n_time_bins: int
+) -> pd.DataFrame:
+    """Per subject x time bin median of ``value_col`` (equal weight per segment),
+    then group median / IQR per bin. Columns: bin, time, median, q25, q75, n."""
+    per_subject = (
+        df.groupby(["subject_id", "trajectory_time_bin"], as_index=False)[value_col]
+        .median()
+    )
+    grp = per_subject.groupby("trajectory_time_bin")[value_col]
+    out = pd.DataFrame(
+        {
+            "trajectory_time_bin": grp.median().index,
+            "median": grp.median().to_numpy(),
+            "q25": grp.quantile(0.25).to_numpy(),
+            "q75": grp.quantile(0.75).to_numpy(),
+            "n_subjects": grp.size().to_numpy(),
+        }
+    )
+    out["time"] = (out["trajectory_time_bin"] - 0.5) / float(n_time_bins)
+    return out.sort_values("trajectory_time_bin")
+
+
+def compute_workspace_occupancy_analysis(
+    trajectory_time_bins: pd.DataFrame,
+    *,
+    n_time_bins: int = 50,
+) -> dict[str, pd.DataFrame]:
+    """Setup-level (N vs L workspace) spatial-extent tables behind the occupancy figure.
+
+    Uses the per-segment time bins (50 per stiffness segment) in **workspace
+    centimetres** so the two setups, which have different camera scales, are
+    comparable. Returns:
+
+    * ``radial_profile_by_setup``: group median + IQR (across participants) of the
+      radial distance from the workspace centre per normalised time bin.
+    * ``radiality_profile_by_setup``: same for the radiality index
+      ``|v_r| / (|v_r| + |v_t|)`` (1 = purely radial, 0 = purely tangential).
+    * ``spatial_extent_by_participant``: per participant peak radius (95th
+      percentile of r), mean radiality and time-weighted mean |x|, |y|.
+    * ``spatial_extent_by_setup``: median / IQR of those across participants.
+    """
+    need = {
+        "subject_id", "workspace_setup", "trajectory_time_bin",
+        "x_workspace_cm", "y_workspace_cm", "r_workspace_cm",
+        "radial_velocity_cm_s", "tangential_velocity_cm_s",
+    }
+    empty = {
+        k: pd.DataFrame()
+        for k in [
+            "radial_profile_by_setup", "radiality_profile_by_setup",
+            "spatial_extent_by_participant", "spatial_extent_by_setup",
+        ]
+    }
+    if trajectory_time_bins is None or trajectory_time_bins.empty or not need.issubset(trajectory_time_bins.columns):
+        return empty
+    d = _drop_lost_tracking_corner_rows(trajectory_time_bins)
+    d = d[list((need | {"finger_condition", "workspace_width_cm", "workspace_height_cm"}) & set(d.columns))].copy()
+    for c in need - {"subject_id", "workspace_setup"}:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["x_workspace_cm", "y_workspace_cm", "trajectory_time_bin"])
+    vr = d["radial_velocity_cm_s"].abs()
+    vt = d["tangential_velocity_cm_s"].abs()
+    denom = vr + vt
+    d["radiality_index"] = np.where(denom > 1e-9, vr / denom, np.nan)
+
+    radial_rows, radiality_rows, part_rows = [], [], []
+    for setup, s in d.groupby("workspace_setup"):
+        rp = _participant_bin_profile(s, "r_workspace_cm", n_time_bins).assign(workspace_setup=setup)
+        radial_rows.append(rp)
+        ri = _participant_bin_profile(s, "radiality_index", n_time_bins).assign(workspace_setup=setup)
+        radiality_rows.append(ri)
+        for sid, p in s.groupby("subject_id"):
+            part_rows.append(
+                {
+                    "workspace_setup": setup,
+                    "subject_id": sid,
+                    "peak_radius_cm_p95": float(np.nanpercentile(p["r_workspace_cm"], 95)),
+                    "median_radius_cm": float(np.nanmedian(p["r_workspace_cm"])),
+                    "mean_abs_x_cm": float(np.nanmean(np.abs(p["x_workspace_cm"]))),
+                    "mean_abs_y_cm": float(np.nanmean(np.abs(p["y_workspace_cm"]))),
+                    "mean_radiality_index": float(np.nanmean(p["radiality_index"])),
+                    "n_time_bin_rows": int(len(p)),
+                }
+            )
+    by_participant = pd.DataFrame(part_rows)
+    metrics = ["peak_radius_cm_p95", "median_radius_cm", "mean_abs_x_cm", "mean_abs_y_cm", "mean_radiality_index"]
+    by_setup_rows = []
+    for setup, p in by_participant.groupby("workspace_setup"):
+        for m in metrics:
+            by_setup_rows.append(
+                {
+                    "workspace_setup": setup,
+                    "metric": m,
+                    "n_participants": int(p["subject_id"].nunique()),
+                    "median": float(p[m].median()),
+                    "q25": float(p[m].quantile(0.25)),
+                    "q75": float(p[m].quantile(0.75)),
+                    "mean": float(p[m].mean()),
+                    "sd": float(p[m].std(ddof=1)) if len(p) > 1 else np.nan,
+                }
+            )
+    return {
+        "radial_profile_by_setup": pd.concat(radial_rows, ignore_index=True) if radial_rows else pd.DataFrame(),
+        "radiality_profile_by_setup": pd.concat(radiality_rows, ignore_index=True) if radiality_rows else pd.DataFrame(),
+        "spatial_extent_by_participant": by_participant,
+        "spatial_extent_by_setup": pd.DataFrame(by_setup_rows),
+    }
+
+
+def save_workspace_occupancy_figures(
+    output_root: Path,
+    trajectory_time_bins: pd.DataFrame,
+    *,
+    n_time_bins: int = 50,
+    bin_cm: float = OCCUPANCY_BIN_CM,
+    fig_dpi: int = 160,
+    fig_dir: Optional[Path] = None,
+) -> list[Path]:
+    """Group-level 2-D occupancy heatmaps + radial profile per workspace setup.
+
+    Reviewer-facing replacement for single-subject example trajectories: pooled
+    over every participant of each setup (N vs L), in workspace centimetres, with
+    equal weight per participant (each participant's histogram is normalised
+    before averaging). Writes
+
+    * ``xy_occupancy_heatmap_radial_profile_by_setup.png`` -- top row: occupancy
+      heatmap per setup (shared colour scale and axes, dashed = physical
+      workspace outline); bottom row: median radial distance from the centre
+      vs normalised segment time with the across-participant IQR band, and the
+      radiality index ``|v_r|/(|v_r|+|v_t|)`` with IQR, one curve per setup.
+    * ``xy_occupancy_heatmap_by_setup_finger.png`` -- the heatmaps split by
+      finger (rows = setup, columns = finger), shared colour scale.
+    * ``workspace_occupancy_*.csv`` tables from
+      :func:`compute_workspace_occupancy_analysis`.
+
+    Only produced when at least one setup has more than one participant and the
+    time-bin table carries workspace-cm coordinates. Skipped otherwise.
+    """
+    paths: list[Path] = []
+    tables = compute_workspace_occupancy_analysis(trajectory_time_bins, n_time_bins=n_time_bins)
+    if tables["spatial_extent_by_participant"].empty:
+        return paths
+    n_per_setup = tables["spatial_extent_by_participant"].groupby("workspace_setup")["subject_id"].nunique()
+    if n_per_setup.max() <= 1:
+        return paths
+
+    d = _drop_lost_tracking_corner_rows(trajectory_time_bins).copy()
+    for c in ["x_workspace_cm", "y_workspace_cm", "workspace_width_cm", "workspace_height_cm"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["x_workspace_cm", "y_workspace_cm"])
+    d["finger_condition"] = d["finger_condition"].map(normalize_finger_condition) if "finger_condition" in d.columns else np.nan
+    setups = [s for s in ["N", "L"] if s in set(d["workspace_setup"].astype(str))]
+    setups += sorted(set(d["workspace_setup"].astype(str)) - set(setups))
+    half_extent = OCCUPANCY_HALF_EXTENT_CM
+
+    def _setup_label(setup: str, sub: pd.DataFrame) -> str:
+        w = sub["workspace_width_cm"].dropna().iloc[0] if "workspace_width_cm" in sub and sub["workspace_width_cm"].notna().any() else np.nan
+        h = sub["workspace_height_cm"].dropna().iloc[0] if "workspace_height_cm" in sub and sub["workspace_height_cm"].notna().any() else np.nan
+        n = int(sub["subject_id"].nunique())
+        size = f" ({w:g}x{h:g} cm)" if np.isfinite(w) and np.isfinite(h) else ""
+        return f"{setup} workspace{size}, n={n}"
+
+    def _draw_heatmap(ax: plt.Axes, H: np.ndarray, xe: np.ndarray, ye: np.ndarray, sub: pd.DataFrame, vmax: float, title: str):
+        from matplotlib.colors import PowerNorm
+        from matplotlib.patches import Rectangle
+
+        im = ax.imshow(
+            H.T, origin="lower", extent=[xe[0], xe[-1], ye[0], ye[-1]],
+            cmap="magma", norm=PowerNorm(gamma=0.5, vmin=0, vmax=vmax), aspect="equal",
+        )
+        w = sub["workspace_width_cm"].dropna()
+        h = sub["workspace_height_cm"].dropna()
+        if not w.empty and not h.empty:
+            ax.add_patch(Rectangle((-w.iloc[0] / 2, -h.iloc[0] / 2), w.iloc[0], h.iloc[0], fill=False, ls="--", lw=1.0, ec="white"))
+        ax.axhline(0, color="white", lw=0.4, alpha=0.5)
+        ax.axvline(0, color="white", lw=0.4, alpha=0.5)
+        ax.set_xlim(xe[0], xe[-1])
+        ax.set_ylim(ye[0], ye[-1])
+        ax.set_xlabel("X from workspace centre (cm)")
+        ax.set_ylabel("Y from workspace centre (cm)")
+        ax.set_title(title, fontsize=10)
+        return im
+
+    fig_out = Path(fig_dir) if fig_dir is not None else _figures_base(output_root) / "workspace_occupancy"
+    fig_out.mkdir(parents=True, exist_ok=True)
+    setup_color = {s: GROUP_TO_COLOR.get(s, "#444444") for s in setups}
+
+    # ---- Figure 1: heatmap per setup + radial / radiality profiles -------------
+    grids = {s: _occupancy_grid(d[d["workspace_setup"].astype(str) == s], bin_cm, half_extent) for s in setups}
+    vmax = max(float(np.nanpercentile(H, 99.5)) for H, _, _ in grids.values()) or 1.0
+    if len(setups) == 1:
+        # One setup (a single-group run): heatmap + the two profiles in one row.
+        fig, row = plt.subplots(1, 3, figsize=(17.0, 5.6), layout="constrained")
+        heat_axes = [row[0]]
+        ax_r, ax_i = row[1], row[2]
+    else:
+        ncols = len(setups)
+        fig, axes = plt.subplots(2, ncols, figsize=(5.6 * ncols, 10.0), layout="constrained")
+        axes = np.atleast_2d(axes)
+        heat_axes = list(axes[0, :])
+        ax_r, ax_i = axes[1, 0], axes[1, 1]
+        for j in range(2, ncols):
+            axes[1, j].axis("off")
+    im = None
+    for ax, s in zip(heat_axes, setups):
+        sub = d[d["workspace_setup"].astype(str) == s]
+        H, xe, ye = grids[s]
+        im = _draw_heatmap(ax, H, xe, ye, sub, vmax, f"Occupancy, {_setup_label(s, sub)}")
+    if im is not None:
+        cb = fig.colorbar(im, ax=heat_axes, shrink=0.85, pad=0.02)
+        cb.set_label(f"% of a participant's movement time per {bin_cm:g}x{bin_cm:g} cm cell (sqrt scale)", fontsize=8)
+    for s in setups:
+        rp = tables["radial_profile_by_setup"]
+        rp = rp[rp["workspace_setup"].astype(str) == s]
+        ri = tables["radiality_profile_by_setup"]
+        ri = ri[ri["workspace_setup"].astype(str) == s]
+        c = setup_color[s]
+        ax_r.fill_between(rp["time"], rp["q25"], rp["q75"], color=c, alpha=0.2, lw=0)
+        ax_r.plot(rp["time"], rp["median"], color=c, lw=2.2, label=f"{s} workspace")
+        ax_i.fill_between(ri["time"], ri["q25"], ri["q75"], color=c, alpha=0.2, lw=0)
+        ax_i.plot(ri["time"], ri["median"], color=c, lw=2.2, label=f"{s} workspace")
+    ax_r.set_xlabel("Normalised time within stiffness segment")
+    ax_r.set_ylabel("Radial distance from centre (cm)")
+    ax_r.set_title("Median radial distance, IQR across participants", fontsize=10)
+    ax_r.set_xlim(0, 1)
+    ax_r.grid(alpha=0.2)
+    ax_r.legend(fontsize=8)
+    ax_i.set_xlabel("Normalised time within stiffness segment")
+    ax_i.set_ylabel("Radiality index |v_r| / (|v_r| + |v_t|)")
+    ax_i.set_title("Radiality index (1 = purely radial), IQR across participants", fontsize=10)
+    ax_i.set_xlim(0, 1)
+    ax_i.set_ylim(0, 1)
+    ax_i.axhline(0.5, color="0.6", lw=0.8, ls=":")
+    ax_i.grid(alpha=0.2)
+    ax_i.legend(fontsize=8)
+    fig.suptitle(
+        "Group-level workspace occupancy per setup\n"
+        "heatmaps: each participant's time-normalised occupancy averaged across participants (equal weight); "
+        "dashed = physical workspace",
+        fontsize=11,
+    )
+    out = fig_out / "xy_occupancy_heatmap_radial_profile_by_setup.png"
+    fig.savefig(out, dpi=fig_dpi)
+    plt.close(fig)
+    paths.append(out)
+
+    # ---- Figure 2: heatmaps split by finger -----------------------------------
+    fingers = _ordered_fingers(d["finger_condition"].dropna().unique()) if "finger_condition" in d.columns else []
+    if fingers and len(setups) >= 1:
+        f_grids = {
+            (s, f): _occupancy_grid(
+                d[(d["workspace_setup"].astype(str) == s) & (d["finger_condition"] == f)], bin_cm, half_extent
+            )
+            for s in setups
+            for f in fingers
+        }
+        vmax_f = max(float(np.nanpercentile(H, 99.5)) for H, _, _ in f_grids.values()) or 1.0
+        fig, axes = plt.subplots(len(setups), len(fingers), figsize=(4.4 * len(fingers), 4.0 * len(setups)), squeeze=False)
+        im = None
+        for i, s in enumerate(setups):
+            for j, f in enumerate(fingers):
+                sub = d[(d["workspace_setup"].astype(str) == s) & (d["finger_condition"] == f)]
+                H, xe, ye = f_grids[(s, f)]
+                n = int(sub["subject_id"].nunique())
+                im = _draw_heatmap(axes[i, j], H, xe, ye, sub, vmax_f, f"{s} workspace, {FINGER_LABELS.get(str(f), str(f))} (n={n})")
+                if j > 0:
+                    axes[i, j].set_ylabel("")
+                if i < len(setups) - 1:
+                    axes[i, j].set_xlabel("")
+        if im is not None:
+            cb = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.02, shrink=0.9)
+            cb.set_label(f"% of movement time per {bin_cm:g}x{bin_cm:g} cm cell (sqrt scale)", fontsize=8)
+        fig.suptitle("Group-level workspace occupancy per setup and finger (equal weight per participant; dashed = physical workspace)", fontsize=11)
+        out = fig_out / "xy_occupancy_heatmap_by_setup_finger.png"
+        fig.savefig(out, dpi=fig_dpi, bbox_inches="tight")
+        plt.close(fig)
+        paths.append(out)
+
+    for key, name in [
+        ("radial_profile_by_setup", "workspace_occupancy_radial_profile_by_setup.csv"),
+        ("radiality_profile_by_setup", "workspace_occupancy_radiality_profile_by_setup.csv"),
+        ("spatial_extent_by_participant", "workspace_occupancy_extent_by_participant.csv"),
+        ("spatial_extent_by_setup", "workspace_occupancy_extent_by_setup.csv"),
+    ]:
+        if not tables[key].empty:
+            save_csv(tables[key], output_root, name)
+    save_csv(pd.DataFrame({"figure": [str(p) for p in paths]}), output_root, "workspace_occupancy_figure_manifest.csv")
     return paths
 
 

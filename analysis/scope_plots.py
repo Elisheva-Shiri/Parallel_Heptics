@@ -37,6 +37,24 @@ LEVEL_SPECS = [
 ]
 MAX_RAW_VALUES_PER_SUMMARY_POINT = 80
 MAX_SUMMARY_PLOT_ROWS = 160
+SETUP_DISPLAY_LABELS = {
+    "no_airsled": "N",
+    "airsled": "L",
+    "N_E": "N",
+    "N_P": "N",
+    "L_E": "L",
+    "L_P": "L",
+}
+SETUP_DISPLAY_COLORS = {
+    "no_airsled": "#7B3294",  # N / natural / no airsled = purple
+    "N": "#7B3294",
+    "N_E": "#7B3294",
+    "N_P": "#7B3294",
+    "airsled": "#E78AC3",  # L / airsled = pink
+    "L": "#E78AC3",
+    "L_E": "#E78AC3",
+    "L_P": "#E78AC3",
+}
 
 
 def sanitize_name(value: Any, fallback: str = "unknown") -> str:
@@ -53,8 +71,12 @@ def _short_label(value: Any) -> str:
         "correct_response": "success",
         "experiment_group": "group",
         "setup_factor": "setup",
-        "no_airsled": "N/no air",
-        "airsled": "L/air",
+        "no_airsled": "N",
+        "airsled": "L",
+        "N_E": "N",
+        "N_P": "N",
+        "L_E": "L",
+        "L_P": "L",
         "standard": "std",
         "comparison": "cmp",
     }
@@ -72,8 +94,8 @@ def _plot_label(row: pd.Series, x_cols: list[str]) -> str:
 
 def _bar_colors(df: pd.DataFrame, x_cols: list[str]) -> list[Any]:
     finger_colors = {"I": "#1f77b4", "M": "#ff7f0e", "R": "#2ca02c", "P": "#d62728"}
-    setup_colors = {"no_airsled": "#D55E00", "airsled": "#0072B2", "N": "#D55E00", "L": "#0072B2"}
-    group_colors = {"N_E": "#D55E00", "L_E": "#0072B2", "L_P": "#009E73"}
+    setup_colors = SETUP_DISPLAY_COLORS
+    group_colors = SETUP_DISPLAY_COLORS
     for col, palette in [("finger_condition", finger_colors), ("setup_factor", setup_colors), ("experiment_group", group_colors)]:
         if col in df.columns:
             return [palette.get(str(v), "#4C78A8") for v in df[col]]

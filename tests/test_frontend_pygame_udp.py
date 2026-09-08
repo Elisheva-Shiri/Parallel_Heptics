@@ -2,8 +2,10 @@ import pytest
 
 from frontend_pygame import (
     _control_payload,
+    _display_scale_from_env,
     _fallback_visual_cue_radius_pixels,
     _recv_latest_datagram,
+    _scaled_window_size,
     _should_show_cycle_counter,
 )
 from structures import ControlAction, ExperimentControl, TrackingObject, VisualCueMode
@@ -83,3 +85,26 @@ def test_fallback_visual_cue_radius_is_not_progress_clamped():
     assert _fallback_visual_cue_radius_pixels(tracking_obj, 640, 480) == pytest.approx(
         480.0 + 20.0
     )
+
+
+def test_scaled_window_size_preserves_ratio_with_uniform_scale():
+    assert _scaled_window_size(640, 480, 2.0) == (1280, 960)
+    assert _scaled_window_size(640, 480, 1.5) == (960, 720)
+
+
+def test_scaled_window_size_rejects_non_positive_scale():
+    with pytest.raises(ValueError, match="greater than 0"):
+        _scaled_window_size(640, 480, 0)
+
+
+def test_display_scale_from_env_uses_positive_number(monkeypatch):
+    monkeypatch.setenv("PYGAME_DISPLAY_SCALE", "2.5")
+
+    assert _display_scale_from_env() == 2.5
+
+
+def test_display_scale_from_env_rejects_invalid_value(monkeypatch):
+    monkeypatch.setenv("PYGAME_DISPLAY_SCALE", "big")
+
+    with pytest.raises(ValueError, match="PYGAME_DISPLAY_SCALE"):
+        _display_scale_from_env()

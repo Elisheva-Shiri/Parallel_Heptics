@@ -38,13 +38,13 @@ PROTOCOL_GROUP_ORDER = ["N_P", "L_P", "E_P"]
 SUBGROUP_ORDER = ["N", "L", "P", "E"]
 SETUP_FACTOR_ORDER = ["no_airsled", "airsled"]
 SETUP_FACTOR_LABELS = {
-    "airsled": "with_airsled_L",
-    "no_airsled": "without_airsled_N",
+    "airsled": "L",
+    "no_airsled": "N",
 }
 MAX_SUMMARY_RAW_VALUES = 80
 EXPERIMENT_GROUP_LABELS = {
-    "N_E": "natural_experiment",
-    "L_E": "lab_experiment",
+    "N_E": "N",
+    "L_E": "L",
     "N_P": "natural_protocol",
     "L_P": "lab_protocol",
     "E_P": "experiment_protocol",

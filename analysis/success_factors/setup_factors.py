@@ -40,7 +40,10 @@ except ModuleNotFoundError:  # pragma: no cover - supports running from this fol
     )
     from analysis.scope_plots import save_scope_summary_plots
 
-SETUP_COLORS = {"no_airsled": "#D55E00", "airsled": "#0072B2"}
+SETUP_COLORS = {
+    "no_airsled": "#7B3294",  # N / natural / no airsled = purple
+    "airsled": "#E78AC3",  # L / airsled = pink
+}
 SETUP_X = {"no_airsled": 0.0, "airsled": 1.0}
 
 DEFAULT_TABLE_SPECS: list[dict[str, Any]] = [

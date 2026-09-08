@@ -248,7 +248,8 @@ todo.md
 analysis/motor_response_experiment/responses/
 
 # Motor response analyzer servo generated responses
-analysis/motor_response_analizer_servo/responses/
+validetion/Servomotor/responses/
+validetion/Servomotor/output/
 
 # Generated result folders anywhere in the repo
 **/[Rr]esult/
@@ -288,3 +289,8 @@ analysis/**/plots/
 # Report generation artifacts
 paper/report_script/
 *.3mf
+
+# Large generated/raw data folders (checkpoint 2026-09-08)
+analysis/Kinematics/result_fillter/
+analysis/Kinematics/output/
+analysis/success_factors/results_fillter/

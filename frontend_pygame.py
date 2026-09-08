@@ -1,3 +1,5 @@
+import argparse
+import os
 import pygame
 import random
 import socket
@@ -16,6 +18,33 @@ AMBIENT_NOISE_LOW_PASS_ALPHA = 0.075
 AMBIENT_NOISE_RAW_MIX = 0.16
 # Full-size visual cue radius. MOVEMENT_AREA_SCALE controls the active fraction.
 OUTBOUND_CUE_RADIUS = 215
+DISPLAY_SCALE_ENV = "PYGAME_DISPLAY_SCALE"
+
+
+def _validate_display_scale(display_scale: float) -> float:
+    if display_scale <= 0:
+        raise ValueError("display_scale must be greater than 0")
+    return display_scale
+
+
+def _scaled_window_size(
+    width: int, height: int, display_scale: float
+) -> tuple[int, int]:
+    display_scale = _validate_display_scale(display_scale)
+    return (max(1, round(width * display_scale)), max(1, round(height * display_scale)))
+
+
+def _display_scale_from_env(default: float = 1.0) -> float:
+    value = os.environ.get(DISPLAY_SCALE_ENV)
+    if value is None or value.strip() == "":
+        return _validate_display_scale(default)
+    try:
+        return _validate_display_scale(float(value))
+    except ValueError as ex:
+        raise ValueError(
+            f"{DISPLAY_SCALE_ENV} must be a positive number, got {value!r}"
+        ) from ex
+
 
 def _should_show_cycle_counter(target_cycle_count: int) -> bool:
     return target_cycle_count > 1
@@ -150,9 +179,18 @@ class PygameFrontEnd:
         frontend_port: int = PYGAME_PORT,
         backend_port: int = BACKEND_PORT,
         white_noise_volume: float = WHITE_NOISE_VOLUME,
+        display_scale: float | None = None,
     ):
         self._width = width
         self._height = height
+        self._display_scale = (
+            _display_scale_from_env()
+            if display_scale is None
+            else _validate_display_scale(display_scale)
+        )
+        self._window_size = _scaled_window_size(
+            self._width, self._height, self._display_scale
+        )
         self._server_address=server_address
         self._frontend_port=frontend_port
         self._backend_port=backend_port
@@ -186,8 +224,15 @@ class PygameFrontEnd:
         pygame.font.init()
         self._font = pygame.font.SysFont('Arial', 30)
         self._title_font = pygame.font.SysFont('Arial', 40)
-        self.screen = pygame.display.set_mode((self._width, self._height))
-        pygame.display.set_caption("Hand Tracking Visualization")
+        self._display_surface = pygame.display.set_mode(self._window_size)
+        self.screen = (
+            self._display_surface
+            if self._display_scale == 1.0
+            else pygame.Surface((self._width, self._height))
+        )
+        pygame.display.set_caption(
+            f"Hand Tracking Visualization ({self._window_size[0]}x{self._window_size[1]})"
+        )
         self._white_noise.start()
 
     
@@ -419,6 +464,11 @@ class PygameFrontEnd:
                 pygame.draw.circle(self.screen, (211, 211, 211),
                                 (int(finger_position.x * self._width), int(finger_position.z * self._height)), 5)
 
+        if self.screen is not self._display_surface:
+            pygame.transform.smoothscale(
+                self.screen, self._window_size, self._display_surface
+            )
+
         pygame.display.flip()
 
     def _handle_pygame_events(self, event: pygame.event.Event) -> bool:
@@ -439,6 +489,22 @@ class PygameFrontEnd:
         return True
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the Pygame experiment frontend.")
+    parser.add_argument(
+        "--display-scale",
+        "--scale",
+        type=float,
+        default=None,
+        help=(
+            "Scale the Pygame window while preserving the 640x480 logical ratio. "
+            f"Can also be set with {DISPLAY_SCALE_ENV}. Example: --display-scale 2"
+        ),
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    frontend = PygameFrontEnd()
-    frontend.start()    
+    args = _parse_args()
+    frontend = PygameFrontEnd(display_scale=args.display_scale)
+    frontend.start()

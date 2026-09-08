@@ -1,2 +1,3 @@
-& "c:/Users/user/BIO MEDICAL ROBOTICS Dropbox/Elisheva Shiri Decktor/BGU/Codes/Parallel_Heptics/.venv/Scripts/python.exe" "c:/Users/user/BIO MEDICAL ROBOTICS Dropbox/Elisheva Shiri Decktor/BGU/Codes/Parallel_Heptics/hello.py"
-& "c:/Users/user/BIO MEDICAL ROBOTICS Dropbox/Elisheva Shiri Decktor/BGU/Codes/Parallel_Heptics/.venv/Scripts/python.exe" "c:/Users/user/BIO MEDICAL ROBOTICS Dropbox/Elisheva Shiri Decktor/BGU/Codes/Parallel_Heptics/pygame_frontend.py"
+@echo off
+cd /d "%~dp0"
+".venv\Scripts\python.exe" "frontend_pygame.py" %*
