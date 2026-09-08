@@ -10,24 +10,24 @@ finger on PSE bias or JND. A non-significant test is "absence of evidence", not
 perceptually equivalent -- we run a Two One-Sided Tests (TOST) equivalence test.
 
 TOST logic (Lakens, 2017; Schuirmann, 1987):
-  Pick a smallest effect size of interest (SESOI). Here SESOI = +/- 5 mm/m, the
-  same +/-5 mm/m band the paper already uses to call a participant "unbiased"
-  (about 6% of the 85 mm/m standard). Two one-sided t-tests then ask whether the
+  Pick a smallest effect size of interest (SESOI). Here SESOI = +/- 0.5 mm/m, the
+  same +/-0.5 mm/m band the paper already uses to call a participant "unbiased"
+  (about 6% of the 8.5 mm/m standard). Two one-sided t-tests then ask whether the
   effect is reliably *inside* (-SESOI, +SESOI). If the 90% CI of the effect lies
   entirely within the band (equivalently max(p_lower, p_upper) < alpha), we
   declare statistical equivalence.
 
 WHAT IT TESTS
 -------------
-  (A) One-sample TOST per finger: is that finger's mean PSE bias within +/-5 of 0?
+  (A) One-sample TOST per finger: is that finger's mean PSE bias within +/-0.5 mm/m of 0?
   (B) Paired TOST for every finger pair: is the per-subject PSE-bias difference
-      within +/-5?
+      within +/-0.5 mm/m?
   (C) Welch two-sample TOST for Setup (L = air-slide vs N = natural), Lakens
       2017 eq. 3-4: is the L - N difference in bias and in JND within the
       equivalence bounds? Run on the per-subject mean over fingers (one value
       per participant, so the test unit matches the ANOVA) and within each
-      finger. Reported at two pre-specified bounds: the primary +/-5 mm/m band
-      and a secondary +/-10 mm/m band (a difference smaller than the 12 mm/m
+      finger. Reported at two pre-specified bounds: the primary +/-0.5 mm/m band
+      and a secondary +/-1.0 mm/m band (a difference smaller than the 1.5 mm/m
       spacing between adjacent comparison stimuli). A Bayes factor (BF10,
       JZS default prior via pingouin, when installed) is given next to each
       TOST so frequentist and Bayesian evidence for the null sit side by side,
@@ -35,7 +35,7 @@ WHAT IT TESTS
 All are run twice:
   - "all"   : every subject x finger fit, including degenerate ones.
   - "clean" : dropping fits flagged excluded_from_group_analysis, and PSE biases
-              outside the tested comparison range (|bias| > 60 mm/m), which are
+              outside the tested comparison range (|bias| > 6 mm/m), which are
               off-scale artifacts of the psignifit fallback (see the paper's
               Statistical-analysis OPEN note). This mirrors the ANOVA sensitivity
               analysis and is the intended primary reading.
@@ -69,10 +69,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(HERE, "results", "equivalence")
 ANOVA_DATA_SOURCE = "L_N_E"   # same psychophysics source as the ANOVA notebook
 
-SESOI = 5.0          # smallest effect size of interest, mm/m (the +/-5 band)
-SESOI_SETUP = (5.0, 10.0)  # Setup L-vs-N bounds: primary +/-5, secondary +/-10 mm/m
+SESOI = 0.5          # smallest effect size of interest, mm/m (the +/-0.5 band)
+SESOI_SETUP = (0.5, 1.0)  # Setup L-vs-N bounds: primary +/-0.5, secondary +/-1.0 mm/m
 ALPHA = 0.05         # equivalence declared if max(p_lower, p_upper) < ALPHA
-BIAS_VALID_ABS = 60.0  # |bias| beyond the tested +/-60 mm/m range = off-scale fit
+BIAS_VALID_ABS = 6.0  # |bias| beyond the tested +/-6 mm/m range = off-scale fit
 FINGERS = ["I", "M", "R", "P"]
 FINGER_NAME = {"I": "Index", "M": "Middle", "R": "Ring", "P": "Pinky"}
 SYSTEMS = ("L", "N")   # L = air-slide (device), N = natural

@@ -58,7 +58,7 @@ def set_psychometric_delta_axis(ax: Any, delta_values: Any = None) -> None:
     """Use a centred, symmetric comparison-standard delta axis (0 at the middle).
 
     The x-axis is G_comparison - G_standard, centred on 0 with equal negative and
-    positive extent (``+/- PSYCHOMETRIC_DELTA_AXIS_LIMIT``, i.e. +/-80), widened
+    positive extent (``+/- PSYCHOMETRIC_DELTA_AXIS_LIMIT``, i.e. +/-8 mm/m), widened
     only if the observed deltas genuinely extend past it so no level is clipped.
     """
     ax.set_xlabel(PSYCHOMETRIC_DELTA_AXIS_LABEL)
@@ -68,7 +68,7 @@ def set_psychometric_delta_axis(ax: Any, delta_values: Any = None) -> None:
         if not values.empty:
             data_extent = float(np.max(np.abs(values.to_numpy(dtype=float))))
             if np.isfinite(data_extent):
-                limit = max(limit, float(np.ceil(data_extent / 5.0) * 5.0))
+                limit = max(limit, float(np.ceil(data_extent / 0.5) * 0.5))
     ax.set_xlim(-limit, limit)
     if delta_values is None:
         return
@@ -539,8 +539,8 @@ def _plot_article_style_metric_lines(
             plot_df[metric_col],
             symmetric=("PSE" in ylabel or "shift" in ylabel.lower() or "slope" in ylabel.lower()),
             lower_bound=0.0 if "JND" in ylabel else None,
-            minimum_half_range=60.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else 25.0,
-            maximum_half_range=250.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else None,
+            minimum_half_range=6.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else 2.5,
+            maximum_half_range=DISPLAY_ABS_VALUE_MAX if ("PSE" in ylabel or "shift" in ylabel.lower()) else None,
         )
     ax.set_xticks(range(len(x_order)))
     ax.set_xticklabels(_appearance_tick_labels(x_order) if x_col == "finger_appearance_order" else [str(x) for x in x_order])
@@ -790,7 +790,7 @@ def _plot_finger_columns_stiffness_dots(
             norm=plt.Normalize(vmin=float(numeric.min()), vmax=float(numeric.max())),
         )
         cbar = fig.colorbar(sm, ax=ax, pad=0.02)
-        cbar.set_label("Comparison stiffness")
+        cbar.set_label("Comparison gain (mm/m)")
     ax.set_xticks(range(len(order)))
     ax.set_xticklabels([_finger_label(f) for f in order])
     ax.set_xlabel("Finger condition")
@@ -890,7 +890,7 @@ def _plot_side_bias_object_columns(
     if has_stiffness and numeric_stiff.notna().sum() > 1:
         sm = plt.cm.ScalarMappable(cmap=plt.get_cmap(STIFFNESS_CMAP), norm=plt.Normalize(vmin=vmin, vmax=vmax))
         cbar = fig.colorbar(sm, ax=ax, pad=0.02)
-        cbar.set_label("Comparison stiffness (dot fill)")
+        cbar.set_label("Comparison gain, mm/m (dot fill)")
 
     legend_handles = [
         plt.Line2D([0], [0], marker="s", linestyle="", markersize=10, markerfacecolor=OBJECT1_COLOR, markeredgecolor="none", label="Object 1 (left)"),
@@ -996,7 +996,7 @@ def _save_subject_article_summary(
         ax.axhline(0, color="black", linewidth=0.8)
         ax.set_xticks(x)
         ax.set_xticklabels([_finger_label(f) for f in order])
-        ax.set_ylabel("Stiffness units")
+        ax.set_ylabel("Gain (mm/m)")
         ax.set_title("Fit summary")
         ax.legend(fontsize=8)
     fig.suptitle(f"Article-style subject summary: {subject}")
@@ -1366,8 +1366,8 @@ def _save_all_subject_background_metric_plot(
             plot_df[y_col],
             symmetric=("PSE" in ylabel or "shift" in ylabel.lower() or y_col.endswith("_slope")),
             lower_bound=0.0 if "JND" in ylabel else None,
-            minimum_half_range=60.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else 25.0,
-            maximum_half_range=250.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else None,
+            minimum_half_range=6.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else 2.5,
+            maximum_half_range=DISPLAY_ABS_VALUE_MAX if ("PSE" in ylabel or "shift" in ylabel.lower()) else None,
         )
     ax.set_xticks(range(len(order)))
     ax.set_xticklabels(labels)
@@ -1469,8 +1469,8 @@ def _save_all_fit_metric_by_subject_finger(
             plot_df[metric_col],
             symmetric=("PSE" in ylabel or "shift" in ylabel.lower()),
             lower_bound=0.0 if "JND" in ylabel else None,
-            minimum_half_range=60.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else 25.0,
-            maximum_half_range=250.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else None,
+            minimum_half_range=6.0 if ("PSE" in ylabel or "shift" in ylabel.lower()) else 2.5,
+            maximum_half_range=DISPLAY_ABS_VALUE_MAX if ("PSE" in ylabel or "shift" in ylabel.lower()) else None,
         )
     ax.set_xticks(range(len(order)))
     ax.set_xticklabels([_finger_label(f) for f in order])
@@ -1915,7 +1915,7 @@ def save_all_figures(
             fig, ax = plt.subplots(figsize=(8, 4.8))
             plot_df = pse_jnd_by_subject_finger.copy()
             plot_df[metric] = pd.to_numeric(plot_df[metric], errors="coerce")
-            display_max = 250.0
+            display_max = DISPLAY_ABS_VALUE_MAX
             keep_mask = plot_df[metric].abs() <= display_max
             removed = plot_df.loc[~keep_mask & plot_df[metric].notna()].copy()
             plot_df = plot_df.loc[keep_mask].copy()
@@ -1955,7 +1955,7 @@ def save_all_figures(
                 values,
                 symmetric=False,
                 lower_bound=0.0 if metric in {"pse", "jnd"} else None,
-                minimum_half_range=25.0,
+                minimum_half_range=2.5,
             )
             note = _format_display_filter_note(removed, metric_col=metric, metric_label=ylabel, threshold=display_max)
             ax.text(0.02, 0.02, note, transform=ax.transAxes, ha="left", va="bottom", fontsize=7, color="0.35")
@@ -2496,7 +2496,7 @@ def save_finger_time_appearance_figures(
                 capsize=4,
             )
             ax2.axhline(0, color="black", linewidth=1)
-            ax2.set_xlabel("Comparison stiffness")
+            ax2.set_xlabel("Comparison gain (mm/m)")
             ax2.set_ylabel("Mean success slope over session time")
             ax2.set_title("By stiffness")
             ax2.tick_params(axis="x", rotation=45)
@@ -2620,7 +2620,7 @@ def save_success_by_stiffness_repetition_figures(
     sm = ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=flat_axes, shrink=0.85, pad=0.02)
-    cbar.set_label("Stiffness delta (comparison - standard)")
+    cbar.set_label("Gain delta, comparison - standard (mm/m)")
 
     fig.suptitle("Success across repetitions of each stiffness, per finger\n(lines show across-subject mean success; individual binary trials are hidden for readability)")
     out = fig_root / "success_by_stiffness_repetition_per_finger.png"
@@ -2640,6 +2640,7 @@ from twoafc_psychophysics import (  # noqa: E402
     OBJECT1_COLOR,
     OBJECT2_COLOR,
     PSYCHOMETRIC_DELTA_AXIS_LABEL,
+    DISPLAY_ABS_VALUE_MAX,
     PSYCHOMETRIC_DELTA_AXIS_LIMIT,
     PSYCHOMETRIC_GREATER_Y_LABEL,
     PSYCHOMETRIC_MEAN_GREATER_Y_LABEL,

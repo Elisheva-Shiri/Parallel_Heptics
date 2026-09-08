@@ -21,7 +21,7 @@ Everything else -- the logistic model, the multi-start L-BFGS-B MLE, the PSE
 (x at P=0.5) and JND ((x75 - x25)/2) definitions -- is copied verbatim from
 twoafc_psychophysics.py so the only change is the lapse ceiling. It then:
   1. reports the mean fitted lapse before/after,
-  2. writes per-subject Bias(=PSE-85)/JND tables for both variants, and
+  2. writes per-subject Bias(=PSE-8.5 mm/m)/JND tables for both variants, and
   3. re-runs the TOST equivalence test (imported from
      anova_statistics/tost_equivalence.py) on the constrained fits.
 
@@ -50,10 +50,10 @@ REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 TRIALS = os.path.join(HERE, "results", "L_N_E", "csv", "all", "shared", "clean_trials.csv")
 OUT_DIR = os.path.join(HERE, "results", "constrained_lapse_refit")
 
-STANDARD = 85.0
+STANDARD = 8.5  # mm/m (clean_trials.csv is already in mm/m)
 MIN_TRIALS_PER_FIT = 12
 MIN_LEVELS_PER_FIT = 3
-BIAS_VALID_ABS = 60.0
+BIAS_VALID_ABS = 6.0  # mm/m
 SESOI = 5.0
 FINGERS = ["I", "M", "R", "P"]
 

@@ -20,7 +20,7 @@ import pandas as pd
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
-RESULTS_DIR = SCRIPT_DIR / "results" / "L_N_E" / "_working"
+RESULTS_DIR = SCRIPT_DIR / "results" / "L_N_E" / "csv" / "all" / "shared"
 MEDIA_DIR = (
     REPO_ROOT
     / "paper"
@@ -90,18 +90,17 @@ def _workspace_color(workspace: str | None) -> str:
 
 
 def _fmt_delta(value: float) -> str:
-    """Display raw stiffness deltas in decimal units (60 -> 6, 45 -> 4.5)."""
-    scaled = value / 10.0
-    return f"{scaled:g}"
+    """Format a gain delta already expressed in mm/m (the pipeline unit)."""
+    return f"{value:g}"
 
 
 def _fmt_pse_value(value: float) -> str:
-    """Display PSE deltas in the same scaled units as the reference figure."""
-    return f"{value / 10.0:.2f}"
+    """Format a PSE delta already expressed in mm/m."""
+    return f"{value:.2f}"
 
 
-XTICKS = np.array([-60, -45, -30, -15, 0, 15, 30, 45, 60], dtype=float)
-X_GRID = np.linspace(-60, 60, 300)
+XTICKS = np.array([-6, -4.5, -3, -1.5, 0, 1.5, 3, 4.5, 6], dtype=float)  # mm/m
+X_GRID = np.linspace(-6, 6, 300)
 CBAR_TICKS = [-6, -4.5, -3, -1.5, 0, 1.5, 3, 4.5, 6]
 
 
@@ -152,7 +151,7 @@ def _draw_panel(ax, finger: str, tables: dict, pf, norm) -> None:
             scatter = ax.scatter(
                 x,
                 y,
-                c=x / 10.0,
+                c=x,
                 cmap=STIFFNESS_CMAP,
                 norm=norm,
                 s=120,
@@ -194,7 +193,7 @@ def _draw_panel(ax, finger: str, tables: dict, pf, norm) -> None:
         ax.axvline(0, color=STANDARD_COLOR, linestyle=":", linewidth=1.1, zorder=2)
         ax.axhline(0.5, color="gray", linestyle=":", linewidth=1.0, zorder=1)
         ax.set_title(f"Finger {finger}", fontsize=FS_TITLE, pad=14)  # "group pooled" goes in the caption
-        ax.set_xlim(-65, 65)
+        ax.set_xlim(-6.5, 6.5)
         ax.set_ylim(-0.05, 1.05)
         ax.set_xticks(xticks)
         ax.set_xticklabels([_fmt_delta(float(v)) for v in xticks])

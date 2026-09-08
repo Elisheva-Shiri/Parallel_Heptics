@@ -38,6 +38,12 @@ import pandas as pd
 from scipy import stats
 
 TRACKING_USECOLS = ["timestamp", "interacting", "stiffness"]
+# tracking.csv logs the gain in RAW device units (0.1 mm/m) while the cleaned
+# trial table is in mm/m; the raw values are needed to match tracking segments.
+try:  # keep the single source of truth in the psychophysics module
+    from twoafc_psychophysics import RAW_GAIN_UNITS_PER_MM_PER_M
+except Exception:  # pragma: no cover - standalone import fallback
+    RAW_GAIN_UNITS_PER_MM_PER_M = 10.0
 # A gap between consecutive tracking samples longer than this is treated as a
 # pause (moderator pause / dropped frames) and is not counted as interaction.
 MAX_SAMPLE_GAP_S = 0.5
@@ -289,6 +295,8 @@ TRIAL_KEEP_COLUMNS = [
     "abs_stiffness_delta",
     "object_1_value",
     "object_2_value",
+    "object_1_value_raw_units",
+    "object_2_value_raw_units",
     "correct_response",
     "reaction_time",
     "experiment_group",
@@ -318,9 +326,16 @@ def compute_object_interaction_trials(
         _pair_folder(Path(f), p) / "tracking.csv" if f else Path("__missing__")
         for f, p in zip(trials["session_folder"], trials["trial_index_raw"])
     ]
-    if {"object_1_value", "object_2_value"}.issubset(trials.columns):
-        v1 = pd.to_numeric(trials["object_1_value"], errors="coerce")
-        v2 = pd.to_numeric(trials["object_2_value"], errors="coerce")
+    # Expected stiffness values must be in the RAW tracking.csv units.
+    if {"object_1_value_raw_units", "object_2_value_raw_units"}.issubset(trials.columns):
+        v1 = pd.to_numeric(trials["object_1_value_raw_units"], errors="coerce")
+        v2 = pd.to_numeric(trials["object_2_value_raw_units"], errors="coerce")
+        expected = [
+            tuple(v for v in (a, b) if np.isfinite(v)) or None for a, b in zip(v1, v2)
+        ]
+    elif {"object_1_value", "object_2_value"}.issubset(trials.columns):
+        v1 = pd.to_numeric(trials["object_1_value"], errors="coerce") * RAW_GAIN_UNITS_PER_MM_PER_M
+        v2 = pd.to_numeric(trials["object_2_value"], errors="coerce") * RAW_GAIN_UNITS_PER_MM_PER_M
         expected = [
             tuple(v for v in (a, b) if np.isfinite(v)) or None for a, b in zip(v1, v2)
         ]

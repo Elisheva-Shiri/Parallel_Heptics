@@ -225,22 +225,22 @@ def test_probing_group_comparisons_are_returned_by_summary() -> None:
 def test_psychophysics_group_comparison_section_returns_trial_and_fit_tables() -> None:
     clean = pd.DataFrame(
         [
-            {"subject_id": "N_E01", "finger_condition": "I", "comparison_value": 40, "standard_value": 85, "response_comparison_greater": 0, "reaction_time": 1.0, "sex": "female", "age": 21},
-            {"subject_id": "N_E01", "finger_condition": "M", "comparison_value": 120, "standard_value": 85, "response_comparison_greater": 1, "reaction_time": 1.2, "sex": "female", "age": 21},
-            {"subject_id": "L_E01", "finger_condition": "I", "comparison_value": 40, "standard_value": 85, "response_comparison_greater": 1, "reaction_time": 2.0, "sex": "male", "age": 28},
-            {"subject_id": "L_E01", "finger_condition": "M", "comparison_value": 120, "standard_value": 85, "response_comparison_greater": 1, "reaction_time": 2.2, "sex": "male", "age": 28},
-            {"subject_id": "L_P01", "finger_condition": "I", "comparison_value": 5, "standard_value": 85, "response_comparison_greater": 0, "reaction_time": 2.8, "sex": "female", "age": 31},
-            {"subject_id": "L_P01", "finger_condition": "M", "comparison_value": 165, "standard_value": 85, "response_comparison_greater": 1, "reaction_time": 3.0, "sex": "female", "age": 31},
-            {"subject_id": "N_P01", "finger_condition": "I", "comparison_value": 5, "standard_value": 85, "response_comparison_greater": 0, "reaction_time": 2.6, "sex": "female", "age": 24},
-            {"subject_id": "N_P01", "finger_condition": "M", "comparison_value": 165, "standard_value": 85, "response_comparison_greater": 1, "reaction_time": 2.9, "sex": "female", "age": 24},
+            {"subject_id": "N_E01", "finger_condition": "I", "comparison_value": 4.0, "standard_value": 8.5, "response_comparison_greater": 0, "reaction_time": 1.0, "sex": "female", "age": 21},
+            {"subject_id": "N_E01", "finger_condition": "M", "comparison_value": 12.0, "standard_value": 8.5, "response_comparison_greater": 1, "reaction_time": 1.2, "sex": "female", "age": 21},
+            {"subject_id": "L_E01", "finger_condition": "I", "comparison_value": 4.0, "standard_value": 8.5, "response_comparison_greater": 1, "reaction_time": 2.0, "sex": "male", "age": 28},
+            {"subject_id": "L_E01", "finger_condition": "M", "comparison_value": 12.0, "standard_value": 8.5, "response_comparison_greater": 1, "reaction_time": 2.2, "sex": "male", "age": 28},
+            {"subject_id": "L_P01", "finger_condition": "I", "comparison_value": 0.5, "standard_value": 8.5, "response_comparison_greater": 0, "reaction_time": 2.8, "sex": "female", "age": 31},
+            {"subject_id": "L_P01", "finger_condition": "M", "comparison_value": 16.5, "standard_value": 8.5, "response_comparison_greater": 1, "reaction_time": 3.0, "sex": "female", "age": 31},
+            {"subject_id": "N_P01", "finger_condition": "I", "comparison_value": 0.5, "standard_value": 8.5, "response_comparison_greater": 0, "reaction_time": 2.6, "sex": "female", "age": 24},
+            {"subject_id": "N_P01", "finger_condition": "M", "comparison_value": 16.5, "standard_value": 8.5, "response_comparison_greater": 1, "reaction_time": 2.9, "sex": "female", "age": 24},
         ]
     )
     fits = pd.DataFrame(
         [
-            {"subject_id": "N_E01", "finger_condition": "I", "pse": 80.0, "jnd": 10.0, "n_trials": 12},
-            {"subject_id": "L_E01", "finger_condition": "I", "pse": 85.0, "jnd": 11.0, "n_trials": 12},
-            {"subject_id": "L_P01", "finger_condition": "M", "pse": 90.0, "jnd": 12.0, "n_trials": 12},
-            {"subject_id": "N_P01", "finger_condition": "M", "pse": 75.0, "jnd": 13.0, "n_trials": 12},
+            {"subject_id": "N_E01", "finger_condition": "I", "pse": 8.0, "jnd": 1.0, "n_trials": 12},
+            {"subject_id": "L_E01", "finger_condition": "I", "pse": 8.5, "jnd": 1.1, "n_trials": 12},
+            {"subject_id": "L_P01", "finger_condition": "M", "pse": 9.0, "jnd": 1.2, "n_trials": 12},
+            {"subject_id": "N_P01", "finger_condition": "M", "pse": 7.5, "jnd": 1.3, "n_trials": 12},
         ]
     )
 
@@ -279,17 +279,17 @@ def test_psychophysics_group_comparison_section_returns_trial_and_fit_tables() -
         & (fit_between["comparison"] == "L_E - N_E")
         & (fit_between["metric"] == "pse")
     ].iloc[0]
-    assert np.isclose(le_minus_ne["mean_difference_b_minus_a"], 5.0)
+    assert np.isclose(le_minus_ne["mean_difference_b_minus_a"], 0.5)
 
 
 
 def test_psychophysics_fit_delta_columns_fill_missing_standard_value() -> None:
-    fits = pd.DataFrame([{"pse": 90.0, "jnd": 8.5, "standard_value": np.nan}])
+    fits = pd.DataFrame([{"pse": 9.0, "jnd": 0.85, "standard_value": np.nan}])
 
     out = psych.add_fit_delta_columns(fits)
 
     assert np.isclose(out["standard_value"].iloc[0], psych.STANDARD_FALLBACK)
-    assert np.isclose(out["pse_delta_from_standard"].iloc[0], 5.0)
+    assert np.isclose(out["pse_delta_from_standard"].iloc[0], 0.5)
     assert np.isclose(out["weber_fraction"].iloc[0], 0.1)
 
 
@@ -343,9 +343,9 @@ def test_group_comparison_save_helpers_write_expected_csvs(tmp_path: Path) -> No
 
     clean = pd.DataFrame(
         [
-            {"subject_id": "N_E01", "finger_condition": "I", "comparison_value": 40, "standard_value": 85, "response_comparison_greater": 0, "reaction_time": 1.0},
-            {"subject_id": "L_E01", "finger_condition": "I", "comparison_value": 40, "standard_value": 85, "response_comparison_greater": 1, "reaction_time": 2.0},
-            {"subject_id": "L_P01", "finger_condition": "I", "comparison_value": 40, "standard_value": 85, "response_comparison_greater": 1, "reaction_time": 3.0},
+            {"subject_id": "N_E01", "finger_condition": "I", "comparison_value": 4.0, "standard_value": 8.5, "response_comparison_greater": 0, "reaction_time": 1.0},
+            {"subject_id": "L_E01", "finger_condition": "I", "comparison_value": 4.0, "standard_value": 8.5, "response_comparison_greater": 1, "reaction_time": 2.0},
+            {"subject_id": "L_P01", "finger_condition": "I", "comparison_value": 4.0, "standard_value": 8.5, "response_comparison_greater": 1, "reaction_time": 3.0},
         ]
     )
     psych.save_experiment_group_comparison_outputs(tmp_path, clean)

@@ -15,7 +15,7 @@ Psychometric model
 ------------------
 The task is a yes/no-style stiffness comparison: on each trial the participant
 judges whether the *comparison* stimulus C is stiffer than the fixed *standard*
-S = 85. The fitted binary response is
+S = 8.5 mm/m. The fitted binary response is
 
     y = 1  if the participant judged the comparison C stiffer than the standard S
     y = 0  if the participant judged the standard S stiffer than the comparison C
@@ -28,22 +28,33 @@ rate, the fitted curve is a lapse-aware sigmoid with FOUR free parameters
 
     P(y = 1) = lapse_low + (1 - lapse_low - lapse_high) * F(delta; mu, scale)
 
-with ``delta = C - 85`` and ``F`` a monotonic logistic sigmoid (see
+with ``delta = C - 8.5`` and ``F`` a monotonic logistic sigmoid (see
 ``logistic4``). Two fitters are supported and the chosen one is recorded per fit
 in the ``fit_method`` / ``psignifit_status`` columns:
   1. ``psignifit`` -- preferred, used when it is installed;
   2. the custom lapse-aware maximum-likelihood fitter (``fit_with_scipy_logistic``)
      -- the fallback used when psignifit is unavailable.
 
-Derived quantities (the fit is in comparison-stiffness units, so these are
+Derived quantities (the fit is in comparison-gain units, mm/m, so these are
 equivalent to the delta-space definitions):
-  - PSE  = comparison value where P(y=1) = 0.5  (delta_PSE = PSE - 85);
-  - Bias = PSE - 85 = delta at P(y=1) = 0.5  (``pse_delta_from_standard``);
+  - PSE  = comparison value where P(y=1) = 0.5  (delta_PSE = PSE - 8.5);
+  - Bias = PSE - 8.5 = delta at P(y=1) = 0.5  (``pse_delta_from_standard``);
   - JND  = (x75 - x25) / 2, where x25/x75 are the values where the curve reaches
     0.25/0.75. Because of the lapse parameters, 0.25/0.75 are only attainable when
     they lie within ``[lapse_low, 1 - lapse_high]``; when they do not, the fitter
     returns NaN (PSE/JND) and a ``fit_warning`` ("pse_outside_lapse_range" /
     "jnd_quantile_outside_lapse_range") rather than a silently invalid value.
+
+Stimulus units
+--------------
+The device logs the skin-stretch gain in RAW units of 0.1 mm/m (``answers.csv``
+/ ``configuration.csv``: standard 85, comparisons 25..145). ``canonicalize_trials``
+converts every stimulus value to **mm/m** (standard 8.5, comparisons 2.5..14.5),
+the unit reported in the paper, and keeps the raw device value in the
+``*_raw_units`` columns. Every table, fit, PSE/JND/CI and figure downstream of
+that point is therefore in mm/m; only the raw import tables and the
+``*_raw_units`` columns stay in device units. Nothing downstream may divide or
+multiply by 10 again.
 """
 
 from __future__ import annotations
@@ -88,15 +99,33 @@ except ModuleNotFoundError:  # pragma: no cover - supports running from analysis
     from analysis.scope_plots import save_scope_summary_plots
 
 
-STANDARD_FALLBACK = 85.0
-STANDARD_ABS_TOLERANCE = 0.75
+# --- Stimulus units ---------------------------------------------------------
+# Raw device logs store the skin-stretch gain in units of 0.1 mm/m (standard 85,
+# comparisons 25..145). ``canonicalize_trials`` converts to mm/m ONCE; every
+# value after that point (clean trials, fits, PSE/JND/CIs, figures) is in mm/m.
+RAW_GAIN_UNITS_PER_MM_PER_M = 10.0
+RAW_GAIN_TO_MM_PER_M = 1.0 / RAW_GAIN_UNITS_PER_MM_PER_M
+GAIN_UNIT_LABEL = "mm/m"
+# Standard in RAW device units: used only to identify the standard object in the
+# raw answer rows (``infer_standard_value`` / ``canonicalize_trials``).
+STANDARD_RAW_FALLBACK = 85.0
+STANDARD_RAW_ABS_TOLERANCE = 0.75
+# Standard in mm/m: used everywhere downstream of canonicalisation.
+STANDARD_FALLBACK = 8.5
+STANDARD_ABS_TOLERANCE = 0.075
 MIN_TRIALS_PER_FIT = 12
 MIN_LEVELS_PER_FIT = 3
+# Per-subject/finger fits (many, used for the ANOVA) keep a modest bootstrap;
+# the few group-level pooled fits reported in the paper table use a larger one.
 DEFAULT_FIT_BOOTSTRAP_N = 200
+GROUP_FIT_BOOTSTRAP_N = 2000
 MIN_BOOTSTRAP_FOR_CI = 30
 DEFAULT_CENTER_X = 320.0
 DEFAULT_CENTER_Y = 240.0
-STIFFNESS_MAX_FOR_STRETCH_PROXY = 175.0
+STIFFNESS_MAX_FOR_STRETCH_PROXY = 17.5  # mm/m
+# Per-subject PSE/JND display filter for article-style figures (|value| above
+# this is hidden from the plot, never from the CSVs).
+DISPLAY_ABS_VALUE_MAX = 25.0  # mm/m
 IGNORED_PATH_PATTERNS = (
     "old",
     "not finish",
@@ -126,18 +155,19 @@ GROUP_SELECTIONS: dict[str, tuple[str, ...]] = {
     "NL_E": ("L_E", "N_E"),
 }
 FILTER_ONLY_SELECTION = "FILTER_ONLY"
-PSYCHOMETRIC_DELTA_AXIS_LABEL = "G_comparison-G_standart"
+PSYCHOMETRIC_DELTA_AXIS_LABEL = "G_comparison - G_standard (mm/m)"
 PSYCHOMETRIC_GREATER_Y_LABEL = "P(choose comparison > standard)"
 PSYCHOMETRIC_MEAN_GREATER_Y_LABEL = "Mean P(choose comparison > standard)"
 # Psychometric delta x-axis is centred on 0 (comparison == standard) and drawn
 # symmetric over +/- this half-range, i.e. the full tested stimulus span
-# (comparison 5..165 around the standard 85 -> delta -80..+80).
-PSYCHOMETRIC_DELTA_AXIS_LIMIT = 80.0
-# Group-analysis PSE validity band (absolute stiffness units). Fits whose PSE
-# falls outside this band are kept and flagged in the per-subject tables/curves
-# but excluded from every GROUP-level aggregation (band-pass / LPF+HPF on PSE).
-PSE_VALID_MIN_ABS = 25.0
-PSE_VALID_MAX_ABS = 145.0
+# (comparison 0.5..16.5 mm/m around the standard 8.5 -> delta -8..+8 mm/m).
+PSYCHOMETRIC_DELTA_AXIS_LIMIT = 8.0
+# Group-analysis PSE validity band (absolute gain, mm/m = the tested comparison
+# range 2.5..14.5). Fits whose PSE falls outside this band are kept and flagged
+# in the per-subject tables/curves but excluded from every GROUP-level
+# aggregation (band-pass / LPF+HPF on PSE).
+PSE_VALID_MIN_ABS = 2.5
+PSE_VALID_MAX_ABS = 14.5
 # The full table x metric x scope cross-product produced ~768 mostly-uninformative
 # scope-summary figures. Only these few headline figures are generated now (as
 # (source_table, summary_level, metric) triples). Edit this list to change which
@@ -631,7 +661,7 @@ def add_delta_and_less_response_columns(df: pd.DataFrame) -> pd.DataFrame:
 def add_psychophysics_context_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Add transparent analysis context without changing raw answer values.
 
-    Stiffness is kept in the original analog units and is additionally expressed
+    Gain is kept in mm/m (see module docstring) and is additionally expressed
     relative to each trial's standard value for cross-condition comparability.
     Workspace columns document the original L/N workspaces but do not rescale
     the stiffness stimulus because it is not a spatial coordinate.
@@ -652,7 +682,7 @@ def add_psychophysics_context_columns(df: pd.DataFrame) -> pd.DataFrame:
         if "abs_stiffness_delta" not in out:
             out["abs_stiffness_delta"] = out["signed_stiffness_delta"].abs()
         out["abs_delta_over_standard"] = np.where(standard > 0, out["abs_stiffness_delta"] / standard, np.nan)
-        out["standard_value_reference"] = standard.astype(str) + " analog stiffness units"
+        out["standard_value_reference"] = standard.astype(str) + " " + GAIN_UNIT_LABEL
     elif "standard_value" in out:
         standard = pd.to_numeric(out["standard_value"], errors="coerce").fillna(STANDARD_FALLBACK)
         out["standard_value"] = standard
@@ -1028,7 +1058,8 @@ def row_contains_protocol_marker(row: pd.Series) -> bool:
     return bool(PROTOCOL_RE.search(text))
 
 
-def infer_standard_value(df: pd.DataFrame, cols: dict[str, Optional[str]], fallback: float = STANDARD_FALLBACK) -> tuple[float, pd.DataFrame]:
+def infer_standard_value(df: pd.DataFrame, cols: dict[str, Optional[str]], fallback: float = STANDARD_RAW_FALLBACK) -> tuple[float, pd.DataFrame]:
+    """Infer the standard stimulus from the RAW answer rows (raw device units)."""
     c1, c2 = cols.get("object_1_value"), cols.get("object_2_value")
     if not c1 or not c2:
         return fallback, pd.DataFrame([{"candidate_value": fallback, "reason": "fallback_missing_value_columns"}])
@@ -1057,10 +1088,19 @@ def canonicalize_trials(
     df: pd.DataFrame,
     cols: dict[str, Optional[str]],
     standard_value: float,
-    standard_tolerance: float = STANDARD_ABS_TOLERANCE,
+    standard_tolerance: float = STANDARD_RAW_ABS_TOLERANCE,
     pilot_onboarding_trials: int = PILOT_ONBOARDING_TRIALS,
+    gain_scale: float = RAW_GAIN_TO_MM_PER_M,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Canonicalise raw answer rows into one clean dataframe per trial.
+
+    ``standard_value`` / ``standard_tolerance`` are in the RAW device units of the
+    answer files (standard 85). The standard is identified in raw units and every
+    stimulus value in the returned tables (``object_*_value``, ``standard_value``,
+    ``comparison_value``) is then multiplied by ``gain_scale`` so the pipeline
+    works in mm/m (standard 8.5). The raw device values are kept alongside in the
+    ``*_raw_units`` columns for anything that must be matched back against raw
+    logs (e.g. ``tracking.csv``). Pass ``gain_scale=1.0`` to keep raw units.
 
     The first ``pilot_onboarding_trials`` clean comparison trials per subject
     are an onboarding/familiarisation phase and are excluded from the returned
@@ -1127,16 +1167,21 @@ def canonicalize_trials(
             "trial_index_raw": row.get(c_trial) if c_trial else np.nan,
             "timestamp": row.get(c_time) if c_time else np.nan,
             "block_raw": row.get(c_block) if c_block else np.nan,
-            "object_1_value": v1,
-            "object_2_value": v2,
+            "object_1_value": v1 * gain_scale,
+            "object_2_value": v2 * gain_scale,
+            "object_1_value_raw_units": v1,
+            "object_2_value_raw_units": v2,
             "object_1_finger_raw": f1_raw,
             "object_2_finger_raw": f2_raw,
             "object_1_finger": f1,
             "object_2_finger": f2,
-            "standard_value": standard_value,
+            "standard_value": standard_value * gain_scale,
+            "standard_value_raw_units": standard_value,
             "standard_side": standard_side,
             "comparison_side": comparison_side,
-            "comparison_value": comparison_value,
+            "comparison_value": comparison_value * gain_scale,
+            "comparison_value_raw_units": comparison_value,
+            "gain_units": GAIN_UNIT_LABEL,
             "standard_finger": standard_finger,
             "comparison_finger": comparison_finger,
             "finger_condition": finger_condition,
@@ -2371,6 +2416,10 @@ def fit_with_scipy_logistic(agg: pd.DataFrame, n_bootstrap: int = DEFAULT_FIT_BO
         "lapse_rate": np.nan,
         "neg_log_likelihood": np.nan,
         "deviance": np.nan,
+        "deviance_df": np.nan,
+        "deviance_p_chi2": np.nan,
+        "deviance_null": np.nan,
+        "pseudo_r2_mcfadden": np.nan,
         "aic": np.nan,
         "pse_se": np.nan,
         "pse_ci95_lower": np.nan,
@@ -2436,6 +2485,20 @@ def fit_with_scipy_logistic(agg: pd.DataFrame, n_bootstrap: int = DEFAULT_FIT_BO
     p_sat = np.clip(y_obs, eps, 1 - eps)
     saturated_nll = -float(np.sum(k * np.log(p_sat) + (n - k) * np.log(1 - p_sat)))
     nll_value = _logistic_nll(best.x, x, k, n, eps)
+    # Goodness of fit: deviance vs. the saturated model (df = levels - 4 params),
+    # its chi-square tail probability, and McFadden's pseudo-R^2 against a
+    # constant-probability null model.
+    p_null = float(np.clip(k.sum() / n.sum(), eps, 1 - eps)) if n.sum() > 0 else np.nan
+    null_nll = -float(np.sum(k * np.log(p_null) + (n - k) * np.log(1 - p_null))) if np.isfinite(p_null) else np.nan
+    deviance_value = max(0.0, 2 * (nll_value - saturated_nll))
+    deviance_null = max(0.0, 2 * (null_nll - saturated_nll)) if np.isfinite(null_nll) else np.nan
+    deviance_df = int(len(x)) - 4
+    try:
+        from scipy.stats import chi2 as _chi2
+        deviance_p = float(_chi2.sf(deviance_value, deviance_df)) if deviance_df > 0 else np.nan
+    except Exception:  # pragma: no cover - scipy already imported above
+        deviance_p = np.nan
+    pseudo_r2 = float(1.0 - nll_value / null_nll) if np.isfinite(null_nll) and null_nll > 0 else np.nan
     if not np.isfinite(pse):
         warnings.append("pse_outside_lapse_range")
     if not np.isfinite(x25) or not np.isfinite(x75):
@@ -2487,7 +2550,11 @@ def fit_with_scipy_logistic(agg: pd.DataFrame, n_bootstrap: int = DEFAULT_FIT_BO
             "jnd": float((x75 - x25) / 2) if np.isfinite(x25) and np.isfinite(x75) else np.nan,
             "slope_at_pse": slope,
             "neg_log_likelihood": nll_value,
-            "deviance": max(0.0, 2 * (nll_value - saturated_nll)),
+            "deviance": deviance_value,
+            "deviance_df": deviance_df,
+            "deviance_p_chi2": deviance_p,
+            "deviance_null": deviance_null,
+            "pseudo_r2_mcfadden": pseudo_r2,
             "aic": 8 + 2 * nll_value,
             "fit_quality": "ok" if not warnings else "warning",
             "fit_warning": ";".join(warnings + bootstrap_warnings),
@@ -2848,7 +2915,7 @@ def add_fit_delta_columns(fits: pd.DataFrame) -> pd.DataFrame:
         out["pse_delta_from_standard"] = out["pse_delta_comparison_minus_standard"]
         out["abs_pse_delta_from_standard"] = out["pse_delta_from_standard"].abs()
         # Band-pass (LPF+HPF) on the PSE: a fit is valid for GROUP analysis only
-        # when its PSE sits inside the reliable stimulus band [25, 145]. Out-of-band
+        # when its PSE sits inside the tested stimulus band [2.5, 14.5] mm/m. Out-of-band
         # (or un-estimated) fits are KEPT here and drawn individually but flagged so
         # compute_experiment_group_comparisons can drop them from group aggregation.
         out["pse_in_valid_band"] = (pse >= PSE_VALID_MIN_ABS) & (pse <= PSE_VALID_MAX_ABS)
@@ -3204,7 +3271,7 @@ def save_article_style_psychophysics_figures(
             x_order=_finger_order_present(fits["finger_condition"]) if not fits.empty and "finger_condition" in fits else None,
             style_col="subject_id",
             fig_dpi=fig_dpi,
-            abs_value_filter=250.0 if (is_pse_article or is_jnd_article) else None,
+            abs_value_filter=DISPLAY_ABS_VALUE_MAX if (is_pse_article or is_jnd_article) else None,
             filter_metric_label=("PSE shift" if is_pse_article else "JND" if is_jnd_article else None),
             focus_ylim=is_pse_article or is_jnd_article,
             finger_fill_subject_edge=True,
@@ -3325,7 +3392,9 @@ def _analyze_tracking_file(
     interacting = out["interacting"] if "interacting" in out else pd.Series(False, index=out.index)
     out["interacting_bool"] = interacting.astype(str).str.lower().isin(["true", "1", "yes"])
     stiffness = out["stiffness"] if "stiffness" in out else pd.Series(np.nan, index=out.index)
-    out["skin_stretch_gain_mm_per_m"] = pd.to_numeric(stiffness, errors="coerce")
+    # tracking.csv logs the gain in raw device units (0.1 mm/m); convert to mm/m.
+    out["skin_stretch_gain_raw_units"] = pd.to_numeric(stiffness, errors="coerce")
+    out["skin_stretch_gain_mm_per_m"] = out["skin_stretch_gain_raw_units"] * RAW_GAIN_TO_MM_PER_M
     # Backward-compatible alias for older generated CSVs/figures.
     out["skin_stretch_gain_mm_per_m_or_condition"] = out["skin_stretch_gain_mm_per_m"]
     out["skin_stretch_gain_normalized"] = out["skin_stretch_gain_mm_per_m"] / STIFFNESS_MAX_FOR_STRETCH_PROXY
@@ -3599,17 +3668,22 @@ def compute_psychophysics_group_aggregates(
     all_pooled_trials["group"] = "all_pooled"
     psychometric_input_group_all_pooled = make_psychometric_input(all_pooled_trials, ["group"])
 
+    (pse_jnd_subject_pooled,) = fit_conditions_many(
+        [(psychometric_input_subject_pooled, ["subject_id"])],
+        psignifit_available,
+        n_jobs=n_jobs,
+    )
+    # The few pooled group fits carry the paper's CIs: use the larger bootstrap.
     (
-        pse_jnd_subject_pooled,
         pse_jnd_group_by_finger,
         pse_jnd_group_all_pooled,
     ) = fit_conditions_many(
         [
-            (psychometric_input_subject_pooled, ["subject_id"]),
             (psychometric_input_group_by_finger, ["finger_condition"]),
             (psychometric_input_group_all_pooled, ["group"]),
         ],
         psignifit_available,
+        n_bootstrap=GROUP_FIT_BOOTSTRAP_N,
         n_jobs=n_jobs,
     )
 
@@ -3706,6 +3780,20 @@ def save_selected_analysis_tree(
         for name, table in shared_tables.items():
             path = _save_table_if_not_empty(table, shared_all_csv, name)
             record("all", "shared", "csv", path)
+        # Paper table (pooled fits with CIs/lambda/deviance/N + per-participant summaries).
+        if pse_jnd_group_by_finger is not None and not pse_jnd_group_by_finger.empty:
+            try:
+                from psychometric_fit_table import write_psychometric_fit_table
+                for kind, path in write_psychometric_fit_table(
+                    shared_all_csv,
+                    pse_jnd_group_by_finger,
+                    pse_jnd_group_all_pooled if pse_jnd_group_all_pooled is not None else pd.DataFrame(),
+                    pse_jnd_by_subject_finger if pse_jnd_by_subject_finger is not None else pd.DataFrame(),
+                    cohort=str(selection),
+                ).items():
+                    record("all", "shared", "csv" if kind == "csv" else "table", path)
+            except Exception as exc:  # pragma: no cover - never fail the tree over the table
+                print("psychometric_fit_table skipped:", exc)
         for prefix, tables in [("time_fatigue", success_time_fatigue), ("finger_time_appearance", finger_time_appearance), ("group_comparisons", psychophysics_group_comparisons or {})]:
             for name, table in tables.items():
                 path = _save_table_if_not_empty(table, shared_all_csv / prefix, f"{sanitize_name(name)}.csv")
@@ -4015,7 +4103,7 @@ def save_selected_analysis_tree(
             title="JND per participant and finger",
             ylabel="JND",
             fig_dpi=fig_dpi,
-            abs_value_filter=250.0,
+            abs_value_filter=DISPLAY_ABS_VALUE_MAX,
             filter_metric_label="JND",
             focus_ylim=True,
         ),
@@ -4029,7 +4117,7 @@ def save_selected_analysis_tree(
             title="PSE per participant and finger",
             ylabel="PSE shift (comparison - standard)" if pse_metric != "pse" else "PSE",
             fig_dpi=fig_dpi,
-            abs_value_filter=250.0,
+            abs_value_filter=DISPLAY_ABS_VALUE_MAX,
             filter_metric_label="PSE shift" if pse_metric != "pse" else "PSE",
             focus_ylim=True,
         ),
@@ -4047,7 +4135,7 @@ def save_selected_analysis_tree(
             line_color="subject",
             dot_color="finger_fill_subject_edge",
             fig_dpi=fig_dpi,
-            abs_value_filter=250.0,
+            abs_value_filter=DISPLAY_ABS_VALUE_MAX,
             filter_metric_label="JND",
             focus_ylim=True,
         ),
@@ -4670,6 +4758,9 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
         "pse_jnd_subject_pooled.csv",
         "pse_jnd_group_by_finger.csv",
         "pse_jnd_group_all_pooled.csv",
+        "psychometric_fit_table.csv",
+        "psychometric_fit_table.tex",
+        "psychometric_fit_table.md",
         "pse_bias_by_subject_finger.csv",
         "pse_bias_subject_pooled.csv",
         "pse_bias_group_by_finger.csv",

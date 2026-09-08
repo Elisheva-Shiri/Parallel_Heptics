@@ -15,7 +15,7 @@ Design summary
 * System is the between-subject factor (L/N).
 * Finger is the within-subject repeated factor (I/M/P/R).
 * Subject is the repeated-measures unit.
-* Bias = PSE - 85; JND = (x75 - x25) / 2 from the frozen upstream fits.
+* Bias = PSE - 8.5 mm/m; JND = (x75 - x25) / 2 from the frozen upstream fits.
 
 Main analysis: mixed-design ANOVA, because each subject contributes repeated
 finger measurements. The one-way analyses are retained only as didactic and
@@ -81,7 +81,7 @@ else:
 # Constants
 # --------------------------------------------------------------------------- #
 
-STANDARD_VALUE = 85.0  # fixed standard stiffness S
+STANDARD_VALUE = 8.5  # fixed standard gain S, mm/m (raw device units are 0.1 mm/m)
 RANDOM_SEED = 20240613  # fixed seed for ALL stochastic steps (bootstrap, jitter)
 N_BOOTSTRAP = 5000  # bootstrap resamples
 BOOTSTRAP_CI = 95  # confidence level (%)
@@ -132,11 +132,11 @@ LEGACY_FROZEN_DATA_PATH = os.path.join(
     "data", PSE_JND_SUMMARY_FILENAME,
 )
 
-# A JND larger than this (in stiffness units, same scale as the comparisons
-# which span 25-145) is implausible for a discrimination threshold and almost
+# A JND larger than this (in mm/m, same scale as the comparisons which span
+# 2.5-14.5) is implausible for a discrimination threshold and almost
 # always indicates a degenerate / failed psychometric fit. Used ONLY to flag
 # rows for the report and the sensitivity analysis, never to silently drop.
-JND_EXTREME_THRESHOLD = 100.0
+JND_EXTREME_THRESHOLD = 10.0
 
 # Lapse rate parameters were fitted within [0, 0.20]. A lapse value within this
 # tolerance of either bound indicates the optimiser pinned it at a limit

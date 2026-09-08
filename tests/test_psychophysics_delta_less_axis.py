@@ -106,7 +106,7 @@ def test_plot_fit_curve_uses_delta_x_and_greater_probability_y(tmp_path: Path) -
 
     fig, ax = psych.plot_fit_curve(agg, fit_row, "delta less test", tmp_path / "curve.png")
     try:
-        assert ax.get_xlabel() == "G_comparison-G_standart"
+        assert ax.get_xlabel() == psych.PSYCHOMETRIC_DELTA_AXIS_LABEL
         assert ax.get_ylabel() == "P(choose comparison > standard)"
 
         scatter_offsets = [
