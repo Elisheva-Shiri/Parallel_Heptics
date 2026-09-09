@@ -501,6 +501,63 @@ def forest_figure(setup: pd.DataFrame, pairs: pd.DataFrame, zero: pd.DataFrame, 
     return path
 
 
+def paper_figure(setup: pd.DataFrame, pairs: pd.DataFrame, zero: pd.DataFrame, path: str) -> str:
+    """Single-column, two-panel equivalence plot for the paper.
+
+    (a) PSE bias: setup difference (per participant), each finger vs 0, and the
+        six finger-pair differences, against the +/-1 JND (light) and +/-0.5 JND
+        (dark) bounds. (b) JND: setup difference and finger pairs against the
+        +/-0.5 mm/m bound. Filled = equivalent at the primary bound (Holm for
+        pairs), open = not. 90% CIs (equivalent to the two one-sided tests).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    def rows_bias():
+        s = setup[(setup.DV == "Bias") & setup.bound.str.contains("1 JND") & (setup.unit == "per participant")]
+        z = zero[zero.bound.str.contains("1 JND")]
+        p = pairs[(pairs.DV == "Bias") & pairs.bound.str.contains("1 JND")]
+        out = [("Setup: air-slide - natural", s.iloc[0].estimate, s.iloc[0].ci90_lo, s.iloc[0].ci90_hi, bool(s.iloc[0].equivalent))]
+        out += [(f"{r.finger} vs 0", r.estimate, r.ci90_lo, r.ci90_hi, bool(r.equivalent)) for _, r in z.iterrows()]
+        out += [(r.pair.replace("-", " - "), r.estimate, r.ci90_lo, r.ci90_hi, bool(r.equivalent_holm)) for _, r in p.iterrows()]
+        return out
+
+    def rows_jnd():
+        s = setup[(setup.DV == "JND") & (setup.unit == "per participant")]
+        p = pairs[pairs.DV == "JND"]
+        out = [("Setup: air-slide - natural", s.iloc[0].estimate, s.iloc[0].ci90_lo, s.iloc[0].ci90_hi, bool(s.iloc[0].equivalent))]
+        out += [(r.pair.replace("-", " - "), r.estimate, r.ci90_lo, r.ci90_hi, bool(r.equivalent_holm)) for _, r in p.iterrows()]
+        return out
+
+    panels = [("(a) PSE bias (mm/m)", rows_bias(), SESOI_BIAS["1 JND"], SESOI_BIAS["0.5 JND"]),
+              ("(b) JND (mm/m)", rows_jnd(), SESOI_JND_ABS, None)]
+    n_rows = [len(p[1]) for p in panels]
+    fig, axes = plt.subplots(2, 1, figsize=(3.45, 0.19 * sum(n_rows) + 1.3),
+                             gridspec_kw={"height_ratios": n_rows})
+    for ax, (title, rows, b1, b2) in zip(axes, panels):
+        y = np.arange(len(rows))[::-1]
+        ax.axvspan(-b1, b1, color="#e3ecf5", zorder=0, lw=0)
+        if b2 is not None:
+            ax.axvspan(-b2, b2, color="#c9d9ea", zorder=0, lw=0)
+        ax.axvline(0, color="0.4", lw=0.7)
+        for yi, (lab, est, lo, hi, ok) in zip(y, rows):
+            ax.plot([lo, hi], [yi, yi], color="#1f4e79", lw=1.4)
+            ax.plot(est, yi, "o", ms=4, mfc="#1f4e79" if ok else "white", mec="#1f4e79", mew=1.2)
+        ax.set_yticks(y); ax.set_yticklabels([r[0] for r in rows], fontsize=7)
+        ax.tick_params(axis="x", labelsize=7); ax.set_title(title, fontsize=8, loc="left")
+        ax.set_ylim(-0.7, len(rows) - 0.3)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+    axes[-1].set_xlabel("Difference [90% CI]; shading = equivalence bounds", fontsize=7)
+    fig.tight_layout(h_pad=0.6)
+    fig.savefig(path, dpi=300)
+    if path.lower().endswith(".png"):
+        fig.savefig(path[:-4] + ".pdf")
+    plt.close(fig)
+    return path
+
+
 # --------------------------------------------------------------------------- #
 # Report sentences
 # --------------------------------------------------------------------------- #
@@ -590,6 +647,8 @@ def run(out_dir: str = OUT_DIR, exclude: bool = True, verbose: bool = True) -> d
     res["jasp_csv"] = export_for_jasp(df, os.path.join(out_dir, "for_jasp_wide.csv"))
     res["figure"] = forest_figure(res["setup"], res["pairs"], res["zero"],
                                   os.path.join(out_dir, "equivalence_forest.png"))
+    res["paper_figure"] = paper_figure(res["setup"], res["pairs"], res["zero"],
+                                       os.path.join(out_dir, "equivalence_paper.png"))
     res["report"] = report_sentences(df, res["setup"], res["pairs"], res["verdict"], res["zero"],
                                      res["bf_ttest"], res["bf_pairs"], res["mde"], jnd_ref)
     with open(os.path.join(out_dir, "report_sentences.md"), "w", encoding="utf-8") as fh:
