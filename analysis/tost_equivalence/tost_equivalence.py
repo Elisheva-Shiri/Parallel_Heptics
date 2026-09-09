@@ -1,315 +1,606 @@
 """
-TOST equivalence test for finger-invariance of stiffness perception
-===================================================================
+Equivalence analysis for the setup and finger null effects (standalone)
+=======================================================================
 
-WHY THIS EXISTS
----------------
-The mixed-design ANOVA (see anova_statistics.py) finds *no significant* effect of
-finger on PSE bias or JND. A non-significant test is "absence of evidence", not
-"evidence of absence". To make the positive claim -- that the fingers are
-perceptually equivalent -- we run a Two One-Sided Tests (TOST) equivalence test.
+Goal (supervisor plan): replace "p > .05, therefore flexible finger selection"
+with "the difference, if any, is smaller than a perceptually meaningful
+amount". The analysis runs on the per-participant PSE/JND fits that fed the
+mixed-design ANOVA (one 4-parameter logistic fit per participant x finger,
+64 trials each), reads them directly from the psychophysics pipeline output,
+and does NOT depend on the anova_statistics package.
 
-TOST logic (Lakens, 2017; Schuirmann, 1987):
-  Pick a smallest effect size of interest (SESOI). Here SESOI = +/- 0.5 mm/m, the
-  same +/-0.5 mm/m band the paper already uses to call a participant "unbiased"
-  (about 6% of the 8.5 mm/m standard). Two one-sided t-tests then ask whether the
-  effect is reliably *inside* (-SESOI, +SESOI). If the 90% CI of the effect lies
-  entirely within the band (equivalently max(p_lower, p_upper) < alpha), we
-  declare statistical equivalence.
+Cohort
+------
+Participants whose raw-data folder under Parallel_Heptics/results is tagged
+"(filter)" are excluded from every analysis (currently L_E_19 and N_E_17).
+This gives N = 39 (20 air-slide, 19 natural). Unequal group sizes are handled
+by Welch's t statistic with Welch-Satterthwaite degrees of freedom, which is
+the default recommended for two-group comparisons (Delacre, Lakens & Leys,
+2017; Welch, 1947) and the form used by Lakens (2017, eq. 3-4) for TOST.
 
-WHAT IT TESTS
--------------
-  (A) One-sample TOST per finger: is that finger's mean PSE bias within +/-0.5 mm/m of 0?
-  (B) Paired TOST for every finger pair: is the per-subject PSE-bias difference
-      within +/-0.5 mm/m?
-  (C) Welch two-sample TOST for Setup (L = air-slide vs N = natural), Lakens
-      2017 eq. 3-4: is the L - N difference in bias and in JND within the
-      equivalence bounds? Run on the per-subject mean over fingers (one value
-      per participant, so the test unit matches the ANOVA) and within each
-      finger. Reported at two pre-specified bounds: the primary +/-0.5 mm/m band
-      and a secondary +/-1.0 mm/m band (a difference smaller than the 1.5 mm/m
-      spacing between adjacent comparison stimuli). A Bayes factor (BF10,
-      JZS default prior via pingouin, when installed) is given next to each
-      TOST so frequentist and Bayesian evidence for the null sit side by side,
-      as Lakens recommends.
-All are run twice:
-  - "all"   : every subject x finger fit, including degenerate ones.
-  - "clean" : dropping fits flagged excluded_from_group_analysis, and PSE biases
-              outside the tested comparison range (|bias| > 6 mm/m), which are
-              off-scale artifacts of the psignifit fallback (see the paper's
-              Statistical-analysis OPEN note). This mirrors the ANOVA sensitivity
-              analysis and is the intended primary reading.
+Steps
+-----
+0. Consistency: per-participant summaries per finger, next to the pooled fits.
+1. Bounds (pre-specified, perceptual units, mm/m):
+     bias   : +/- 1 JND  = +/- 1.6 mm/m primary;  +/- 0.5 JND = +/- 0.8 secondary
+              (two conditions whose PSEs differ by less than one JND are, by
+              construction, indistinguishable to the participants; JND_REF is
+              the median per-participant JND, ~1.6 mm/m, reported in the paper)
+     JND    : +/- 0.5 mm/m (~30% of JND_REF) on the raw scale, and a ratio
+              bound of x/1.30 .. x1.30 on the log scale (JND is a scale
+              parameter, so ratio bounds are the natural alternative).
+2. Feasibility: observed SDs and the 90% CI half-width each design can reach,
+   compared with the bound, BEFORE reading the TOST outcome.
+3. Tests: Welch two-sample TOST for Setup (per participant and per finger);
+   six paired TOSTs for finger pairs with Holm correction (equivalence of the
+   finger factor is claimed only if all six pass); one-sample TOST of each
+   finger's bias against zero. Every TOST p-value is cross-checked against
+   pingouin.tost.
+4. Bayes factors: (a) JZS Bayes factor for the per-participant Setup t-test
+   with a prior-width robustness check (r = 0.35, 0.5, 0.707, 1.0); (b) JZS
+   Bayes factor for each finger-pair paired t-test. The omnibus inclusion
+   Bayes factors (Finger, Setup x Finger) need BayesFactor::anovaBF or JASP,
+   which are not available in Python; results/for_jasp_wide.csv is exported
+   for that step. (A BIC-based mixed-model approximation was tried and
+   dropped because its fits were not stable across nested models.)
+5. Minimal detectable effect: the effect the design had 80% power to detect,
+   from the observed SDs and the actual group sizes.
 
-INPUT  : the same filtered psychophysics summary the ANOVA reads
-         (analysis/psychophysics/results/L_N_E/_working/pse_jnd_by_subject_finger.csv,
-         via anova_statistics.load_data), so the cohort is identical to the ANOVA
-OUTPUT : analysis/anova_statistics/results/equivalence/
-           tost_bias_one_sample.csv
-           tost_bias_pairwise.csv
-           tost_setup_L_vs_N.csv
-           per_finger_bias_descriptives.csv
-         and a printed summary.
+Outputs: results/*.csv, results/equivalence_forest.png, results/report_sentences.md
 
-Dependencies: numpy, pandas, scipy (same stack as anova_statistics.py);
-pingouin is optional and only adds the BF10 column.
-Run:  uv run python analysis/anova_statistics/tost_equivalence.py
+Run:  python tost_equivalence.py        (system Python: pandas, scipy,
+      pingouin, statsmodels, matplotlib)
 """
 
 from __future__ import annotations
 
+import glob
 import os
+import re
 from itertools import combinations
 
 import numpy as np
 import pandas as pd
 from scipy import stats
 
-# --- configuration ---------------------------------------------------------
+try:
+    import pingouin as pg
+except Exception:  # pragma: no cover
+    pg = None
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT_DIR = os.path.join(HERE, "results", "equivalence")
-ANOVA_DATA_SOURCE = "L_N_E"   # same psychophysics source as the ANOVA notebook
+REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
+DATA_PATH = os.path.join(
+    REPO, "analysis", "psychophysics", "results", "L_N_E", "csv", "all",
+    "shared", "pse_jnd_by_subject_finger.csv")
+POOLED_PATH = os.path.join(
+    REPO, "analysis", "psychophysics", "results", "L_N_E", "csv", "all",
+    "shared", "pse_jnd_group_by_finger.csv")
+RAW_RESULTS_DIR = os.path.join(REPO, "results")   # raw per-participant folders
+OUT_DIR = os.path.join(HERE, "results")
 
-SESOI = 0.5          # smallest effect size of interest, mm/m (the +/-0.5 band)
-SESOI_SETUP = (0.5, 1.0)  # Setup L-vs-N bounds: primary +/-0.5, secondary +/-1.0 mm/m
-ALPHA = 0.05         # equivalence declared if max(p_lower, p_upper) < ALPHA
-BIAS_VALID_ABS = 6.0  # |bias| beyond the tested +/-6 mm/m range = off-scale fit
+STANDARD = 8.5                      # mm/m
+ALPHA = 0.05
+CI_LEVEL = 0.90                     # 1 - 2*alpha, the TOST-equivalent CI
 FINGERS = ["I", "M", "R", "P"]
-FINGER_NAME = {"I": "Index", "M": "Middle", "R": "Ring", "P": "Pinky"}
-SYSTEMS = ("L", "N")   # L = air-slide (device), N = natural
+FINGER_NAME = {"I": "Index", "M": "Middle", "R": "Ring", "P": "Little"}
+SYSTEMS = ("L", "N")
+SYSTEM_NAME = {"L": "air-slide", "N": "natural"}
 
-try:  # optional: Bayes factor for the Setup comparison
-    import pingouin as _pg
-except Exception:  # pragma: no cover - pingouin is not in every environment
-    _pg = None
+# Pre-specified bounds (mm/m). Fixed constants, not derived from the data at
+# run time; JND_REF below is only computed to document the anchor.
+SESOI_BIAS = {"1 JND": 1.6, "0.5 JND": 0.8}
+SESOI_JND_ABS = 0.5
+SESOI_JND_RATIO = 1.30              # log-scale bound = +/- ln(1.30)
+
+# Participants excluded from every analysis. Derived from raw-data folders
+# tagged "(filter)"; the fallback list is used if that folder is unreachable.
+EXCLUDED_FALLBACK = ("L_E_19", "N_E_17")
 
 
-def load_long(source: str = ANOVA_DATA_SOURCE) -> pd.DataFrame:
-    """Load the SAME per-subject x finger summary the mixed-design ANOVA uses.
+def excluded_subjects() -> tuple[str, ...]:
+    """Subject ids whose raw-data folder is tagged '(filter)'."""
+    ids = set(EXCLUDED_FALLBACK)
+    try:
+        for d in os.listdir(RAW_RESULTS_DIR):
+            if "(filter)" in d:
+                m = re.match(r"([LN]_[EP]_\d+)", d)
+                if m:
+                    ids.add(m.group(1))
+    except OSError:
+        pass
+    return tuple(sorted(ids))
 
-    The psychophysics pipeline has already applied the participant exclusions
-    reported in the paper (incomplete sessions; fewer than two fingers with
-    >= 55% success), so "all" here is exactly the ANOVA's main cohort.
-    """
-    import anova_statistics as A
-    df = A.load_data(source)
-    cols = ["Subject", "System", "Finger", "Bias", "JND",
-            "fit_warning", "excluded_from_group_analysis"]
-    df = df[[c for c in cols if c in df.columns]].copy()
-    # one fit per (Subject, Finger); keep the first if duplicated
-    df = df.drop_duplicates(subset=["Subject", "Finger"], keep="first")
-    df["Bias"] = pd.to_numeric(df["Bias"], errors="coerce")
-    df["JND"] = pd.to_numeric(df["JND"], errors="coerce")
+
+# --------------------------------------------------------------------------- #
+# Data
+# --------------------------------------------------------------------------- #
+def load_fits(path: str = DATA_PATH, exclude: bool = True) -> pd.DataFrame:
+    """Per-participant x finger fits in mm/m with canonical column names."""
+    raw = pd.read_csv(path)
+    df = pd.DataFrame({
+        "Subject": raw["subject_id"].astype(str),
+        "System": raw["subject_id"].astype(str).str[0],
+        "Finger": raw["finger_condition"].astype(str),
+        "PSE": pd.to_numeric(raw["pse"], errors="coerce"),
+        "JND": pd.to_numeric(raw["jnd"], errors="coerce"),
+        "fit_quality": raw.get("fit_quality", "unknown"),
+        "fit_warning": raw.get("fit_warning", np.nan),
+        "n_trials": raw.get("n_trials", np.nan),
+    })
+    df["Bias"] = df["PSE"] - STANDARD
+    df["logJND"] = np.log(df["JND"])
+    med = df["PSE"].median()
+    if not (5.0 < med < 15.0):
+        raise ValueError(f"PSE median {med:.2f} is not in mm/m (expected ~8.5); "
+                         f"check the units of {path}")
+    if exclude:
+        df = df[~df["Subject"].isin(excluded_subjects())].copy()
+    df = df[df["Finger"].isin(FINGERS)].reset_index(drop=True)
     return df
 
 
-def clean_mask(df: pd.DataFrame) -> pd.Series:
-    """Rows kept for the 'clean' (sensitivity) analysis."""
-    excluded = df.get("excluded_from_group_analysis", False)
-    excluded = excluded.astype(str).str.lower().eq("true") if excluded is not False else False
-    off_scale = df["Bias"].abs() > BIAS_VALID_ABS
-    return (~excluded) & (~off_scale) & df["Bias"].notna()
+def subject_means(df: pd.DataFrame, dv: str) -> pd.DataFrame:
+    """One value per participant: mean over the four fingers (complete cases)."""
+    wide = df.pivot_table(index=["Subject", "System"], columns="Finger", values=dv)
+    wide = wide.dropna(subset=FINGERS)
+    return wide.mean(axis=1).reset_index(name=dv)
 
 
-def tost_one_sample(x: np.ndarray, sesoi: float):
-    """One-sample TOST of mean(x) against the interval (-sesoi, +sesoi)."""
-    x = np.asarray(x, float)
-    x = x[np.isfinite(x)]
+def wide_by_finger(df: pd.DataFrame, dv: str) -> pd.DataFrame:
+    w = df.pivot_table(index="Subject", columns="Finger", values=dv)
+    return w.dropna(subset=FINGERS)
+
+
+# --------------------------------------------------------------------------- #
+# Step 0: consistency of per-participant fits with the pooled fits
+# --------------------------------------------------------------------------- #
+def step0_consistency(df: pd.DataFrame, pooled_path: str = POOLED_PATH) -> pd.DataFrame:
+    rows = []
+    pooled = pd.read_csv(pooled_path) if os.path.exists(pooled_path) else None
+    for f in FINGERS:
+        sub = df[df["Finger"] == f]
+        row = {"Finger": FINGER_NAME[f], "n fits": int(len(sub)),
+               "trials/fit": int(sub["n_trials"].median()) if sub["n_trials"].notna().any() else np.nan}
+        for dv in ("Bias", "JND"):
+            v = sub[dv].dropna()
+            q1, med, q3 = np.percentile(v, [25, 50, 75])
+            row[f"{dv} mean"] = v.mean(); row[f"{dv} SD"] = v.std(ddof=1)
+            row[f"{dv} median"] = med; row[f"{dv} IQR"] = f"[{q1:.2f}, {q3:.2f}]"
+        if pooled is not None and "finger_condition" in pooled:
+            p = pooled[pooled["finger_condition"] == f]
+            if len(p):
+                row["pooled bias"] = float(p["pse"].iloc[0]) - STANDARD
+                row["pooled JND"] = float(p["jnd"].iloc[0])
+                row["pooled trials"] = int(p["n_trials"].iloc[0]) if "n_trials" in p else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def jnd_reference(df: pd.DataFrame) -> float:
+    """Median per-participant JND: the perceptual anchor for the bias bound."""
+    return float(df["JND"].median())
+
+
+# --------------------------------------------------------------------------- #
+# TOST primitives (Lakens 2017)
+# --------------------------------------------------------------------------- #
+def _lakens_outcome(equivalent: bool, different: bool) -> str:
+    if equivalent and not different:
+        return "A: equivalent, not different"
+    if not equivalent and different:
+        return "B: different, not equivalent"
+    if equivalent and different:
+        return "C: different but equivalent (trivial)"
+    return "D: undetermined"
+
+
+def _finish(est, se, dof, low, high):
+    t_low = (est - low) / se           # H0: est <= low
+    t_up = (est - high) / se           # H0: est >= high
+    p_low = stats.t.sf(t_low, dof)
+    p_up = stats.t.cdf(t_up, dof)
+    p_tost = max(p_low, p_up)
+    tcrit = stats.t.ppf(1 - ALPHA, dof)
+    t_nhst = est / se
+    p_nhst = 2 * stats.t.sf(abs(t_nhst), dof)
+    eq = bool(p_tost < ALPHA)
+    diff = bool(p_nhst < ALPHA)
+    return dict(estimate=float(est), se=float(se), df=float(dof),
+                ci90_lo=float(est - tcrit * se), ci90_hi=float(est + tcrit * se),
+                bound_lo=float(low), bound_hi=float(high),
+                t_lower=float(t_low), t_upper=float(t_up),
+                p_lower=float(p_low), p_upper=float(p_up), p_tost=float(p_tost),
+                t_nhst=float(t_nhst), p_nhst=float(p_nhst),
+                equivalent=eq, different=diff, outcome=_lakens_outcome(eq, diff))
+
+
+def tost_one_sample(x, low, high, mu=0.0):
+    """Lakens (2017) eq. 7. Also used for paired data on the differences."""
+    x = np.asarray(x, float); x = x[np.isfinite(x)]
     n = x.size
-    mean = float(np.mean(x))
-    sd = float(np.std(x, ddof=1)) if n > 1 else float("nan")
-    se = sd / np.sqrt(n) if n > 1 else float("nan")
-    df = n - 1
-    # H0_lower: mean <= -sesoi  ->  reject if mean reliably > -sesoi
-    t_lower = (mean - (-sesoi)) / se
-    p_lower = stats.t.sf(t_lower, df)          # P(T > t_lower)
-    # H0_upper: mean >= +sesoi  ->  reject if mean reliably < +sesoi
-    t_upper = (mean - sesoi) / se
-    p_upper = stats.t.cdf(t_upper, df)         # P(T < t_upper)
-    p_tost = max(p_lower, p_upper)
-    # 90% CI (equivalent to the two one-sided 95% tests)
-    tcrit = stats.t.ppf(1 - ALPHA, df)
-    ci_lo, ci_hi = mean - tcrit * se, mean + tcrit * se
-    return dict(n=n, mean=mean, sd=sd, se=se,
-                p_lower=p_lower, p_upper=p_upper, p_tost=p_tost,
-                ci90_lo=ci_lo, ci90_hi=ci_hi,
-                equivalent=bool(p_tost < ALPHA))
+    est = x.mean() - mu
+    se = x.std(ddof=1) / np.sqrt(n)
+    out = _finish(est, se, n - 1, low, high)
+    out.update(n=int(n), sd=float(x.std(ddof=1)))
+    return out
 
 
-def tost_welch_two_sample(a: np.ndarray, b: np.ndarray, sesoi: float):
-    """Two-sample TOST of mean(a) - mean(b) against (-sesoi, +sesoi).
+def tost_welch(a, b, low, high):
+    """Lakens (2017) eq. 3-4: Welch t with Welch-Satterthwaite df.
 
-    Welch's unequal-variance form (Lakens 2017, eq. 3) with Satterthwaite
-    degrees of freedom (eq. 4). Lakens recommends this form by default because
-    the two groups need not share a variance.
+    Each group's variance is divided by its own n, so unequal group sizes
+    (20 vs 19) need no weighting; the df formula accounts for them.
     """
     a = np.asarray(a, float); a = a[np.isfinite(a)]
     b = np.asarray(b, float); b = b[np.isfinite(b)]
     n1, n2 = a.size, b.size
-    diff = float(np.mean(a) - np.mean(b))
     v1, v2 = a.var(ddof=1) / n1, b.var(ddof=1) / n2
-    se = float(np.sqrt(v1 + v2))
-    df = (v1 + v2) ** 2 / (v1 ** 2 / (n1 - 1) + v2 ** 2 / (n2 - 1))
-    t_lower = (diff + sesoi) / se            # H0_lower: diff <= -sesoi
-    t_upper = (diff - sesoi) / se            # H0_upper: diff >= +sesoi
-    p_lower = stats.t.sf(t_lower, df)
-    p_upper = stats.t.cdf(t_upper, df)
-    p_tost = max(p_lower, p_upper)
-    tcrit = stats.t.ppf(1 - ALPHA, df)
-    ci_lo, ci_hi = diff - tcrit * se, diff + tcrit * se
-    # Companion NHST (Welch t-test) so the four Lakens outcomes can be named.
-    t_nhst = diff / se
-    p_nhst = 2 * stats.t.sf(abs(t_nhst), df)
-    return dict(n_L=n1, n_N=n2, mean_L=float(np.mean(a)), mean_N=float(np.mean(b)),
-                sd_L=float(a.std(ddof=1)), sd_N=float(b.std(ddof=1)),
-                diff=diff, se=se, df_welch=float(df),
-                t_lower=float(t_lower), t_upper=float(t_upper),
-                p_lower=float(p_lower), p_upper=float(p_upper), p_tost=float(p_tost),
-                ci90_lo=float(ci_lo), ci90_hi=float(ci_hi),
-                t_nhst=float(t_nhst), p_nhst=float(p_nhst),
-                equivalent=bool(p_tost < ALPHA),
-                different=bool(p_nhst < ALPHA))
+    se = np.sqrt(v1 + v2)
+    dof = (v1 + v2) ** 2 / (v1 ** 2 / (n1 - 1) + v2 ** 2 / (n2 - 1))
+    out = _finish(a.mean() - b.mean(), se, dof, low, high)
+    out.update(n1=int(n1), n2=int(n2), mean1=float(a.mean()), mean2=float(b.mean()),
+               sd1=float(a.std(ddof=1)), sd2=float(b.std(ddof=1)))
+    return out
 
 
-def bayes_factor_10(a: np.ndarray, b: np.ndarray) -> float:
-    """BF10 for an independent-samples Welch t-test (JZS default prior).
-
-    Values below 1 favour the null; 1/3 to 1 is anecdotal, 1/10 to 1/3
-    moderate evidence for no difference. NaN when pingouin is unavailable.
-    """
-    if _pg is None:
-        return float("nan")
-    a = np.asarray(a, float); a = a[np.isfinite(a)]
-    b = np.asarray(b, float); b = b[np.isfinite(b)]
+def pingouin_tost_p(x, y=None, bound=1.0, paired=False):
+    """Cross-check: pingouin's symmetric-bound TOST p-value (Welch for 2 groups)."""
+    if pg is None:
+        return np.nan
     try:
-        res = _pg.ttest(a, b, paired=False, correction=True)
-        return float(res["BF10"].iloc[0])
-    except Exception:  # pragma: no cover - defensive
-        return float("nan")
+        if y is None:
+            res = pg.tost(np.asarray(x, float), np.zeros(len(x)), bound=bound, paired=True)
+        else:
+            res = pg.tost(np.asarray(x, float), np.asarray(y, float), bound=bound,
+                          paired=paired, correction=(not paired))
+        return float(res["pval"].iloc[0])
+    except Exception:
+        return np.nan
 
 
-def lakens_outcome(row) -> str:
-    """Name the outcome using Lakens (2017) Figure 1 scenarios."""
-    if row["equivalent"] and not row["different"]:
-        return "A: equivalent, not different"
-    if not row["equivalent"] and row["different"]:
-        return "B: not equivalent, different"
-    if row["equivalent"] and row["different"]:
-        return "C: equivalent AND different (trivially small effect)"
-    return "D: undetermined (neither)"
+def holm(pvals):
+    p = np.asarray(pvals, float)
+    order = np.argsort(p)
+    m = len(p)
+    adj = np.empty(m)
+    running = 0.0
+    for rank, idx in enumerate(order):
+        running = max(running, (m - rank) * p[idx])
+        adj[idx] = min(1.0, running)
+    return adj
 
 
-def run():
-    os.makedirs(OUT_DIR, exist_ok=True)
-    df = load_long()
-    datasets = {"all": df, "clean": df[clean_mask(df)]}
-
-    # --- descriptives -----------------------------------------------------
-    desc_rows = []
-    for label, d in datasets.items():
-        for f in FINGERS:
-            b = d.loc[d["Finger"] == f, "Bias"].to_numpy(float)
-            b = b[np.isfinite(b)]
-            j = d.loc[d["Finger"] == f, "JND"].to_numpy(float)
-            j = j[np.isfinite(j)]
-            desc_rows.append(dict(
-                dataset=label, Finger=f, name=FINGER_NAME[f], n=b.size,
-                bias_mean=np.mean(b) if b.size else np.nan,
-                bias_sd=np.std(b, ddof=1) if b.size > 1 else np.nan,
-                jnd_mean=np.mean(j) if j.size else np.nan,
-                jnd_median=np.median(j) if j.size else np.nan,
-            ))
-    desc = pd.DataFrame(desc_rows)
-    desc.to_csv(os.path.join(OUT_DIR, "per_finger_bias_descriptives.csv"), index=False)
-
-    # --- (A) one-sample TOST per finger ----------------------------------
-    one_rows = []
-    for label, d in datasets.items():
-        for f in FINGERS:
-            b = d.loc[d["Finger"] == f, "Bias"].to_numpy(float)
-            res = tost_one_sample(b, SESOI)
-            one_rows.append(dict(dataset=label, Finger=f, name=FINGER_NAME[f],
-                                 sesoi=SESOI, **res))
-    one = pd.DataFrame(one_rows)
-    one.to_csv(os.path.join(OUT_DIR, "tost_bias_one_sample.csv"), index=False)
-
-    # --- (B) paired TOST per finger pair ---------------------------------
-    pair_rows = []
-    for label, d in datasets.items():
-        wide = d.pivot_table(index="Subject", columns="Finger", values="Bias")
-        for fa, fb in combinations(FINGERS, 2):
-            if fa not in wide or fb not in wide:
-                continue
-            diff = (wide[fa] - wide[fb]).to_numpy(float)
-            diff = diff[np.isfinite(diff)]
-            if diff.size < 2:
-                continue
-            res = tost_one_sample(diff, SESOI)
-            pair_rows.append(dict(dataset=label, pair=f"{fa}-{fb}",
-                                  sesoi=SESOI, **res))
-    pair = pd.DataFrame(pair_rows)
-    pair.to_csv(os.path.join(OUT_DIR, "tost_bias_pairwise.csv"), index=False)
-
-    # --- (C) Welch two-sample TOST: Setup L vs N ---------------------------
-    setup_rows = []
-    for label, d in datasets.items():
-        for dv in ("Bias", "JND"):
-            # Unit = participant: mean over the four fingers. Only participants
-            # with all four fingers are kept, matching the complete-case rule
-            # of the mixed-design ANOVA (so N matches the ANOVA table).
-            wide = d.pivot_table(index=["Subject", "System"], columns="Finger",
-                                 values=dv)
-            complete = wide.dropna(subset=[f for f in FINGERS if f in wide])
-            subj_mean = complete.mean(axis=1).reset_index(name=dv)
-            groups = {"subject_mean": subj_mean}
+# --------------------------------------------------------------------------- #
+# Step 2: feasibility (can the CI fit inside the bound if the true effect is 0?)
+# --------------------------------------------------------------------------- #
+def step2_feasibility(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for dv, bounds in (("Bias", SESOI_BIAS), ("JND", {"0.5 mm/m": SESOI_JND_ABS}),
+                       ("logJND", {"x1.30": np.log(SESOI_JND_RATIO)})):
+        sm = subject_means(df, dv)
+        a = sm.loc[sm.System == "L", dv].to_numpy(); b = sm.loc[sm.System == "N", dv].to_numpy()
+        v1, v2 = a.var(ddof=1) / len(a), b.var(ddof=1) / len(b)
+        dof = (v1 + v2) ** 2 / (v1 ** 2 / (len(a) - 1) + v2 ** 2 / (len(b) - 1))
+        hw = stats.t.ppf(1 - ALPHA, dof) * np.sqrt(v1 + v2)
+        for bname, bval in bounds.items():
+            rows.append(dict(DV=dv, comparison="Setup, per participant", n=f"{len(a)} vs {len(b)}",
+                             SD=f"{a.std(ddof=1):.2f} / {b.std(ddof=1):.2f}",
+                             ci90_halfwidth=hw, bound=bval, bound_name=bname,
+                             feasible=bool(hw < bval)))
+        w = wide_by_finger(df, dv)
+        d = np.concatenate([(w[x] - w[y]).to_numpy() for x, y in combinations(FINGERS, 2)])
+        sd_diff = np.median([np.std(w[x] - w[y], ddof=1) for x, y in combinations(FINGERS, 2)])
+        hw = stats.t.ppf(1 - ALPHA, len(w) - 1) * sd_diff / np.sqrt(len(w))
+        for bname, bval in bounds.items():
+            rows.append(dict(DV=dv, comparison="Finger pairs (paired), median SD of diffs",
+                             n=str(len(w)), SD=f"{sd_diff:.2f}", ci90_halfwidth=hw,
+                             bound=bval, bound_name=bname, feasible=bool(hw < bval)))
+        if dv == "Bias":
             for f in FINGERS:
-                groups[f] = d.loc[d["Finger"] == f, ["System", dv]]
-            for unit, g in groups.items():
-                a = g.loc[g["System"] == SYSTEMS[0], dv].to_numpy(float)
-                b = g.loc[g["System"] == SYSTEMS[1], dv].to_numpy(float)
-                if np.isfinite(a).sum() < 2 or np.isfinite(b).sum() < 2:
-                    continue
-                bf10 = bayes_factor_10(a, b)
-                for sesoi in SESOI_SETUP:
-                    res = tost_welch_two_sample(a, b, sesoi)
-                    res["outcome"] = lakens_outcome(res)
-                    setup_rows.append(dict(
-                        dataset=label, DV=dv, unit=unit,
-                        name=FINGER_NAME.get(unit, "mean over fingers"),
-                        sesoi=sesoi, BF10=bf10, **res))
-    setup = pd.DataFrame(setup_rows)
-    setup.to_csv(os.path.join(OUT_DIR, "tost_setup_L_vs_N.csv"), index=False)
+                x = df.loc[df.Finger == f, dv].dropna().to_numpy()
+                hw = stats.t.ppf(1 - ALPHA, len(x) - 1) * x.std(ddof=1) / np.sqrt(len(x))
+                for bname, bval in bounds.items():
+                    rows.append(dict(DV=dv, comparison=f"Bias vs 0, {FINGER_NAME[f]}", n=str(len(x)),
+                                     SD=f"{x.std(ddof=1):.2f}", ci90_halfwidth=hw,
+                                     bound=bval, bound_name=bname, feasible=bool(hw < bval)))
+    return pd.DataFrame(rows)
 
-    # --- summary ----------------------------------------------------------
-    def show(title, frame, key):
-        print(f"\n=== {title} ===")
-        with pd.option_context("display.width", 160,
-                               "display.max_columns", 20,
-                               "display.float_format", lambda v: f"{v:8.3f}"):
-            cols = [key, "dataset", "n", "mean", "ci90_lo", "ci90_hi",
-                    "p_tost", "equivalent"]
-            print(frame[cols].to_string(index=False))
 
-    print(f"SESOI = +/-{SESOI} mm/m, alpha = {ALPHA}")
-    print(f"Loaded {len(df)} subject x finger fits; "
-          f"clean set keeps {int(clean_mask(df).sum())}.")
-    show("(A) One-sample TOST: finger bias within +/-5 mm/m of 0",
-         one, "name")
-    show("(B) Paired TOST: finger-pair bias difference within +/-5 mm/m",
-         pair, "pair")
-    print("\n=== (C) Welch TOST: Setup L - N (Lakens 2017 eq. 3-4), "
-          "with BF10 (JZS; <1 favours no difference) ===")
-    with pd.option_context("display.width", 200, "display.max_columns", 30,
-                           "display.float_format", lambda v: f"{v:8.3f}"):
-        cols = ["dataset", "DV", "unit", "sesoi", "n_L", "n_N", "diff",
-                "ci90_lo", "ci90_hi", "p_tost", "equivalent", "p_nhst",
-                "BF10", "outcome"]
-        print(setup[cols].to_string(index=False))
-    print("\nDescriptives:")
-    print(desc.to_string(index=False,
-                         float_format=lambda v: f"{v:8.3f}"))
-    print(f"\nWrote CSVs to {OUT_DIR}")
-    return {"one_sample": one, "pairwise": pair, "setup": setup,
-            "descriptives": desc}
+# --------------------------------------------------------------------------- #
+# Step 3: the tests
+# --------------------------------------------------------------------------- #
+def _dv_bounds():
+    """(dv, label, low, high, pingouin_bound) for every DV/bound combination."""
+    out = []
+    for name, b in SESOI_BIAS.items():
+        out.append(("Bias", f"bias +/-{b} ({name})", -b, b, b))
+    out.append(("JND", f"JND +/-{SESOI_JND_ABS} mm/m", -SESOI_JND_ABS, SESOI_JND_ABS, SESOI_JND_ABS))
+    lb = np.log(SESOI_JND_RATIO)
+    out.append(("logJND", f"JND ratio x{SESOI_JND_RATIO}", -lb, lb, lb))
+    return out
+
+
+def step3_setup(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for dv, label, lo, hi, pb in _dv_bounds():
+        units = {"per participant": subject_means(df, dv)}
+        for f in FINGERS:
+            units[FINGER_NAME[f]] = df.loc[df.Finger == f, ["System", dv]]
+        for unit, g in units.items():
+            a = g.loc[g.System == "L", dv].dropna().to_numpy()
+            b = g.loc[g.System == "N", dv].dropna().to_numpy()
+            r = tost_welch(a, b, lo, hi)
+            r["p_tost_pingouin"] = pingouin_tost_p(a, b, bound=pb, paired=False)
+            rows.append(dict(DV=dv, bound=label, unit=unit, **r))
+    out = pd.DataFrame(rows)
+    if "logJND" in set(out.DV):   # add ratio columns for readability
+        m = out.DV == "logJND"
+        for c in ("estimate", "ci90_lo", "ci90_hi"):
+            out.loc[m, c + "_ratio"] = np.exp(out.loc[m, c])
+    return out
+
+
+def step3_finger_pairs(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for dv, label, lo, hi, pb in _dv_bounds():
+        w = wide_by_finger(df, dv)
+        block = []
+        for x, y in combinations(FINGERS, 2):
+            d = (w[x] - w[y]).to_numpy()
+            r = tost_one_sample(d, lo, hi)
+            r["p_tost_pingouin"] = pingouin_tost_p(w[x].to_numpy(), w[y].to_numpy(), bound=pb, paired=True)
+            block.append(dict(DV=dv, bound=label, pair=f"{FINGER_NAME[x]}-{FINGER_NAME[y]}", **r))
+        ph = holm([b["p_tost"] for b in block])
+        for b, p in zip(block, ph):
+            b["p_tost_holm"] = float(p)
+            b["equivalent_holm"] = bool(p < ALPHA)
+        rows += block
+    out = pd.DataFrame(rows)
+    return out
+
+
+def step3_bias_vs_zero(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for name, b in SESOI_BIAS.items():
+        for f in FINGERS:
+            x = df.loc[df.Finger == f, "Bias"].dropna().to_numpy()
+            r = tost_one_sample(x, -b, b)
+            r["p_tost_pingouin"] = pingouin_tost_p(x, None, bound=b)
+            rows.append(dict(DV="Bias", bound=f"bias +/-{b} ({name})", finger=FINGER_NAME[f], **r))
+    return pd.DataFrame(rows)
+
+
+def finger_factor_verdict(pairs: pd.DataFrame) -> pd.DataFrame:
+    """Equivalence of the Finger factor: all six Holm-corrected pairs must pass."""
+    g = pairs.groupby(["DV", "bound"])
+    return g.agg(n_pairs=("pair", "size"),
+                 n_equivalent_holm=("equivalent_holm", "sum"),
+                 all_six_pass=("equivalent_holm", "all"),
+                 max_p_holm=("p_tost_holm", "max")).reset_index()
+
+
+# --------------------------------------------------------------------------- #
+# Step 4: Bayes factors
+# --------------------------------------------------------------------------- #
+def step4_bf_setup_ttest(df: pd.DataFrame, radii=(0.35, 0.5, 0.707, 1.0)) -> pd.DataFrame:
+    """JZS BF01 for the per-participant Setup comparison, with prior-width check."""
+    rows = []
+    if pg is None:
+        return pd.DataFrame(rows)
+    for dv in ("Bias", "JND", "logJND"):
+        sm = subject_means(df, dv)
+        a = sm.loc[sm.System == "L", dv].to_numpy(); b = sm.loc[sm.System == "N", dv].to_numpy()
+        t = tost_welch(a, b, -1, 1)["t_nhst"]
+        row = dict(DV=dv, unit="per participant", n1=len(a), n2=len(b), t_welch=t)
+        for r in radii:
+            bf10 = float(pg.bayesfactor_ttest(t, len(a), len(b), paired=False, r=r))
+            row[f"BF01 (r={r})"] = 1.0 / bf10
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def step4_bf_finger_pairs(df: pd.DataFrame, r: float = 0.707) -> pd.DataFrame:
+    """JZS BF01 for each finger pair (paired t) and, per DV, the smallest BF01.
+
+    The omnibus inclusion Bayes factors for Finger and Setup x Finger require
+    BayesFactor::anovaBF or JASP; use results/for_jasp_wide.csv for those.
+    """
+    rows = []
+    if pg is None:
+        return pd.DataFrame(rows)
+    for dv in ("Bias", "JND", "logJND"):
+        w = wide_by_finger(df, dv)
+        for x, y in combinations(FINGERS, 2):
+            d = (w[x] - w[y]).to_numpy()
+            t = d.mean() / (d.std(ddof=1) / np.sqrt(len(d)))
+            bf10 = float(pg.bayesfactor_ttest(t, len(d), paired=True, r=r))
+            rows.append(dict(DV=dv, pair=f"{FINGER_NAME[x]}-{FINGER_NAME[y]}", n=len(d),
+                             t=float(t), BF01=1.0 / bf10, BF10=bf10))
+    out = pd.DataFrame(rows)
+    out["evidence"] = out["BF01"].apply(
+        lambda v: "strong for null" if v > 10 else "moderate for null" if v > 3
+        else "anecdotal for null" if v > 1 else "anecdotal for effect" if v > 1/3
+        else "moderate for effect" if v > 0.1 else "strong for effect")
+    return out
+
+
+def export_for_jasp(df: pd.DataFrame, path: str) -> str:
+    """Wide file (one row per participant) for a Bayesian RM ANOVA in JASP."""
+    frames = []
+    for dv in ("Bias", "JND", "logJND"):
+        w = df.pivot_table(index=["Subject", "System"], columns="Finger", values=dv)
+        w.columns = [f"{dv}_{c}" for c in w.columns]
+        frames.append(w)
+    wide = pd.concat(frames, axis=1).reset_index()
+    wide.to_csv(path, index=False)
+    return path
+
+
+# --------------------------------------------------------------------------- #
+# Step 5: minimal detectable effect (80% power, two-sided alpha .05)
+# --------------------------------------------------------------------------- #
+def step5_mde(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for dv in ("Bias", "JND", "logJND"):
+        sm = subject_means(df, dv)
+        a = sm.loc[sm.System == "L", dv].to_numpy(); b = sm.loc[sm.System == "N", dv].to_numpy()
+        sp = np.sqrt(((len(a) - 1) * a.var(ddof=1) + (len(b) - 1) * b.var(ddof=1)) / (len(a) + len(b) - 2))
+        if pg is not None:
+            d80 = float(pg.power_ttest2n(nx=len(a), ny=len(b), power=0.8, alpha=ALPHA))
+        else:
+            d80 = np.nan
+        rows.append(dict(DV=dv, comparison="Setup, per participant", n=f"{len(a)} vs {len(b)}",
+                         pooled_SD=sp, d_80=d80, MDE=d80 * sp))
+        w = wide_by_finger(df, dv)
+        sd_diff = float(np.median([np.std(w[x] - w[y], ddof=1) for x, y in combinations(FINGERS, 2)]))
+        dz80 = float(pg.power_ttest(n=len(w), power=0.8, alpha=ALPHA, contrast="paired")) if pg else np.nan
+        rows.append(dict(DV=dv, comparison="Finger pair (paired), median SD of diffs", n=str(len(w)),
+                         pooled_SD=sd_diff, d_80=dz80, MDE=dz80 * sd_diff))
+    out = pd.DataFrame(rows)
+    m = out.DV == "logJND"
+    out.loc[m, "MDE_ratio"] = np.exp(out.loc[m, "MDE"])
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Figure: estimates with 90% CI against the equivalence bounds
+# --------------------------------------------------------------------------- #
+def forest_figure(setup: pd.DataFrame, pairs: pd.DataFrame, zero: pd.DataFrame, path: str) -> str:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    panels = [
+        ("Setup: air-slide - natural, bias (mm/m)", setup[(setup.DV == "Bias") & setup.bound.str.contains("1 JND")], "unit", SESOI_BIAS["1 JND"], SESOI_BIAS["0.5 JND"]),
+        ("Finger pairs, bias (mm/m)", pairs[(pairs.DV == "Bias") & pairs.bound.str.contains("1 JND")], "pair", SESOI_BIAS["1 JND"], SESOI_BIAS["0.5 JND"]),
+        ("Bias vs 0 (mm/m)", zero[zero.bound.str.contains("1 JND")], "finger", SESOI_BIAS["1 JND"], SESOI_BIAS["0.5 JND"]),
+        ("Setup: air-slide - natural, JND (mm/m)", setup[setup.DV == "JND"], "unit", SESOI_JND_ABS, None),
+        ("Finger pairs, JND (mm/m)", pairs[pairs.DV == "JND"], "pair", SESOI_JND_ABS, None),
+    ]
+    fig, axes = plt.subplots(1, len(panels), figsize=(3.2 * len(panels), 4.2))
+    for ax, (title, frame, labcol, b1, b2) in zip(axes, panels):
+        frame = frame.reset_index(drop=True)
+        y = np.arange(len(frame))[::-1]
+        ax.axvspan(-b1, b1, color="#dfe9f3", zorder=0)
+        if b2 is not None:
+            ax.axvspan(-b2, b2, color="#c3d5e8", zorder=0)
+        ax.axvline(0, color="grey", lw=0.8)
+        ok = frame["equivalent"].to_numpy() if "equivalent_holm" not in frame else frame["equivalent_holm"].to_numpy()
+        for yi, (_, r), e in zip(y, frame.iterrows(), ok):
+            ax.plot([r.ci90_lo, r.ci90_hi], [yi, yi], color="#1f4e79" if e else "#b03a2e", lw=2)
+            ax.plot(r.estimate, yi, "o", color="#1f4e79" if e else "#b03a2e", ms=5)
+        ax.set_yticks(y); ax.set_yticklabels(frame[labcol]); ax.set_title(title, fontsize=9)
+        ax.tick_params(labelsize=8)
+    fig.suptitle("Effect estimates with 90% CI against equivalence bounds (blue = equivalent, red = not)", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200); plt.close(fig)
+    return path
+
+
+# --------------------------------------------------------------------------- #
+# Report sentences
+# --------------------------------------------------------------------------- #
+def _fmt_p(p):
+    return "< .001" if p < 0.001 else f"= {p:.3f}"
+
+
+def report_sentences(df, setup, pairs, verdict, zero, bf_t, bf_pairs, mde, jnd_ref) -> str:
+    n1 = int((subject_means(df, "Bias").System == "L").sum()); n2 = int((subject_means(df, "Bias").System == "N").sum())
+    sb = setup[(setup.DV == "Bias") & setup.bound.str.contains("1 JND") & (setup.unit == "per participant")].iloc[0]
+    sj = setup[(setup.DV == "JND") & (setup.unit == "per participant")].iloc[0]
+    sr = setup[(setup.DV == "logJND") & (setup.unit == "per participant")].iloc[0]
+    vb = verdict[(verdict.DV == "Bias") & verdict.bound.str.contains("1 JND")].iloc[0]
+    vj = verdict[verdict.DV == "JND"].iloc[0]
+    vr = verdict[verdict.DV == "logJND"].iloc[0]
+    zb = zero[zero.bound.str.contains("1 JND")]
+    pb = bf_pairs[bf_pairs.DV == "Bias"]; pj = bf_pairs[bf_pairs.DV == "logJND"]
+    diffj = pairs[(pairs.DV == "JND") & pairs.different]
+    mb = mde[(mde.DV == "Bias") & mde.comparison.str.startswith("Setup")].iloc[0]
+    mj = mde[(mde.DV == "JND") & mde.comparison.str.startswith("Setup")].iloc[0]
+    bt = bf_t.set_index("DV")
+
+    lines = []
+    lines.append("## Results paragraph (after the mixed-design ANOVA)\n")
+    lines.append(
+        f"Because a non-significant ANOVA cannot establish the absence of an effect, we tested equivalence with two "
+        f"one-sided tests (TOST; Lakens, 2017) on the per-participant fits (N = {n1 + n2}; {n1} air-slide, {n2} natural). "
+        f"Bounds were pre-specified in perceptual units: +/-1 JND (+/-{SESOI_BIAS['1 JND']} mm/m; median per-participant JND "
+        f"= {jnd_ref:.2f} mm/m) for PSE bias, with +/-0.5 JND (+/-{SESOI_BIAS['0.5 JND']} mm/m) as a stricter secondary bound, "
+        f"and +/-{SESOI_JND_ABS} mm/m (about 30% of the JND) or a x{SESOI_JND_RATIO} ratio for JND. Setup comparisons used "
+        f"Welch's t with Welch-Satterthwaite degrees of freedom (Delacre et al., 2017), finger pairs used paired TOSTs "
+        f"with Holm correction, and equivalence was declared when the 90% CI lay within the bounds.\n")
+    lines.append(
+        f"PSE bias was statistically equivalent between setups within +/-1 JND (air-slide minus natural = {sb.estimate:.2f} mm/m, "
+        f"90% CI [{sb.ci90_lo:.2f}, {sb.ci90_hi:.2f}], t({sb.df:.1f}) = {(sb.t_lower if sb.p_lower >= sb.p_upper else sb.t_upper):.2f}, "
+        f"p_TOST {_fmt_p(sb.p_tost)}){' and' if vb.all_six_pass else ', but not'} across all six finger pairs "
+        f"(Holm-corrected p_TOST max {_fmt_p(vb.max_p_holm)}). "
+        + ("Each finger's bias was equivalent to zero within +/-1 JND (all p_TOST " + _fmt_p(zb.p_tost.max()) + "). "
+           if zb.equivalent.all() else
+           "Bias was equivalent to zero within +/-1 JND for " + ", ".join(zb.loc[zb.equivalent, 'finger']) + ". "))
+    lines.append(
+        f"For JND, the setup difference was {sj.estimate:.2f} mm/m (90% CI [{sj.ci90_lo:.2f}, {sj.ci90_hi:.2f}], "
+        f"p_TOST {_fmt_p(sj.p_tost)} at +/-{SESOI_JND_ABS} mm/m; ratio {np.exp(sr.estimate):.2f}, 90% CI "
+        f"[{np.exp(sr.ci90_lo):.2f}, {np.exp(sr.ci90_hi):.2f}], p_TOST {_fmt_p(sr.p_tost)} at x{SESOI_JND_RATIO}), so "
+        f"{'equivalence was established' if (sj.equivalent or sr.equivalent) else 'equivalence could not be established'}; "
+        f"across finger pairs {int(vj.n_equivalent_holm)}/6 (absolute) and {int(vr.n_equivalent_holm)}/6 (ratio) passed.\n")
+    if len(diffj):
+        lines.append(
+            "Finger pairs whose JND differed (90% CI excluding zero): " + "; ".join(
+                f"{r.pair} {r.estimate:.2f} mm/m [{r.ci90_lo:.2f}, {r.ci90_hi:.2f}]" for _, r in diffj.iterrows()) + ".\n")
+    lines.append(
+        f"Bayes factors complemented the TOST: for the per-participant setup comparison BF01 = {bt.loc['Bias','BF01 (r=0.707)']:.2f} "
+        f"(bias) and {bt.loc['logJND','BF01 (r=0.707)']:.2f} (log JND) with the default JZS prior (r = 0.707; over r = 0.35-1.0: "
+        f"{bt.loc['Bias',[c for c in bt.columns if c.startswith('BF01')]].min():.2f}-{bt.loc['Bias',[c for c in bt.columns if c.startswith('BF01')]].max():.2f} for bias). "
+        f"Paired JZS Bayes factors for the six finger pairs ranged over BF01 = {pb.BF01.min():.2f}-{pb.BF01.max():.2f} for bias and "
+        f"{pj.BF01.min():.2f}-{pj.BF01.max():.2f} for log JND (smallest: {pj.loc[pj.BF01.idxmin(),'pair']}). "
+        f"[Omnibus inclusion BF01 for Finger and Setup x Finger: fill from JASP using results/for_jasp_wide.csv.]\n")
+    lines.append(
+        f"With {n1} vs {n2} participants and the observed SDs, the design had 80% power to detect a setup difference of "
+        f"{mb.MDE:.2f} mm/m in bias and {mj.MDE:.2f} mm/m in JND.\n")
+    lines.append("\n## Discussion sentence\n")
+    lines.append(
+        "Use 'evidence for equivalence' only where the TOST passed (bias, within one JND), 'evidence for the null' where only "
+        "the Bayes factor supports it, and never 'proved no difference'.\n")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration
+# --------------------------------------------------------------------------- #
+def run(out_dir: str = OUT_DIR, exclude: bool = True, verbose: bool = True) -> dict:
+    os.makedirs(out_dir, exist_ok=True)
+    df = load_fits(exclude=exclude)
+    jnd_ref = jnd_reference(df)
+    res = {"data": df, "jnd_ref": jnd_ref, "excluded": excluded_subjects()}
+    res["step0"] = step0_consistency(df)
+    res["step2"] = step2_feasibility(df)
+    res["setup"] = step3_setup(df)
+    res["pairs"] = step3_finger_pairs(df)
+    res["verdict"] = finger_factor_verdict(res["pairs"])
+    res["zero"] = step3_bias_vs_zero(df)
+    res["bf_ttest"] = step4_bf_setup_ttest(df)
+    res["bf_pairs"] = step4_bf_finger_pairs(df)
+    res["mde"] = step5_mde(df)
+    for k in ("step0", "step2", "setup", "pairs", "verdict", "zero", "bf_ttest", "bf_pairs", "mde"):
+        res[k].to_csv(os.path.join(out_dir, f"{k}.csv"), index=False)
+    res["jasp_csv"] = export_for_jasp(df, os.path.join(out_dir, "for_jasp_wide.csv"))
+    res["figure"] = forest_figure(res["setup"], res["pairs"], res["zero"],
+                                  os.path.join(out_dir, "equivalence_forest.png"))
+    res["report"] = report_sentences(df, res["setup"], res["pairs"], res["verdict"], res["zero"],
+                                     res["bf_ttest"], res["bf_pairs"], res["mde"], jnd_ref)
+    with open(os.path.join(out_dir, "report_sentences.md"), "w", encoding="utf-8") as fh:
+        fh.write(res["report"])
+    if verbose:
+        print(f"N = {df.Subject.nunique()} participants "
+              f"({(subject_means(df,'Bias').System=='L').sum()} L, {(subject_means(df,'Bias').System=='N').sum()} N); "
+              f"excluded: {res['excluded']}; JND_REF = {jnd_ref:.2f} mm/m")
+        print(res["report"])
+        print("Wrote outputs to", out_dir)
+    return res
 
 
 if __name__ == "__main__":
