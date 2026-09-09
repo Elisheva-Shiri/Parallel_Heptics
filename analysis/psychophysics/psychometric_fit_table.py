@@ -201,13 +201,27 @@ def to_latex(panel_a: pd.DataFrame, panel_b: pd.DataFrame, standard: float, coho
     L.append(r"\begin{table*}[t]")
     L.append(r"\centering")
     L.append(r"\small")
+    L.append(r"\setlength{\tabcolsep}{2.5pt}%")
     L.append(r"\caption{Psychometric fits by finger" + (f" ({_tex_escape(cohort)})" if cohort else "") + ".}")
     L.append(r"\label{tab:psychometric-fit}")
     # ---- panel A
-    L.append(r"\textbf{(A) Pooled fits} -- one 4-parameter logistic per finger fitted to all trials of all participants; 95\% parametric-bootstrap CIs in brackets.\\[2pt]")
+    # When every finger has the same number of trials, state the counts once in
+    # the panel heading and keep only p_bias in the last column (narrower table).
+    fingers_a = panel_a[~panel_a["finger"].astype(str).str.startswith(("Standard", "All"))]
+    n_finger = fingers_a["n_trials"].dropna().unique()
+    pooled_rows = panel_a[panel_a["finger"].astype(str).str.startswith("All")]
+    n_pooled = pooled_rows["n_trials"].dropna().unique()
+    same_n = len(n_finger) == 1
+    heading = r"\textbf{(A) Pooled fits} -- one 4-parameter logistic per finger fitted to all trials of all participants"
+    if same_n:
+        heading += f" ({int(n_finger[0])} trials per finger"
+        heading += f", {int(n_pooled[0])} pooled)" if len(n_pooled) == 1 else ")"
+    heading += r"; 95\% parametric-bootstrap CIs in brackets.\\[2pt]"
+    L.append(heading)
     L.append(r"\begin{tabular}{@{}lcccccccc@{}}")
     L.append(r"\toprule")
-    L.append("Finger & PSE [95\\% CI] & Bias [95\\% CI] & JND [95\\% CI] & Weber & $\\lambda$ & Dev. (df), $p$ & pseudo-$R^2$ & $N_{\\mathrm{trials}}$, $p_{\\mathrm{bias}=0}$ \\\\")
+    last_hdr = "$p_{\\mathrm{bias}=0}$" if same_n else "$N_{\\mathrm{trials}}$, $p_{\\mathrm{bias}=0}$"
+    L.append("Finger & PSE [95\\% CI] & Bias [95\\% CI] & JND [95\\% CI] & Weber & $\\lambda$ & Dev.\\,(df), $p$ & ps.-$R^2$ & " + last_hdr + " \\\\")
     L.append(r"\midrule")
     for _, r in panel_a.iterrows():
         if str(r["finger"]).startswith("Standard"):
@@ -217,7 +231,10 @@ def to_latex(panel_a: pd.DataFrame, panel_b: pd.DataFrame, standard: float, coho
         dev = _fmt(r.get("deviance", np.nan), 1)
         df = r.get("deviance_df", np.nan)
         dev_txt = f"{dev} ({int(df)}), {_fmt_p(r.get('deviance_p_chi2', np.nan))}" if np.isfinite(df) and dev else dev
-        n_txt = f"{int(r['n_trials'])}, {_fmt_p(r.get('p_bias_eq_0', np.nan))}" if np.isfinite(r.get("n_trials", np.nan)) else ""
+        if same_n:
+            n_txt = _fmt_p(r.get("p_bias_eq_0", np.nan))
+        else:
+            n_txt = f"{int(r['n_trials'])}, {_fmt_p(r.get('p_bias_eq_0', np.nan))}" if np.isfinite(r.get("n_trials", np.nan)) else ""
         L.append(
             f"{_tex_escape(str(r['finger']))} & "
             f"{_fmt(r['pse'])} {_fmt_ci(r.get('pse_ci95_lower', np.nan), r.get('pse_ci95_upper', np.nan))} & "
@@ -232,9 +249,11 @@ def to_latex(panel_a: pd.DataFrame, panel_b: pd.DataFrame, standard: float, coho
     if panel_b is not None and not panel_b.empty:
         L.append(r"\\[6pt]")
         L.append(r"\textbf{(B) Per-participant fits} -- one fit per participant $\times$ finger (the estimates entering the mixed ANOVA); across-participant summaries.\\[2pt]")
+        any_excluded = bool((panel_b["n_fits_excluded_pse_band"].fillna(0) > 0).any())
         L.append(r"\begin{tabular}{@{}lccccccc@{}}")
         L.append(r"\toprule")
-        L.append("Finger & $n$ fits (excl.) & Trials/fit & Bias median [IQR] & Bias mean $\\pm$ SD & JND median [IQR] & JND mean $\\pm$ SD & $\\lambda$ median \\\\")
+        n_hdr = "$n$ fits (excl.)" if any_excluded else "$n$ fits"
+        L.append("Finger & " + n_hdr + " & Trials/fit & Bias median [IQR] & Bias mean $\\pm$ SD & JND median [IQR] & JND mean $\\pm$ SD & $\\lambda$ median \\\\")
         L.append(r"\midrule")
         for _, r in panel_b.iterrows():
             tpf = r.get("trials_per_fit_median", np.nan)
@@ -242,8 +261,9 @@ def to_latex(panel_a: pd.DataFrame, panel_b: pd.DataFrame, standard: float, coho
             tpf_txt = f"{int(tpf)}" if np.isfinite(tpf) else ""
             if np.isfinite(tmin) and np.isfinite(tmax) and (tmin != tmax):
                 tpf_txt += f" ({int(tmin)}--{int(tmax)})"
+            n_cell = f"{int(r['n_fits_used'])} ({int(r['n_fits_excluded_pse_band'])})" if any_excluded else f"{int(r['n_fits_used'])}"
             L.append(
-                f"{_tex_escape(str(r['finger']))} & {int(r['n_fits_used'])} ({int(r['n_fits_excluded_pse_band'])}) & {tpf_txt} & "
+                f"{_tex_escape(str(r['finger']))} & {n_cell} & {tpf_txt} & "
                 f"{_fmt_signed(r['bias_median'])} {_fmt_ci(r['bias_q25'], r['bias_q75'])} & "
                 f"{_fmt_signed(r['bias_mean'])} $\\pm$ {_fmt(r['bias_sd'])} & "
                 f"{_fmt(r['jnd_median'])} {_fmt_ci(r['jnd_q25'], r['jnd_q75'])} & "
@@ -257,9 +277,11 @@ def to_latex(panel_a: pd.DataFrame, panel_b: pd.DataFrame, standard: float, coho
         + r"; the standard was " + _fmt(standard, 1) + " " + UNIT
         + r" and the eight comparisons spanned 2.5--14.5 " + UNIT
         + r". Weber $=$ JND / standard. $\lambda = \lambda_{l} + \lambda_{h}$ is the fitted total lapse rate (each asymptote bounded in [0, 0.20])."
-        + r" Dev.\ is the deviance against the saturated model with its degrees of freedom (stimulus levels $-$ 4 parameters) and $\chi^2$ tail probability; pseudo-$R^2$ is McFadden's."
+        + r" Dev.\ is the deviance against the saturated model with its degrees of freedom (stimulus levels $-$ 4 parameters) and $\chi^2$ tail probability; ps.-$R^2$ is McFadden's pseudo-$R^2$."
         + r" $p_{\mathrm{bias}=0}$ tests whether the pooled bias differs from zero (bootstrap SE)."
-        + r" In (B), ``excl.'' counts participant $\times$ finger fits whose PSE fell outside the tested range and were excluded from group pooling.}"
+        + (r" In (B), ``excl.'' counts participant $\times$ finger fits whose PSE fell outside the tested range and were excluded from group pooling."
+           if (panel_b is not None and not panel_b.empty and bool((panel_b["n_fits_excluded_pse_band"].fillna(0) > 0).any())) else "")
+        + "}"
     )
     L.append(r"\end{table*}")
     return "\n".join(L) + "\n"
