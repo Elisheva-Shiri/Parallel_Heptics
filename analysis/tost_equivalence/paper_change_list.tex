@@ -1,0 +1,281 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{url}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black}
+\lstset{basicstyle=\ttfamily\small,breaklines=true,breakatwhitespace=false,columns=fullflexible,
+  keepspaces=true,frame=single,framerule=0.3pt,rulecolor=\color{black!40},backgroundcolor=\color{black!3},
+  xleftmargin=4pt,xrightmargin=4pt,aboveskip=2pt,belowskip=6pt,literate={--}{{-{}-}}2}
+\newcommand{\find}[1]{\noindent\textbf{Find:} #1\par\smallskip}
+\newcommand{\findfrom}[2]{\noindent\textbf{Find from:} #1\\\textbf{to:} #2\par\smallskip}
+\newcommand{\replace}{\noindent\textbf{Replace with:}\par\nopagebreak}
+\newcommand{\insertafter}[1]{\noindent\textbf{Insert after:} #1\par\nopagebreak}
+\setlist[enumerate]{leftmargin=*}
+\title{JULIET-SRR (ICRA 2027): change list for the 39-participant analysis and equivalence tests}
+\author{Generated from \path{analysis/tost_equivalence} (commits 02e6eef, 0797e49) -- 2026-09-09}
+\date{}
+\begin{document}
+\maketitle
+
+\noindent\textbf{How to use.} Items are in the order they appear in the paper. Open the Overleaf project, turn on \emph{Review $\to$ Track Changes}, and for each item locate the ``Find'' text and paste the replacement. Do not re-upload whole \texttt{.tex} files, so that existing comments stay anchored. Numbers are in mm/m and come from the pipeline run on the 39-participant cohort (20 air-slide, 19 natural; L\_E\_19 and N\_E\_17 excluded by the rule ``at least 60\% success on at least two fingers'').
+
+\medskip
+\noindent\textbf{Summary of what changes.} Participant count 40 $\to$ 39; success and pooled-fit numbers; the ANOVA table (now $N=39$, no sensitivity analysis); a new equivalence paragraph and figure; calibrated wording in Abstract, Introduction, Discussion and Conclusion; three references. The kinematics and probing-behaviour subsections are not covered here: they must be re-run on the 39 participants first (see item 15 and 23).
+
+\section*{Abstract and Introduction}
+
+\begin{enumerate}
+\item \textbf{Abstract, participant count.}
+\noindent\textbf{Find:}\begin{lstlisting}
+In a 40-participant
+\end{lstlisting}
+\replace
+\begin{lstlisting}
+In a 39-participant
+\end{lstlisting}
+
+\item \textbf{Abstract, accuracy sentence.}
+\noindent\textbf{Find from:}\begin{lstlisting}
+Participants achieved 80\% discrimination accuracy
+\end{lstlisting}
+\noindent\textbf{to:}\begin{lstlisting}
+(Weber fraction 0.19).
+\end{lstlisting}
+\replace
+\begin{lstlisting}
+participants achieved 81\% discrimination accuracy, with a pooled point of subjective equality (PSE) of 8.41~mm/m (8.5~mm/m standard) and a just-noticeable difference (JND) of 2.47~mm/m (Weber fraction 0.29).
+\end{lstlisting}
+
+\item \textbf{Abstract, claim sentence (the bracketed placeholder).}
+\noindent\textbf{Find from:}\begin{lstlisting}
+[Equivalence tests and Bayesian analyses indicated
+\end{lstlisting}
+\noindent\textbf{to:}\begin{lstlisting}
+despite substantially different exploratory kinematics between conditions.
+\end{lstlisting}
+\replace
+\begin{lstlisting}
+Neither setup nor finger affected PSE bias, and equivalence tests bounded any bias difference within one JND; JND did not differ between setups and differed only between the middle and ring fingers, despite substantially different exploratory kinematics between conditions.
+\end{lstlisting}
+
+\item \textbf{Abstract, last sentence.}
+\noindent\textbf{Find:}\begin{lstlisting}
+This finger-robust performance positions
+\end{lstlisting}
+\replace
+\begin{lstlisting}
+This finger-robust perceptual accuracy positions
+\end{lstlisting}
+
+\item \textbf{Introduction, second contribution bullet.} Replace the whole second bullet (the one starting with ``Psychophysical evaluation'').
+\replace
+\begin{lstlisting}
+\item Psychophysical evaluation -- A 39-participant study across two setups, testing whether stiffness-discrimination bias and sensitivity depend on finger or setup, with equivalence tests that bound how large any such effect can be.
+\end{lstlisting}
+
+\item \textbf{Introduction, closing sentence} (also delete the two commented lines that follow it).
+\noindent\textbf{Find:}\begin{lstlisting}
+\noindent We found that despite changes in movement behavior, stiffness-discrimination sensitivity did not differ significantly.
+\end{lstlisting}
+\replace
+\begin{lstlisting}
+\noindent We found that, despite markedly different exploratory kinematics between setups, stiffness was perceived veridically on all four fingers in both setups, with bias statistically equivalent within one JND, and that sensitivity differed only between the middle and ring fingers.
+\end{lstlisting}
+\end{enumerate}
+
+\section*{Results}
+
+\begin{enumerate}[resume]
+\item \textbf{Exclusions (first Results paragraph).}
+\noindent\textbf{Find from:}\begin{lstlisting}
+Of the 43 participants, two were excluded
+\end{lstlisting}
+\noindent\textbf{to:}\begin{lstlisting}
+leaving 40 participants (20 air-slide, 20 natural).
+\end{lstlisting}
+\replace
+\begin{lstlisting}
+Of the 43 participants, two were excluded because they did not complete the session and two because fewer than two fingers reached 60\% success, leaving 39 participants (20 air-slide, 19 natural).
+\end{lstlisting}
+
+\item \textbf{Success rates.}
+\noindent\textbf{Find from:}\begin{lstlisting}
+Overall success was 79.9\%
+\end{lstlisting}
+\noindent\textbf{to:}\begin{lstlisting}
+Success was similar across fingers (77.8--80.8\%)
+\end{lstlisting}
+\replace
+\begin{lstlisting}
+Overall success was 80.6\% (95\% CI: 79.8--81.4\%), slightly higher in the natural than the air-slide setup (82.8\% vs.\ 78.5\%). Success was similar across fingers (79.4--81.3\%)
+\end{lstlisting}
+Then, in the same paragraph:
+\noindent\textbf{Find:}\begin{lstlisting}
+95.5\% at 2.5, 66.8\% at 10.0, and 81.6\% at 14.5
+\end{lstlisting}
+\replace
+\begin{lstlisting}
+96.8\% at 2.5, 67.1\% at 10.0, and 82.1\% at 14.5
+\end{lstlisting}
+
+\item \textbf{Psychometric paragraph: delete the sensitivity-ANOVA sentences.}
+\noindent\textbf{Find from:}\begin{lstlisting}
+One participant-by-finger fit (natural setup, middle finger)
+\end{lstlisting}
+\noindent\textbf{to:}\begin{lstlisting}
+$\eta_{p}^{2}=0.075$).
+\end{lstlisting}
+\replace nothing (delete). That participant is now excluded by the success rule, so there is no sensitivity ANOVA.
+
+\item \textbf{Psychometric paragraph: append the equivalence methods.}
+\noindent\textbf{Insert after:}\begin{lstlisting}
+...the correction factor $\varepsilon$ is reported with each effect.
+\end{lstlisting}
+\begin{lstlisting}
+Because a non-significant ANOVA cannot establish the absence of an effect, we also ran two one-sided equivalence tests (TOST)~\cite{lakens2017} on the same per-participant fits. Bounds were pre-specified in perceptual units: for PSE bias, $\pm$1~JND ($\pm$1.6~mm/m; median per-participant JND 1.61~mm/m), because two conditions whose PSEs differ by less than one JND are indistinguishable to the participants themselves, with $\pm$0.5~JND ($\pm$0.8~mm/m) as a stricter secondary bound; for JND, $\pm$0.5~mm/m (about 30\% of the JND). Setup comparisons (20 vs.\ 19 participants) used Welch's $t$ with Welch--Satterthwaite degrees of freedom, which requires neither equal group sizes nor equal variances~\cite{delacre2017}; finger pairs used paired TOSTs with Holm correction, and the Finger factor was called equivalent only if all six pairs passed. Equivalence was declared when the 90\% confidence interval lay within the bounds. For JND, default JZS Bayes factors~\cite{rouder2009} are reported alongside, and the minimal detectable effect at 80\% power is given for both measures.
+\end{lstlisting}
+
+\item \textbf{ANOVA table (\texttt{tab:anova}).} Replace the caption and the tabular; the N column is dropped.
+\replace
+\begin{lstlisting}
+\caption{Mixed-design ANOVA for PSE bias and JND ($N=39$). JND effects involving Finger are Greenhouse--Geisser corrected (Mauchly $W=0.73$, $p=.045$, $\varepsilon=0.82$); sphericity held for bias ($W=0.88$, $p=.46$).}
+\label{tab:anova}
+\begin{tabular}{@{}llccccc@{}}
+\toprule\noalign{}
+DV & Effect & F & df1 & df2 & \(p\) & $\eta_{p}^{2}$ \\
+\midrule\noalign{}
+Bias & Setup & 1.476 & 1 & 37 & 0.232 & 0.038 \\
+Bias & Finger & 0.843 & 3 & 111 & 0.473 & 0.022 \\
+Bias & Setup $\times$ Finger & 0.904 & 3 & 111 & 0.442 & 0.024 \\
+JND & Setup & 3.489 & 1 & 37 & 0.070 & 0.086 \\
+JND & Finger & 2.998 & 2.47 & 91.5 & 0.042 & 0.075 \\
+JND & Setup $\times$ Finger & 0.500 & 2.47 & 91.5 & 0.647 & 0.013 \\
+\bottomrule\noalign{}
+\end{tabular}%
+\end{lstlisting}
+
+\item \textbf{Results text after the ANOVA table.}
+\noindent\textbf{Find from:}\begin{lstlisting}
+Neither PSE bias nor JND showed significant effects of Setup or Finger combination
+\end{lstlisting}
+\noindent\textbf{to:}\begin{lstlisting}
+are given in Table~\ref{tab:psychometric-fit}.
+\end{lstlisting}
+\replace
+\begin{lstlisting}
+PSE bias showed no significant effect of Setup, Finger, or their interaction (Table~\ref{tab:anova}). For JND, the Setup effect was not significant, but the Finger effect was ($p_{\mathrm{GG}}=.042$, $\eta_p^2=.075$): Holm-corrected pairwise comparisons showed a higher JND for the middle than the ring finger (medians 2.33 vs.\ 1.53~mm/m; $t(38)=3.63$, $p=.005$, $d=0.55$), with no other pair differing (all $p\geq.60$). The psychometric fit to all trials pooled across fingers and setups gave a PSE of $8.41$~mm/m (95\% CI $[8.22, 8.59]$), i.e.\a bias of $-0.09$~mm/m ($[-0.28, 0.09]$, $p_{\mathrm{bias}=0}=.33$), and a JND of $2.47$~mm/m ($[2.29, 2.64]$; Weber fraction $0.29$). Finger-level pooled and per-participant estimates are given in Table~\ref{tab:psychometric-fit}.
+
+Equivalence tests (Fig.~\ref{fig:equivalence}) supported the null result for bias. The setup difference in bias was equivalent within $\pm$1~JND (air-slide minus natural $=0.26$~mm/m, 90\% CI $[-0.10, 0.62]$, $t(34.9)=-6.32$, $p_{\mathrm{TOST}}<.001$) and within $\pm$0.5~JND ($p_{\mathrm{TOST}}=.008$); each finger's bias was equivalent to zero within $\pm$0.5~JND (all $p_{\mathrm{TOST}}\leq.013$), and all six finger-pair differences were equivalent within $\pm$1~JND (Holm-corrected $p_{\mathrm{TOST}}\leq.001$). For JND, equivalence could not be established: JND was $0.92$~mm/m higher in the air-slide setup (90\% CI $[0.09, 1.75]$, $p_{\mathrm{TOST}}=.80$; Welch $t(33.0)=1.89$, $p=.068$; $\mathrm{BF}_{01}=0.8$, i.e.\undecided) and higher for the middle than the ring finger ($1.19$~mm/m, $[0.64, 1.74]$; $\mathrm{BF}_{10}=36$), whereas the other pairs neither differed nor reached equivalence (index vs.\little: $\mathrm{BF}_{01}=5.7$). With 20 vs.\ 19 participants and the observed variability, the design had 80\% power to detect a setup difference of $0.62$~mm/m in bias and $1.42$~mm/m in JND.
+\end{lstlisting}
+
+\item \textbf{New equivalence figure.} Upload \path{analysis/tost_equivalence/results/equivalence_paper.pdf} to the Overleaf \path{media/} folder, then insert after the ANOVA table:
+\begin{lstlisting}
+\begin{figure}[!t]
+\centering
+\includegraphics[width=0.9\columnwidth]{media/equivalence_paper.pdf}
+\caption{Equivalence tests. Differences with 90\% CIs against the pre-specified bounds (shading: $\pm$1~JND light and $\pm$0.5~JND dark for bias; $\pm$0.5~mm/m for JND). Filled markers: equivalent at the primary bound (Holm-corrected for finger pairs); open: not. (a) PSE bias: setup difference, each finger against zero, and finger pairs. (b) JND: setup difference and finger pairs.}
+\label{fig:equivalence}
+\end{figure}
+\end{lstlisting}
+
+\item \textbf{Table III (\texttt{tab:psychometric-fit}).} Replace both sub-tables with the regenerated file \path{analysis/psychophysics/results/L_N_E/csv/all/shared/psychometric_fit_table.tex}. Every finger now has 2496 trials (pooled 9984) and part (B) shows 39 (0) fits per finger. In the table note, delete the last sentence (``In (B), `excl.' counts participant $\times$ finger fits whose PSE fell outside the tested range \ldots'').
+
+\item \textbf{Kinematics subsection (not covered here).} \texttt{(\$n = 20\$ per setup)} and the heat-map caption \texttt{(\$n = 20\$ each)} become 20 vs.\ 19 once the kinematics notebook is re-run without N\_E\_17; all values in that subsection will shift slightly.
+\end{enumerate}
+
+\section*{Discussion, Conclusion, References}
+
+\begin{enumerate}[resume]
+\item \textbf{Discussion, null-effect sentence.}
+\noindent\textbf{Find from:}\begin{lstlisting}
+Although success was slightly higher in the natural than air-slide setup (81.3\% vs. 78.5\%)
+\end{lstlisting}
+\noindent\textbf{to:}\begin{lstlisting}
+significantly affected (bias) or JND.
+\end{lstlisting}
+\replace
+\begin{lstlisting}
+Although success was slightly higher in the natural than the air-slide setup (82.8\% vs.\ 78.5\%), PSE bias was unaffected by setup or finger, and equivalence tests bounded any bias difference within one JND. Because the standard and comparison were rendered on the same finger, a non-zero bias would indicate a rendering artefact rather than a perceptual property; its equivalence to zero on every finger therefore validates the display in both setups. Sensitivity was less uniform: JND did not differ significantly between setups but could not be shown equivalent, and the middle finger was less sensitive than the ring finger by about 1.2~mm/m, half a JND.
+\end{lstlisting}
+
+\item \textbf{Discussion, finger-effect sentence.}
+\noindent\textbf{Find:}\begin{lstlisting}
+The absence of a systematic finger effect may be useful for teleoperation system design,
+\end{lstlisting}
+\replace
+\begin{lstlisting}
+The absence of a finger effect on bias, and the small size of the only sensitivity difference, may be useful for teleoperation system design,
+\end{lstlisting}
+
+\item \textbf{Discussion, limitations paragraph.}
+\noindent\textbf{Insert after:}\begin{lstlisting}
+...Bowden routing friction, backlash, and hysteresis.
+\end{lstlisting}
+\begin{lstlisting}
+A second limitation is statistical: with 39 participants, equivalence could be established for bias but not for JND, whose between-participant variability was larger; a $\pm$0.5~mm/m bound on JND would require several hundred participants per setup.
+\end{lstlisting}
+
+\item \textbf{Discussion, Weber-fraction comparison.} Wherever the Weber fraction is compared with other devices, use 0.29 (JND 2.47~mm/m), not 0.19.
+
+\item \textbf{Conclusion.}
+\noindent\textbf{Find from:}\begin{lstlisting}
+Across 40 analyzed participants, discrimination success was 79.9\%
+\end{lstlisting}
+\noindent\textbf{to:}\begin{lstlisting}
+Neither PSE bias nor JND showed a significant effect of finger or setup.
+\end{lstlisting}
+\replace
+\begin{lstlisting}
+Across 39 analyzed participants, discrimination success was 80.6\%, and the pooled PSE of 8.41~mm/m remained close to the 8.5~mm/m standard, with bias statistically equivalent across setups and fingers within one JND; sensitivity did not differ between setups, with only a small middle-versus-ring difference.
+\end{lstlisting}
+
+\item \textbf{Bibliography.} Add the three entries below to the \texttt{.bib} file.
+\begin{lstlisting}
+@article{lakens2017,
+  author  = {Lakens, Dani{\"e}l},
+  title   = {Equivalence tests: A practical primer for t tests, correlations, and meta-analyses},
+  journal = {Social Psychological and Personality Science},
+  volume  = {8}, number = {4}, pages = {355--362}, year = {2017},
+  doi     = {10.1177/1948550617697177}}
+@article{delacre2017,
+  author  = {Delacre, Marie and Lakens, Dani{\"e}l and Leys, Christophe},
+  title   = {Why psychologists should by default use {Welch}'s t-test instead of {Student}'s t-test},
+  journal = {International Review of Social Psychology},
+  volume  = {30}, number = {1}, pages = {92--101}, year = {2017},
+  doi     = {10.5334/irsp.82}}
+@article{rouder2009,
+  author  = {Rouder, Jeffrey N. and Speckman, Paul L. and Sun, Dongchu and Morey, Richard D. and Iverson, Geoffrey},
+  title   = {Bayesian t tests for accepting and rejecting the null hypothesis},
+  journal = {Psychonomic Bulletin \& Review},
+  volume  = {16}, number = {2}, pages = {225--237}, year = {2009},
+  doi     = {10.3758/PBR.16.2.225}}
+\end{lstlisting}
+
+\item \textbf{Discussion, first sentence.}
+\noindent\textbf{Find:}\begin{lstlisting}
+with 79.9\% overall discrimination success and similar performance across fingers (77.8--80.8\%)
+\end{lstlisting}
+\replace
+\begin{lstlisting}
+with 80.6\% overall discrimination success and similar performance across fingers (79.4--81.3\%)
+\end{lstlisting}
+
+\item \textbf{Probing-behaviour subsection (not covered here).} It reports \texttt{Discrimination success was also comparable (L: 78.5\textbackslash\%; N: 81.3\textbackslash\%; p = 0.312)} and all probe counts, dwell fractions and direction percentages for 40 participants. Re-run that analysis on the 39 together with the kinematics, then update those numbers.
+
+\item \textbf{Table III note.} Delete the sentence about fits ``whose PSE fell outside the tested range and were excluded from group pooling'' (all counts are now 0); see item 14.
+
+\item \textbf{Abstract accuracy.} The PDF says 79\% and the draft 80\%; the value is now 81\% (already in item 2).
+\end{enumerate}
+
+\bigskip
+\noindent\textbf{Unchanged.} Section IV User Study (43 recruited: 22 air-slide, 21 natural), all validation sections, mechanism text, and figure captions other than those listed.
+
+\medskip
+\noindent\textbf{Source of every number.} \path{analysis/psychophysics/results/L_N_E/csv/all/shared/} (fits and success), \path{analysis/anova_statistics/results/} (ANOVA), \path{analysis/tost_equivalence/results/} (TOST, Bayes factors, minimal detectable effect, figure).
+\end{document}
