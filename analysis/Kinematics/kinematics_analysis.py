@@ -3832,90 +3832,10 @@ def estimate_side_video_z(
     side_samples["side_time_bin"] = np.minimum(
         (side_samples["side_time_fraction"].fillna(0) * 20).astype(int) + 1, 20
     )
-    side_group_cols = [
-        "subject_id",
-        "subject_group",
-        "stiffness_value",
-        "finger_condition",
-        "side_time_bin",
-    ]
-    side_group_cols.extend(
-        c
-        for c in [
-            EXPERIMENT_GROUP_COLUMN,
-            "workspace_setup",
-            "success_label",
-            "protocol_factor",
-            "sex_factor",
-            "age_group",
-        ]
-        if c in side_samples.columns and c not in side_group_cols
-    )
-    side_group_time = (
-        side_samples.groupby(
-            side_group_cols,
-            dropna=False,
-        )
-        .agg(
-            n_frames=("frame_index", "count"),
-            side_time_fraction=("side_time_fraction", "mean"),
-            side_trial_time_fraction=("side_trial_time_fraction", "mean"),
-            mean_side_z_lift_px=("side_z_lift_px", "median"),
-            sem_side_z_lift_px=("side_z_lift_px", _sem),
-            mean_side_z_lift_cm=("side_z_lift_cm", "median"),
-            sem_side_z_lift_cm=("side_z_lift_cm", _sem),
-            mean_side_x_from_center_camera_corrected_px=(
-                "side_x_from_center_camera_corrected_px",
-                "median",
-            ),
-            mean_side_lift_lateral_angle_camera_corrected_deg=(
-                "side_lift_lateral_angle_camera_corrected_deg",
-                lambda s: _circ_mean_deg(s),
-            ),
-            mean_side_motion_direction_camera_corrected_deg=(
-                "side_motion_direction_camera_corrected_deg",
-                lambda s: _circ_mean_deg(s),
-            ),
-            mean_detection_rate=("side_detected", "mean"),
-        )
-        .reset_index()
-    )
-    side_subject_stiffness_summary = (
-        side_trial_summary.groupby(
-            [
-                "subject_id",
-                "subject_group",
-                "side_camera_side",
-                "stiffness_value",
-                "finger_condition",
-            ],
-            dropna=False,
-        )
-        .agg(
-            n_trials=("trial_index_raw", "count"),
-            mean_side_z_lift_px=("mean_side_z_lift_px", "median"),
-            sem_side_z_lift_px=("mean_side_z_lift_px", _sem),
-            max_side_z_lift_px=("max_side_z_lift_px", "mean"),
-            mean_side_z_lift_cm=("mean_side_z_lift_cm", "median"),
-            sem_side_z_lift_cm=("mean_side_z_lift_cm", _sem),
-            max_side_z_lift_cm=("max_side_z_lift_cm", "mean"),
-            mean_side_x_from_center_camera_corrected_px=(
-                "mean_side_x_from_center_camera_corrected_px",
-                "median",
-            ),
-            mean_side_lift_lateral_angle_camera_corrected_deg=(
-                "mean_side_lift_lateral_angle_camera_corrected_deg",
-                lambda s: _circ_mean_deg(s),
-            ),
-            mean_side_motion_direction_camera_corrected_deg=(
-                "mean_side_motion_direction_camera_corrected_deg",
-                lambda s: _circ_mean_deg(s),
-            ),
-            success_rate=("correct_response", "mean"),
-        )
-        .reset_index()
-    )
-    side_stiffness_summary = _summarize_side_z_by_stiffness(side_trial_summary)
+    _agg = summarize_side_z_tables(side_samples, side_trial_summary)
+    side_group_time = _agg["side_group_time"]
+    side_subject_stiffness_summary = _agg["side_subject_stiffness_summary"]
+    side_stiffness_summary = _agg["side_stiffness_summary"]
     return {
         "side_samples": side_samples,
         "side_trial_summary": side_trial_summary,
@@ -13446,3 +13366,158 @@ def analysis_manifest(output_root: Path) -> pd.DataFrame:
         }
     )
 
+
+
+
+def summarize_side_z_tables(side_samples: pd.DataFrame, side_trial_summary: pd.DataFrame) -> dict:
+    """Group-time, subject x stiffness and stiffness summaries of the side-camera Z tables.
+
+    Shared by ``estimate_side_video_z`` (fresh decode) and
+    ``load_reused_side_video_z`` (saved outputs of an earlier run), so both
+    paths aggregate identically. ``side_samples`` must already carry
+    ``side_time_bin`` and the factor columns added by ``estimate_side_video_z``.
+    """
+    side_group_cols = [
+        "subject_id",
+        "subject_group",
+        "stiffness_value",
+        "finger_condition",
+        "side_time_bin",
+    ]
+    side_group_cols.extend(
+        c
+        for c in [
+            EXPERIMENT_GROUP_COLUMN,
+            "workspace_setup",
+            "success_label",
+            "protocol_factor",
+            "sex_factor",
+            "age_group",
+        ]
+        if c in side_samples.columns and c not in side_group_cols
+    )
+    side_group_time = (
+        side_samples.groupby(
+            side_group_cols,
+            dropna=False,
+        )
+        .agg(
+            n_frames=("frame_index", "count"),
+            side_time_fraction=("side_time_fraction", "mean"),
+            side_trial_time_fraction=("side_trial_time_fraction", "mean"),
+            mean_side_z_lift_px=("side_z_lift_px", "median"),
+            sem_side_z_lift_px=("side_z_lift_px", _sem),
+            mean_side_z_lift_cm=("side_z_lift_cm", "median"),
+            sem_side_z_lift_cm=("side_z_lift_cm", _sem),
+            mean_side_x_from_center_camera_corrected_px=(
+                "side_x_from_center_camera_corrected_px",
+                "median",
+            ),
+            mean_side_lift_lateral_angle_camera_corrected_deg=(
+                "side_lift_lateral_angle_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
+            mean_side_motion_direction_camera_corrected_deg=(
+                "side_motion_direction_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
+            mean_detection_rate=("side_detected", "mean"),
+        )
+        .reset_index()
+    )
+    side_subject_stiffness_summary = (
+        side_trial_summary.groupby(
+            [
+                "subject_id",
+                "subject_group",
+                "side_camera_side",
+                "stiffness_value",
+                "finger_condition",
+            ],
+            dropna=False,
+        )
+        .agg(
+            n_trials=("trial_index_raw", "count"),
+            mean_side_z_lift_px=("mean_side_z_lift_px", "median"),
+            sem_side_z_lift_px=("mean_side_z_lift_px", _sem),
+            max_side_z_lift_px=("max_side_z_lift_px", "mean"),
+            mean_side_z_lift_cm=("mean_side_z_lift_cm", "median"),
+            sem_side_z_lift_cm=("mean_side_z_lift_cm", _sem),
+            max_side_z_lift_cm=("max_side_z_lift_cm", "mean"),
+            mean_side_x_from_center_camera_corrected_px=(
+                "mean_side_x_from_center_camera_corrected_px",
+                "median",
+            ),
+            mean_side_lift_lateral_angle_camera_corrected_deg=(
+                "mean_side_lift_lateral_angle_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
+            mean_side_motion_direction_camera_corrected_deg=(
+                "mean_side_motion_direction_camera_corrected_deg",
+                lambda s: _circ_mean_deg(s),
+            ),
+            success_rate=("correct_response", "mean"),
+        )
+        .reset_index()
+    )
+    side_stiffness_summary = _summarize_side_z_by_stiffness(side_trial_summary)
+    return {
+        "side_group_time": side_group_time,
+        "side_stiffness_summary": side_stiffness_summary,
+        "side_subject_stiffness_summary": side_subject_stiffness_summary,
+    }
+
+
+def _reuse_files(reuse_root, spec: dict) -> dict:
+    root = Path(reuse_root)
+    files = {k: root / rel for k, rel in spec.items()}
+    missing = [str(f) for f in files.values() if not f.exists()]
+    if missing:
+        raise FileNotFoundError("REUSE_HEAVY_STEPS_FROM is missing: " + "; ".join(missing))
+    return files
+
+
+def _read_table(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_csv(path, low_memory=False)
+
+
+def _filter_subjects(df: pd.DataFrame, subject_ids) -> pd.DataFrame:
+    keep = {str(s) for s in subject_ids}
+    if "subject_id" not in df.columns:
+        return df
+    return df[df["subject_id"].astype(str).isin(keep)].reset_index(drop=True)
+
+
+def load_reused_tracking_kinematics(reuse_root, subject_ids) -> dict | None:
+    """Saved outputs of ``compute_tracking_kinematics`` from an earlier run of a
+    superset cohort, filtered to ``subject_ids``. Returns None when ``reuse_root``
+    is None. The per-trial computation is independent across subjects, so
+    filtering rows equals recomputing on the smaller cohort."""
+    if reuse_root is None:
+        return None
+    files = _reuse_files(reuse_root, {
+        "samples": Path("csv") / "other" / "kinematic_samples.parquet",
+        "trial_summary": Path("csv") / "other" / "trial_kinematic_summary.csv",
+        "pair_summary": Path("csv") / "other" / "pair_kinematic_summary.csv",
+        "time_bins": Path("csv") / "trajectories" / "trajectory_time_bins.csv",
+    })
+    return {k: _filter_subjects(_read_table(f), subject_ids) for k, f in files.items()}
+
+
+def load_reused_side_video_z(reuse_root, subject_ids) -> dict | None:
+    """Saved per-trial outputs of ``estimate_side_video_z`` filtered to
+    ``subject_ids``, with the aggregate tables recomputed by
+    ``summarize_side_z_tables``. Returns None when ``reuse_root`` is None."""
+    if reuse_root is None:
+        return None
+    files = _reuse_files(reuse_root, {
+        "side_samples": Path("csv") / "z_lift" / "side_z_samples.parquet",
+        "side_trial_summary": Path("csv") / "z_lift" / "side_z_trial_summary.csv",
+    })
+    side_samples = _filter_subjects(_read_table(files["side_samples"]), subject_ids)
+    side_trial_summary = _filter_subjects(_read_table(files["side_trial_summary"]), subject_ids)
+    out = {"side_samples": side_samples, "side_trial_summary": side_trial_summary}
+    out.update(summarize_side_z_tables(side_samples, side_trial_summary))
+    return out
