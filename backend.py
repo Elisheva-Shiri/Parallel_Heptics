@@ -17,7 +17,7 @@ from typing import Annotated
 import typer
 from pydantic import BaseModel
 from structures import ControlAction, ExperimentControl, ExperimentState, FingerPosition, QuestionInput, StateData, TrackingObject, ExperimentPacket, VisualCueMode
-from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, FINGER_NAMES, FingerName, CENTER_THRESHOLD, EDGE_THRESHOLD, MOVEMENT_AREA_SCALE, STIFFNESS_MAX
+from consts import BACKEND_PORT, PAUSE_SLEEP_SECONDS, MOTORS_COMMUNICATION_RATE, PYGAME_PORT, TARGET_CYCLE_COUNT, HARDWARE_PORT, TOP_HEIGHT, TOP_WIDTH, SIDE_HEIGHT, SIDE_WIDTH, FRONTEND_FPS, VIRTUAL_OBJECT_FPS, FINGER_NAMES, FingerName, CENTER_THRESHOLD, EDGE_THRESHOLD, MOVEMENT_AREA_SCALE, MOVE_FACTOR, STIFFNESS_MAX
 import queue
 from queue import Queue
 from enum import StrEnum
@@ -63,8 +63,6 @@ class MotorType(StrEnum):
     HARDWARE = "hardware"
     NONE = "none"
 
-# for free form 3
-MOVE_FACTOR = 7
 MOTOR_TYPE = MotorType.HARDWARE
 MOVEMENT_STRATEGY = MovementStrategy.IK
 MOTOR_OPPOSES_OBJECT_MOTION = True

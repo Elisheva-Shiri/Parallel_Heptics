@@ -21,9 +21,8 @@ Commands:
 Coordinate systems (do not conflate them):
 
 * **Object displacement (X, Y) — the input.** In tracking-frame pixel units,
-  0 = centered. Bounded by the controller's workspace clamp, roughly
-  ``min(width, height) / 2 - edge_threshold`` (~210 px with the 640x480
-  defaults). May be negative.
+  0 = centered. Bounded by the experiment's scaled workspace clamp, currently
+  ~105 px with the 640x480 defaults. May be negative.
 * **Motor command ``pos`` — the output.** Integer values inside
   ``ZM<idx>P<pos>F``; the firmware treats them as absolute servo targets in
   ``[-1000, 1000]`` and maps them to servo ticks. This range is unrelated to the
@@ -46,7 +45,15 @@ from typing import Optional
 import serial
 import typer
 
-from consts import EDGE_THRESHOLD, HARDWARE_PORT, STIFFNESS_MAX, TOP_HEIGHT, TOP_WIDTH
+from consts import (
+    EDGE_THRESHOLD,
+    HARDWARE_PORT,
+    MOVEMENT_AREA_SCALE,
+    MOVE_FACTOR,
+    STIFFNESS_MAX,
+    TOP_HEIGHT,
+    TOP_WIDTH,
+)
 from haptic_mapping import map_object_displacement_to_tactor
 from motor_controller import (
     HandOrientation,
@@ -162,6 +169,16 @@ def resolve_displacement(
 
     radius = max(1.0, min(top_width, top_height) / 2.0 - edge_threshold)
     return clamp_unit(x, "x") * radius, clamp_unit(y, "y") * radius
+
+
+def experiment_edge_threshold(
+    top_width: float, top_height: float, edge_threshold: float
+) -> float:
+    """Return the controller margin for the experiment's scaled workspace."""
+    half_extent = min(top_width, top_height) / 2.0
+    full_radius = max(0.0, half_extent - edge_threshold)
+    movement_scale = max(0.0, min(1.0, MOVEMENT_AREA_SCALE))
+    return half_extent - full_radius * movement_scale
 
 
 def _controller(
@@ -335,7 +352,10 @@ def goto(
         1000.0, "--spacing", "-s", help="Motor spacing (controller units)"
     ),
     move_factor: float = typer.Option(
-        1.0, "--move-factor", help="Global gain applied to all output deltas"
+        MOVE_FACTOR,
+        "--move-factor",
+        help="Expert override for the experiment's motor-output multiplier",
+        hidden=True,
     ),
     stiffness: Optional[float] = typer.Option(
         None,
@@ -401,8 +421,17 @@ def goto(
         motor_cli.py goto --strategy ik --dry-run -- 0.5 -0.2
         motor_cli.py goto 0.5 0.2 --strategy ik --transport udp   # via the bridge
     """
+    effective_edge_threshold = experiment_edge_threshold(
+        top_width, top_height, edge_threshold
+    )
     controller = _controller(
-        strategy, spacing, move_factor, mirrored, top_width, top_height, edge_threshold
+        strategy,
+        spacing,
+        move_factor,
+        mirrored,
+        top_width,
+        top_height,
+        effective_edge_threshold,
     )
     gain_value = resolve_gain(stiffness, gain)
 
@@ -411,7 +440,9 @@ def goto(
     except ValueError:
         raise typer.BadParameter("motor_set must be 0-4")
 
-    px, py = resolve_displacement(x, y, top_width, top_height, edge_threshold)
+    px, py = resolve_displacement(
+        x, y, top_width, top_height, effective_edge_threshold
+    )
     obj_x, obj_y = px, py
     if oppose:
         obj_x, obj_y = map_object_displacement_to_tactor(
@@ -675,7 +706,10 @@ def monitor(
         1000.0, "--spacing", "-s", help="Motor spacing (controller units)"
     ),
     move_factor: float = typer.Option(
-        1.0, "--move-factor", help="Global gain on output deltas"
+        MOVE_FACTOR,
+        "--move-factor",
+        help="Expert override for the experiment's motor-output multiplier",
+        hidden=True,
     ),
     stiffness: Optional[float] = typer.Option(
         None,
@@ -720,8 +754,17 @@ def monitor(
         motor_set_id = MotorSetId(motor_set)
     except ValueError:
         raise typer.BadParameter("motor_set must be 0-4")
+    effective_edge_threshold = experiment_edge_threshold(
+        top_width, top_height, edge_threshold
+    )
     controller = _controller(
-        strategy, spacing, move_factor, mirrored, top_width, top_height, edge_threshold
+        strategy,
+        spacing,
+        move_factor,
+        mirrored,
+        top_width,
+        top_height,
+        effective_edge_threshold,
     )
     gain_value = resolve_gain(stiffness, gain)
     base_index = motor_set_id.base_index
@@ -784,7 +827,11 @@ def monitor(
                         in_x = float(parts[1])
                         in_y = float(parts[2])
                         obj_x, obj_y = resolve_displacement(
-                            in_x, in_y, top_width, top_height, edge_threshold
+                            in_x,
+                            in_y,
+                            top_width,
+                            top_height,
+                            effective_edge_threshold,
                         )
                         if oppose:
                             obj_x, obj_y = map_object_displacement_to_tactor(
